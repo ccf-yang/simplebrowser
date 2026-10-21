@@ -68,6 +68,17 @@ jobs:
       - name: Generate iOS project
         run: flutter create --platforms=ios --org com.example --project-name simplebrowser .
 
+      # ios/ is generated, so the custom app icon is dropped into the freshly
+      # created asset catalog (15 PNG sizes + the matching Contents.json).
+      - name: Apply app icon
+        run: |
+          set -e
+          ICONSET=ios/Runner/Assets.xcassets/AppIcon.appiconset
+          test -d "$ICONSET"
+          cp -f assets/appicon/Contents.json "$ICONSET/Contents.json"
+          cp -f assets/appicon/Icon-App-*.png "$ICONSET/"
+          echo "app icons: $(ls -1 "$ICONSET"/Icon-App-*.png | wc -l)"
+
       - name: Remove generated widget test
         run: rm -f test/widget_test.dart
 

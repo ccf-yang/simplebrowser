@@ -745,10 +745,19 @@ class _BrowserPageState extends State<BrowserPage>
       ),
       child: Row(
         children: <Widget>[
-          _addressLeading(),
+          ValueListenableBuilder<TextEditingValue>(
+            valueListenable: _urlController,
+            builder: (context, value, _) =>
+                _addressLeading(value.text.trim()),
+          ),
           const SizedBox(width: 7),
-          Expanded(
-            child: _urlFocused ? _buildUrlEditor() : _buildUrlPreview(),
+          Expanded(child: _buildUrlEditor()),
+          ValueListenableBuilder<TextEditingValue>(
+            valueListenable: _urlController,
+            builder: (context, value, _) {
+              if (value.text.isEmpty) return const SizedBox.shrink();
+              return _pillAction(Icons.close_rounded, 'Clear', _clearUrl);
+            },
           ),
           _urlFocused
               ? _pillAction(Icons.arrow_forward_rounded, 'Go', () {
@@ -765,8 +774,7 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  Widget _addressLeading() {
-    final text = _urlController.text.trim();
+  Widget _addressLeading(String text) {
     if (text.isEmpty) {
       return const Icon(
         Icons.search_rounded,
@@ -788,6 +796,11 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
+  void _clearUrl() {
+    _urlController.clear();
+    _urlFocus.requestFocus();
+  }
+
   Widget _buildUrlEditor() {
     return TextField(
       controller: _urlController,
@@ -796,69 +809,15 @@ class _BrowserPageState extends State<BrowserPage>
       textInputAction: TextInputAction.go,
       autocorrect: false,
       enableSuggestions: false,
-      style: const TextStyle(fontSize: 12.5, color: AppColors.ink),
+      style: const TextStyle(fontSize: 13, color: AppColors.ink),
       cursorColor: AppColors.ink,
       decoration: const InputDecoration(
         isCollapsed: true,
         border: InputBorder.none,
+        hintText: 'Search or enter address',
+        hintStyle: TextStyle(fontSize: 13, color: AppColors.faint),
       ),
       onSubmitted: (_) => unawaited(_go()),
-    );
-  }
-
-  Widget _buildUrlPreview() {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => _urlFocus.requestFocus(),
-      child: ValueListenableBuilder<TextEditingValue>(
-        valueListenable: _urlController,
-        builder: (context, value, _) {
-          final raw = value.text.trim();
-          if (raw.isEmpty) {
-            return const Text(
-              'Search or enter address',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 12.5, color: AppColors.faint),
-            );
-          }
-          final uri = Uri.tryParse(
-            raw.contains('://') ? raw : 'https://$raw',
-          );
-          if (uri == null || uri.host.isEmpty) {
-            return Text(
-              raw,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 12.5, color: AppColors.ink),
-            );
-          }
-          final index = raw.indexOf(uri.host);
-          final rest = index < 0
-              ? ''
-              : raw.substring(index + uri.host.length);
-          return Text.rich(
-            TextSpan(
-              children: <InlineSpan>[
-                TextSpan(
-                  text: uri.host,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w600,
-                    color: AppColors.ink,
-                  ),
-                ),
-                TextSpan(
-                  text: rest,
-                  style: const TextStyle(color: AppColors.muted),
-                ),
-              ],
-            ),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 12.5),
-          );
-        },
-      ),
     );
   }
 
@@ -1073,13 +1032,14 @@ class _BrowserPageState extends State<BrowserPage>
       animation: _tabs,
       builder: (context, _) {
         return Container(
-          height: 34,
+          height: 38,
           padding: const EdgeInsets.all(3),
           decoration: BoxDecoration(
             color: AppColors.wash,
             borderRadius: BorderRadius.circular(12),
           ),
           child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
               _segItem(0, 'WebView', null),
               _segItem(1, 'Engine', null),
@@ -1095,61 +1055,67 @@ class _BrowserPageState extends State<BrowserPage>
   Widget _segItem(int index, String label, int? count) {
     final selected = _tabs.index == index;
     return Expanded(
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () => _tabs.index = index,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          decoration: BoxDecoration(
-            color: selected ? AppColors.card : Colors.transparent,
-            borderRadius: BorderRadius.circular(9),
-            boxShadow: selected
-                ? const <BoxShadow>[
-                    BoxShadow(
-                      color: Color(0x140E0F0E),
-                      blurRadius: 2,
-                      offset: Offset(0, 1),
-                    ),
-                  ]
-                : null,
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: <Widget>[
-              Flexible(
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 10.5,
-                    letterSpacing: 0.1,
-                    fontWeight:
-                        selected ? FontWeight.w600 : FontWeight.w500,
-                    color: selected ? AppColors.ink : AppColors.muted,
-                  ),
-                ),
-              ),
-              if (count != null && count > 0) ...<Widget>[
-                const SizedBox(width: 5),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                  decoration: BoxDecoration(
-                    color: selected ? AppColors.signal : AppColors.wash,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(9),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(9),
+          onTap: () => _tabs.index = index,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 160),
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 2),
+            decoration: BoxDecoration(
+              color: selected ? AppColors.card : Colors.transparent,
+              borderRadius: BorderRadius.circular(9),
+              boxShadow: selected
+                  ? const <BoxShadow>[
+                      BoxShadow(
+                        color: Color(0x140E0F0E),
+                        blurRadius: 2,
+                        offset: Offset(0, 1),
+                      ),
+                    ]
+                  : null,
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                Flexible(
                   child: Text(
-                    count > 99 ? '99+' : '$count',
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontFamily: 'monospace',
-                      fontSize: 8.5,
-                      color: selected ? AppColors.ink : AppColors.faint,
+                      fontSize: 12,
+                      letterSpacing: 0.1,
+                      fontWeight:
+                          selected ? FontWeight.w600 : FontWeight.w500,
+                      color: selected ? AppColors.ink : AppColors.muted,
                     ),
                   ),
                 ),
+                if (count != null && count > 0) ...<Widget>[
+                  const SizedBox(width: 4),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: selected ? AppColors.signal : AppColors.wash,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      count > 99 ? '99+' : '$count',
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 9.5,
+                        color: selected ? AppColors.ink : AppColors.faint,
+                      ),
+                    ),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
         ),
       ),
@@ -1203,7 +1169,7 @@ class _BrowserPageState extends State<BrowserPage>
               behavior: HitTestBehavior.opaque,
               onTap: () => unawaited(_browser.refreshResources()),
               child: const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                 child: Text(
                   'Refresh',
                   style: TextStyle(fontSize: 10, color: AppColors.muted),
