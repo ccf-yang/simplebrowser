@@ -24,6 +24,12 @@ public final class BrowserHttpPlugin: NSObject, FlutterPlugin {
       self?.webChannel.invokeMethod("pageNetworkEvent", arguments: event)
     }
 
+    // Navigation decisions (page jumps, blocked external schemes) travel the
+    // same way, so the app can list every jump in its log.
+    webViewBridge.onNavigationEvent = { [weak self] event in
+      self?.webChannel.invokeMethod("navigationEvent", arguments: event)
+    }
+
     let cookies = FlutterMethodChannel(
       name: "browser_http/cookies", binaryMessenger: messenger)
     cookies.setMethodCallHandler { [weak self] call, result in

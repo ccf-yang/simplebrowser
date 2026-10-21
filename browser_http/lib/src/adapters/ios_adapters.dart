@@ -12,6 +12,7 @@ import '../domain/models/browser_cookie.dart';
 import '../domain/models/page_network_event.dart';
 import '../domain/models/session_snapshot.dart';
 import '../domain/models/transport.dart';
+import '../domain/models/webview_navigation_event.dart';
 import '../ffi/api/profile.dart' as ffi_profile;
 import '../ffi/api/transport.dart' as ffi_transport;
 import '../ffi/frb_generated.dart' show RustLib;
@@ -343,12 +344,24 @@ final class _ChannelWebViewAdapter implements WebViewPort {
   final MethodChannel _channel;
   final StreamController<PageNetworkEvent> _networkEvents =
       StreamController<PageNetworkEvent>.broadcast();
+  final StreamController<WebViewNavigationEvent> _navigationEvents =
+      StreamController<WebViewNavigationEvent>.broadcast();
 
   Future<void> _handleNativeCall(MethodCall call) async {
-    if (call.method != 'pageNetworkEvent') return;
     final raw = call.arguments;
     if (raw is! Map) return;
-    _networkEvents.add(PageNetworkEvent.fromJson(raw.cast<String, Object?>()));
+    switch (call.method) {
+      case 'pageNetworkEvent':
+        _networkEvents.add(
+          PageNetworkEvent.fromJson(raw.cast<String, Object?>()),
+        );
+      case 'navigationEvent':
+        _navigationEvents.add(
+          WebViewNavigationEvent.fromJson(raw.cast<String, Object?>()),
+        );
+      default:
+        break;
+    }
   }
 
   @override
@@ -366,7 +379,12 @@ final class _ChannelWebViewAdapter implements WebViewPort {
         message: 'WKWebView could not be created.',
       );
     }
-    return _ChannelWebViewSession(_channel, id, _networkEvents.stream);
+    return _ChannelWebViewSession(
+      _channel,
+      id,
+      _networkEvents.stream,
+      _navigationEvents.stream,
+    );
   }
 
   @override
@@ -374,11 +392,17 @@ final class _ChannelWebViewAdapter implements WebViewPort {
 }
 
 final class _ChannelWebViewSession implements WebViewSession {
-  _ChannelWebViewSession(this._channel, this._id, this._allNetworkEvents);
+  _ChannelWebViewSession(
+    this._channel,
+    this._id,
+    this._allNetworkEvents,
+    this._allNavigationEvents,
+  );
 
   final MethodChannel _channel;
   final String _id;
   final Stream<PageNetworkEvent> _allNetworkEvents;
+  final Stream<WebViewNavigationEvent> _allNavigationEvents;
 
   @override
   String get id => _id;
@@ -386,6 +410,10 @@ final class _ChannelWebViewSession implements WebViewSession {
   @override
   Stream<PageNetworkEvent> get networkEvents =>
       _allNetworkEvents.where((event) => event.sessionId == _id);
+
+  @override
+  Stream<WebViewNavigationEvent> get navigationEvents =>
+      _allNavigationEvents.where((event) => event.sessionId == _id);
 
   @override
   Future<WebViewLoadResult> load(
@@ -538,6 +566,41 @@ final class _ChannelWebViewSession implements WebViewSession {
         'id': _id,
       }) ??
       '';
+
+  @override
+  Future<bool> setDebugOverlay({
+    required bool enabled,
+    String? source,
+    double displaySize = 50,
+  }) async {
+    final ok = await _channel.invokeMethod<bool>(
+      'setDebugOverlay',
+      <String, Object?>{
+        'id': _id,
+        'enabled': enabled,
+        'source': source,
+        'displaySize': displaySize,
+      },
+    );
+    return ok ?? false;
+  }
+
+  @override
+  Future<void> setDebugDisplaySize(double displaySize) =>
+      _channel.invokeMethod<void>('setDebugDisplaySize', <String, Object?>{
+        'id': _id,
+        'displaySize': displaySize,
+      });
+
+  @override
+  Future<void> setNavigationPolicy({
+    bool blockExternal = true,
+    bool reissueTaps = true,
+  }) => _channel.invokeMethod<void>('setNavigationPolicy', <String, Object?>{
+    'id': _id,
+    'blockExternal': blockExternal,
+    'reissueTaps': reissueTaps,
+  });
 
   @override
   Future<void> dispose() =>

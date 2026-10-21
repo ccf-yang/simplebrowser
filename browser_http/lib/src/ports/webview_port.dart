@@ -2,6 +2,7 @@ import 'dart:async';
 
 import '../domain/models/browser_cookie.dart';
 import '../domain/models/page_network_event.dart';
+import '../domain/models/webview_navigation_event.dart';
 
 /// One entry from the page's `PerformanceResourceTiming` list.
 ///
@@ -124,6 +125,33 @@ abstract interface class WebViewSession {
 
   /// Current `navigator.userAgent`, used to verify consistency.
   Future<String> currentUserAgent();
+
+  /// Navigation decisions of this WebView.
+  ///
+  /// Includes the jumps the native side cancelled because they would have left
+  /// the app for another application.
+  Stream<WebViewNavigationEvent> get navigationEvents;
+
+  /// Installs the persistent debug console (eruda) for every later document.
+  ///
+  /// The bundle is registered as a `WKUserScript`, so a page reload, a link tap
+  /// or a redirect all get the console back without host-side timing. Returns
+  /// whether the *currently loaded* document already shows it.
+  Future<bool> setDebugOverlay({
+    required bool enabled,
+    String? source,
+    double displaySize = 50,
+  });
+
+  /// Re-registers the debug console user script with a new panel size.
+  Future<void> setDebugDisplaySize(double displaySize);
+
+  /// Whether non-http(s) navigations are cancelled instead of opening another
+  /// app, and whether Universal-Link taps are re-issued in-app.
+  Future<void> setNavigationPolicy({
+    bool blockExternal = true,
+    bool reissueTaps = true,
+  });
 
   Future<void> dispose();
 }

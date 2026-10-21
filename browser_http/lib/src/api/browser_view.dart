@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../domain/models/page_network_event.dart';
+import '../domain/models/webview_navigation_event.dart';
 import '../ports/webview_port.dart';
 import 'browser_session.dart';
 
@@ -29,7 +30,10 @@ final class BrowserController extends ChangeNotifier {
   bool _disposed = false;
   final StreamController<PageNetworkEvent> _networkEvents =
       StreamController<PageNetworkEvent>.broadcast();
+  final StreamController<WebViewNavigationEvent> _navigationEvents =
+      StreamController<WebViewNavigationEvent>.broadcast();
   StreamSubscription<PageNetworkEvent>? _networkSubscription;
+  StreamSubscription<WebViewNavigationEvent>? _navigationSubscription;
 
   String? _url;
   String? _title;
@@ -57,6 +61,11 @@ final class BrowserController extends ChangeNotifier {
   /// the WebView exists, so subscribing early loses nothing.
   Stream<PageNetworkEvent> get networkEvents => _networkEvents.stream;
 
+  /// Every page jump the WebView decided about, including the ones cancelled
+  /// because they would have opened another app.
+  Stream<WebViewNavigationEvent> get navigationEvents =>
+      _navigationEvents.stream;
+
   /// Creates the WKWebView and navigates to [initialUri] when given.
   ///
   /// Safe to call repeatedly; only the first call creates the native session.
@@ -83,6 +92,9 @@ final class BrowserController extends ChangeNotifier {
       _webView = webView;
       _networkSubscription ??= webView.networkEvents.listen((event) {
         if (!_networkEvents.isClosed) _networkEvents.add(event);
+      });
+      _navigationSubscription ??= webView.navigationEvents.listen((event) {
+        if (!_navigationEvents.isClosed) _navigationEvents.add(event);
       });
       if (initialUri != null) await webView.navigate(initialUri);
       _poll = Timer.periodic(
@@ -212,6 +224,46 @@ final class BrowserController extends ChangeNotifier {
     return webView.evaluate(script);
   }
 
+  /// Installs (or removes) the debug console for this WebView and every
+  /// document it loads afterwards.
+  ///
+  /// [source] is the eruda bundle; it is cached natively, so later navigations
+  /// need no host help. Returns whether the current document already shows it.
+  Future<bool> setDebugOverlay({
+    required bool enabled,
+    String? source,
+    double displaySize = 50,
+  }) async {
+    await start();
+    final webView = _webView;
+    if (webView == null) return false;
+    return webView.setDebugOverlay(
+      enabled: enabled,
+      source: source,
+      displaySize: displaySize,
+    );
+  }
+
+  /// Updates the panel size used by the next documents. Cheap: the injected
+  /// bundle is rebuilt natively, nothing is re-evaluated.
+  Future<void> setDebugDisplaySize(double displaySize) async {
+    final webView = _webView;
+    if (webView == null) return;
+    await webView.setDebugDisplaySize(displaySize);
+  }
+
+  /// Turns the "never leave the app" navigation rules on or off.
+  Future<void> setNavigationPolicy({
+    bool blockExternal = true,
+    bool reissueTaps = true,
+  }) async {
+    await start();
+    await _webView?.setNavigationPolicy(
+      blockExternal: blockExternal,
+      reissueTaps: reissueTaps,
+    );
+  }
+
   @override
   void dispose() {
     _disposed = true;
@@ -222,7 +274,10 @@ final class BrowserController extends ChangeNotifier {
     if (webView != null) unawaited(webView.dispose());
     unawaited(_networkSubscription?.cancel());
     _networkSubscription = null;
+    unawaited(_navigationSubscription?.cancel());
+    _navigationSubscription = null;
     unawaited(_networkEvents.close());
+    unawaited(_navigationEvents.close());
     super.dispose();
   }
 }

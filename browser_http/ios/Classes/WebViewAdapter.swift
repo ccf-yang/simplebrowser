@@ -14,6 +14,10 @@ final class WebViewBridge {
     /// plugin; events carry the owning session id.
     var onNetworkEvent: (([String: Any]) -> Void)?
 
+    /// Forwards navigation decisions (page jumps, blocked external schemes) to
+    /// the Dart side; events carry the owning session id.
+    var onNavigationEvent: (([String: Any]) -> Void)?
+
     /// Looks up an existing session so `UiKitView` can host the *same*
     /// WKWebView that will later export clearance cookies.
     func webView(for id: String) -> WKWebView? {
@@ -22,7 +26,7 @@ final class WebViewBridge {
 
     /// Loads a URL into a session that is already displayed by a platform view.
     func loadForDisplay(id: String, url: URL) {
-        sessions[id]?.webView.load(URLRequest(url: url))
+        sessions[id]?.loadInApp(URLRequest(url: url))
     }
 
     /// Resolves `args["id"]` or reports a Flutter error and returns `nil`.
@@ -63,6 +67,9 @@ final class WebViewBridge {
             holder.onNetworkEvent = { [weak self] event in
                 self?.onNetworkEvent?(event)
             }
+            holder.onNavigationEvent = { [weak self] event in
+                self?.onNavigationEvent?(event)
+            }
             if let userAgent { holder.webView.customUserAgent = userAgent }
             sessions[id] = holder
             result(id)
@@ -97,12 +104,41 @@ final class WebViewBridge {
                 result(FlutterError(code: "webview.navigate", message: "bad arguments", details: nil))
                 return
             }
-            holder.webView.load(request(for: url, headers: args["headers"]))
+            holder.loadInApp(request(for: url, headers: args["headers"]))
             result(nil)
 
         case "setUserAgent":
             guard let holder = session(args, result) else { return }
             holder.webView.customUserAgent = args["userAgent"] as? String
+            result(nil)
+
+        case "setNavigationPolicy":
+            guard let holder = session(args, result) else { return }
+            holder.blockExternalNavigations = args["blockExternal"] as? Bool
+                ?? holder.blockExternalNavigations
+            holder.reissueUserTaps = args["reissueTaps"] as? Bool
+                ?? holder.reissueUserTaps
+            result(nil)
+
+        case "setDebugOverlay":
+            guard let id = args["id"] as? String,
+                  let holder = sessions[id] else {
+                result(FlutterError(code: "webview.debug",
+                                    message: "unknown session",
+                                    details: nil))
+                return
+            }
+            holder.setDebugOverlay(
+                enabled: args["enabled"] as? Bool ?? false,
+                source: args["source"] as? String ?? "",
+                displaySize: (args["displaySize"] as? NSNumber)?.doubleValue ?? 50
+            ) { ok in result(ok) }
+
+        case "setDebugDisplaySize":
+            guard let holder = session(args, result) else { return }
+            if let size = (args["displaySize"] as? NSNumber)?.doubleValue {
+                holder.setDebugDisplaySize(size)
+            }
             result(nil)
 
         case "setCookie":
@@ -333,10 +369,51 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     let webView: WKWebView
     let headless: Bool
     var onNetworkEvent: (([String: Any]) -> Void)?
+    /// Page jumps reported to the host: allowed, re-issued, blocked, committed,
+    /// failed.
+    var onNavigationEvent: (([String: Any]) -> Void)?
     private var loadCompletion: ((Error?) -> Void)?
     fileprivate var lastStatusCode: Int?
 
     private static let networkHandlerName = "browserHttpNet"
+
+    /// Cancels any navigation whose scheme is not http(s)/in-app, so a link can
+    /// never hand the URL over to another app (`baidu://`, `weixin://`,
+    /// `itms-apps://`, `tel:` …).
+    var blockExternalNavigations = true
+
+    /// iOS opens the matching app when a *user tap* moves the main frame to a
+    /// URL registered as a Universal Link. Re-issuing the identical request
+    /// from code keeps the page inside this browser.
+    var reissueUserTaps = true
+
+    /// Requests this holder re-issued itself; their policy call must be allowed
+    /// untouched or the re-issue would cancel itself forever.
+    private var programmaticURLs: Set<String> = []
+
+    /// Method and trigger of the last main-frame action, reused by the response
+    /// and commit callbacks so a log row reads like the request it belongs to.
+    private var lastMethod = "GET"
+    private var lastNavigationType = "other"
+
+    /// Scripts every document gets: the fetch/XHR hooks plus, while the debug
+    /// console is open, the eruda bundle.
+    private var userScripts: [InjectedScript] = []
+    private(set) var debugOverlayEnabled = false
+    private var debugSource = ""
+    private var debugDisplaySize = 50.0
+
+    /// One `WKUserScript` tagged as debug overlay or not, so the overlay can be
+    /// swapped without rebuilding the request-hook script.
+    private struct InjectedScript {
+        let script: WKUserScript
+        let isDebugOverlay: Bool
+    }
+
+    /// Schemes WebKit may load inside this browser. Anything else is an exit.
+    private static let inAppSchemes: Set<String> = [
+        "http", "https", "about", "data", "blob", "file", "void", "javascript",
+    ]
 
     init(id: String, headless: Bool) {
         self.id = id
@@ -353,18 +430,240 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         // Inject the fetch/XHR hooks before the first document script runs.
         // The handler is weak so the holder can be released when the session
         // is disposed.
-        let controller = webView.configuration.userContentController
-        controller.addUserScript(WKUserScript(
-            source: WebViewHolder.networkScript,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false))
-        controller.add(
+        userScripts.append(InjectedScript(
+            script: WKUserScript(
+                source: WebViewHolder.networkScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false),
+            isDebugOverlay: false))
+        applyUserScripts()
+        webView.configuration.userContentController.add(
             WeakScriptMessageHandler(delegate: self),
             name: WebViewHolder.networkHandlerName)
 
         // Visible WebViews are user-driven (challenge page or browser tab);
         // swipe back/forward should behave like Safari.
         webView.allowsBackForwardNavigationGestures = !headless
+    }
+
+    /// Replaces the controller's script list with `userScripts`.
+    ///
+    /// `WKUserContentController` only offers `removeAllUserScripts()`, so the
+    /// whole list is rebuilt whenever the debug overlay is switched on or off.
+    /// Applies to the next document; the current one is handled by the explicit
+    /// `evaluateJavaScript` calls in `setDebugOverlay`.
+    private func applyUserScripts() {
+        let controller = webView.configuration.userContentController
+        controller.removeAllUserScripts()
+        for entry in userScripts {
+            controller.addUserScript(entry.script)
+        }
+    }
+
+    private func rebuildDebugScript() {
+        userScripts.removeAll { $0.isDebugOverlay }
+        guard debugOverlayEnabled, !debugSource.isEmpty else { return }
+        userScripts.append(InjectedScript(
+            script: WKUserScript(
+                source: WebViewHolder.debugBundle(
+                    source: debugSource, displaySize: debugDisplaySize),
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true),
+            isDebugOverlay: true))
+    }
+
+    /// Turns the persistent debug console on or off for *all later documents*.
+    ///
+    /// A `WKUserScript` survives navigations, which is what keeps eruda visible
+    /// no matter how deep the user clicks into a site. The currently loaded
+    /// document is patched immediately as well.
+    func setDebugOverlay(enabled: Bool, source: String, displaySize: Double,
+                         completion: @escaping (Bool) -> Void) {
+        debugOverlayEnabled = enabled
+        if enabled, !source.isEmpty { debugSource = source }
+        debugDisplaySize = displaySize
+        rebuildDebugScript()
+        applyUserScripts()
+
+        guard enabled else {
+            webView.evaluateJavaScript("try{eruda.hide()}catch(e){};0;") { _, _ in
+                completion(true)
+            }
+            return
+        }
+
+        let bundle = WebViewHolder.debugBundle(
+            source: debugSource, displaySize: debugDisplaySize)
+        webView.evaluateJavaScript(bundle) { value, error in
+            if error != nil {
+                completion(false)
+                return
+            }
+            // The boot snippet ends with 'ok'; a page without a JS context
+            // returns nil, which the caller can retry after the load commits.
+            completion((value as? String)?.contains("ok") ?? false)
+        }
+    }
+
+    /// Re-registers the debug user script with a new panel size.
+    ///
+    /// Cheap on purpose: the bundle is only concatenated again, nothing is
+    /// evaluated, so dragging the split does not re-initialise eruda.
+    func setDebugDisplaySize(_ size: Double) {
+        guard debugOverlayEnabled else { return }
+        debugDisplaySize = size
+        rebuildDebugScript()
+        applyUserScripts()
+    }
+
+    /// The eruda bundle followed by the snippet that shows it and prints the
+    /// jump that produced this document.
+    private static func debugBundle(source: String, displaySize: Double) -> String {
+        let boot = String(
+            format: debugBootTemplate,
+            String(format: "%.1f", displaySize),
+            String(format: "%.1f", displaySize)
+        )
+        return source + "\n" + boot
+    }
+
+    /// Two `%@` placeholders: the display size for `init` and for `config.set`.
+    ///
+    /// Runs at document end on every frame of type main, so a page reload, a
+    /// link tap or a redirect all get a working console without any help from
+    /// Dart. `%1$@`/`%2$@` are the same value; keeping both lets a future change
+    /// separate the initial size from the live one.
+    private static let debugBootTemplate = #"""
+    (function () {
+      if (!window.eruda) { return 'no-bundle'; }
+      try {
+        window.__bhDebugLog = function (text, level) {
+          try {
+            var fn = level === 'error' ? console.error
+                     : level === 'warn' ? console.warn : console.log;
+            fn.call(console, '[跳转] ' + text);
+          } catch (e) {}
+        };
+        if (!window.__bhEruda) {
+          eruda.init({ defaults: { displaySize: %@ } });
+          try { eruda.get('entryBtn').hide(); } catch (e) {}
+          window.__bhEruda = true;
+          var from = document.referrer || '';
+          window.__bhDebugLog(location.href + (from ? '  ←  ' + from : ''));
+        } else {
+          eruda.show();
+        }
+        eruda.get().config.set('displaySize', %@);
+        eruda.show('console');
+      } catch (e) { return 'error:' + e; }
+      return 'ok';
+    })();
+    """#
+
+    // -----------------------------------------------------------------------
+    // Navigation policy: stay inside the app, report every jump
+    // -----------------------------------------------------------------------
+
+    /// Reports one navigation to the host.
+    private func reportNavigation(kind: String, url: URL, method: String,
+                                  mainFrame: Bool, type: String,
+                                  status: Int? = nil, message: String? = nil) {
+        var body: [String: Any] = [
+            "kind": kind,
+            "url": url.absoluteString,
+            "method": method,
+            "mainFrame": mainFrame,
+            "navigationType": type,
+            "ts": Int(Date().timeIntervalSince1970 * 1000),
+        ]
+        if let status { body["status"] = status }
+        if let message { body["message"] = message }
+        body["sessionId"] = id
+        onNavigationEvent?(body)
+    }
+
+    private static func navigationTypeName(_ type: WKNavigationType) -> String {
+        switch type {
+        case .linkActivated: return "link"
+        case .formSubmitted: return "form"
+        case .backForward: return "backForward"
+        case .reload: return "reload"
+        case .formResubmitted: return "formResubmit"
+        @unknown default: return "other"
+        }
+    }
+
+    /// Loads a URL the way Safari's address bar does: from code, never as the
+    /// continuation of a user gesture, so Universal Links stay in-app.
+    ///
+    /// The URL is remembered so its own policy call is allowed instead of being
+    /// cancelled by the tap handling above.
+    func loadInApp(_ request: URLRequest) {
+        if let url = request.url { programmaticURLs.insert(url.absoluteString) }
+        webView.load(request)
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+        let scheme = (url.scheme ?? "").lowercased()
+        let method = (navigationAction.request.httpMethod ?? "GET").uppercased()
+        // `targetFrame == nil` is a `target="_blank"` / `window.open` request.
+        let targetsMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        let opensWindow = navigationAction.targetFrame == nil
+        let type = Self.navigationTypeName(navigationAction.navigationType)
+        if targetsMainFrame || opensWindow {
+            lastMethod = method
+            lastNavigationType = type
+        }
+
+        // A load this holder started itself (address bar, re-issue, back/forward
+        // of a queued URL): let it through once, untouched.
+        if programmaticURLs.remove(url.absoluteString) != nil {
+            reportNavigation(kind: "start", url: url, method: method,
+                             mainFrame: targetsMainFrame, type: type,
+                             message: "in-app load")
+            decisionHandler(.allow)
+            return
+        }
+
+        // baidu://, weixin://, itms-apps://, tel:, … would leave the app.
+        if blockExternalNavigations, !Self.inAppSchemes.contains(scheme) {
+            decisionHandler(.cancel)
+            reportNavigation(kind: "blocked", url: url, method: method,
+                             mainFrame: targetsMainFrame, type: type,
+                             message: "external app jump blocked")
+            return
+        }
+
+        // Universal links: iOS hands the app's own domain over to that app when
+        // a *user tap* moves the main frame. Re-issuing the identical GET from
+        // code is the only public way to keep the navigation in-process.
+        // Subframes are never re-issued: their content belongs in the frame.
+        let isTap = navigationAction.navigationType == .linkActivated
+            || navigationAction.navigationType == .formSubmitted
+        let isWebURL = scheme == "http" || scheme == "https"
+        if blockExternalNavigations, reissueUserTaps, isTap, isWebURL,
+           method == "GET",
+           targetsMainFrame || opensWindow,
+           navigationAction.request.httpBody == nil {
+            decisionHandler(.cancel)
+            reportNavigation(kind: "in-app", url: url, method: method,
+                             mainFrame: targetsMainFrame, type: type,
+                             message: "tap reloaded in-app (no external app)")
+            DispatchQueue.main.async { [weak self] in
+                self?.loadInApp(navigationAction.request)
+            }
+            return
+        }
+
+        reportNavigation(kind: "start", url: url, method: method,
+                         mainFrame: targetsMainFrame, type: type)
+        decisionHandler(.allow)
     }
 
     /// page -> Dart bridge. WebKit calls this on the main thread.
@@ -384,7 +683,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil {
-            webView.load(navigationAction.request)
+            loadInApp(navigationAction.request)
         }
         return nil
     }
@@ -396,6 +695,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     func load(_ request: URLRequest, completion: @escaping (Error?) -> Void) {
         lastStatusCode = nil
         loadCompletion = completion
+        if let url = request.url { programmaticURLs.insert(url.absoluteString) }
         webView.load(request)
     }
 
@@ -410,23 +710,59 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         if let response = navigationResponse.response as? HTTPURLResponse {
             lastStatusCode = response.statusCode
+            if navigationResponse.isForMainFrame, let url = response.url {
+                let redirect = [301, 302, 303, 307, 308].contains(response.statusCode)
+                reportNavigation(
+                    kind: redirect ? "redirect" : "response",
+                    url: url,
+                    method: lastMethod,
+                    mainFrame: true,
+                    type: lastNavigationType,
+                    status: response.statusCode)
+            }
         }
         decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        programmaticURLs.removeAll()
+        if let url = webView.url {
+            reportNavigation(
+                kind: "committed",
+                url: url,
+                method: lastMethod,
+                mainFrame: true,
+                type: lastNavigationType,
+                status: lastStatusCode)
+        }
         loadCompletion?(nil)
         loadCompletion = nil
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        programmaticURLs.removeAll()
+        reportFailure(url: webView.url, error: error)
         loadCompletion?(error)
         loadCompletion = nil
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        programmaticURLs.removeAll()
+        reportFailure(url: webView.url, error: error)
         loadCompletion?(error)
         loadCompletion = nil
+    }
+
+    /// A failed navigation often has no URL yet; `about:blank` keeps the row
+    /// readable instead of dropping the event.
+    private func reportFailure(url: URL?, error: Error) {
+        reportNavigation(
+            kind: "failed",
+            url: url ?? URL(string: "about:blank")!,
+            method: lastMethod,
+            mainFrame: true,
+            type: lastNavigationType,
+            message: error.localizedDescription)
     }
 
     /// Hooks `fetch`, `XMLHttpRequest` and `sendBeacon` and forwards method,
