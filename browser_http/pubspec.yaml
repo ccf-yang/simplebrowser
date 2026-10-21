@@ -1,0 +1,32 @@
+name: browser_http
+description: >-
+  Browser-faithful HTTP client for Flutter on iOS. Real TLS (JA3/JA4) and
+  HTTP/2 fingerprints, consistent identity sessions, and WKWebView challenge
+  hand-off with human-in-the-loop verification.
+version: 0.1.0
+homepage: https://github.com/REPLACE_ME/browser_http
+repository: https://github.com/REPLACE_ME/browser_http
+issue_tracker: https://github.com/REPLACE_ME/browser_http/issues
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.0
+  # Must match rust/Cargo.toml exactly, and the codegen CLI version.
+  flutter_rust_bridge: 2.13.0
+  plugin_platform_interface: ^2.1.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: BrowserHttpPlugin

@@ -1,0 +1,204 @@
+# SimpleBrowser -> unsigned iOS IPA -> GitHub Release (manual trigger).
+#
+# The browser_http package is vendored at ./browser_http, so this one
+# repository contains both the app and the Rust/Swift plugin. Platform folders
+# (ios/) are generated in CI and never committed.
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      # browser_http/rust requires edition 2024 (rust-version 1.98).
+      - name: Setup Rust + iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: browser_http/rust -> target
+          cache-on-failure: true
+
+      # BoringSSL's CMake build needs cmake and Go for code generation.
+      - name: Build dependencies (cmake / Go for BoringSSL)
+        run: |
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          command -v go >/dev/null 2>&1 || brew install go
+          command -v pkg-config >/dev/null 2>&1 || brew install pkg-config
+
+      - name: Use CocoaPods (disable SwiftPM)
+        run: flutter config --no-enable-swift-package-manager || true
+
+      # Only lib/ + pubspec are committed; the iOS host project is generated.
+      - name: Generate iOS project
+        run: flutter create --platforms=ios --org com.example --project-name simplebrowser .
+
+      - name: Remove generated widget test
+        run: rm -f test/widget_test.dart
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # Early gate: app code errors fail here with file:line.
+      - name: Analyze app (errors only)
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      # The vendored package has its own analysis_options and dev deps.
+      - name: Analyze browser_http (errors only)
+        working-directory: browser_http
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      # browser_http.podspec declares iOS 15.0, so the app must not be lower.
+      # Done before config-only in case that step triggers pod install.
+      - name: Ensure iOS deployment target >= 15.0
+        run: |
+          python3 - <<'PY'
+          import os, re, glob
+          MIN = 15.0
+          pod = 'ios/Podfile'
+          if os.path.exists(pod):
+              s = open(pod).read()
+              if re.search(r"^\s*platform :ios,", s, re.M):
+                  s = re.sub(r"^\s*platform :ios,\s*'[0-9.]+'",
+                             "platform :ios, '15.0'", s, flags=re.M)
+              else:
+                  s = "platform :ios, '15.0'\n" + s
+              open(pod, 'w').write(s)
+          def bump(m):
+              return 'IPHONEOS_DEPLOYMENT_TARGET = %.1f;' % max(float(m.group(1)), MIN)
+          for p in glob.glob('ios/Runner.xcodeproj/project.pbxproj'):
+              s = open(p).read()
+              s = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = ([0-9.]+);', bump, s)
+              open(p, 'w').write(s)
+          PY
+
+      # Generates ios/Flutter config + Podfile without Flutter's Team check.
+      - name: Prepare Flutter iOS config
+        run: flutter build ios --release --config-only --no-codesign
+
+      # The Podfile may only appear during config-only; pin it now.
+      - name: Pin Podfile platform to 15.0
+        run: |
+          if [ -f ios/Podfile ]; then
+            python3 - <<'PY'
+          import re
+          s = open('ios/Podfile').read()
+          if re.search(r"^\s*platform :ios,", s, re.M):
+              s = re.sub(r"^\s*platform :ios,\s*'[0-9.]+'",
+                         "platform :ios, '15.0'", s, flags=re.M)
+          else:
+              s = "platform :ios, '15.0'\n" + s
+          open('ios/Podfile', 'w').write(s)
+          PY
+          fi
+
+      - name: Patch Info.plist (display name + allow http)
+        run: |
+          PLIST=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName SimpleBrowser" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string SimpleBrowser" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoads true" "$PLIST" 2>/dev/null || true
+
+      - name: CocoaPods install
+        run: cd ios && pod install
+
+      # The Rust archive is produced by the pod's script phase and is only
+      # referenced through dlsym, so the linker would drop it. force_load it
+      # into the app target (belt and braces with the podspec's LDFLAGS).
+      - name: Link Rust archive into the app
+        run: |
+          for f in ios/Flutter/Release.xcconfig; do
+            if ! grep -q 'libbrowser_http_core.a' "$f"; then
+              printf '\nOTHER_LDFLAGS = $(inherited) -Wl,-force_load,"${BUILT_PRODUCTS_DIR}/libbrowser_http_core.a" -lc++\n' >> "$f"
+            fi
+          done
+
+      # Direct xcodebuild: Flutter's `build ios` enforces a Development Team
+      # even with --no-codesign. Script sandboxing off because the Rust build
+      # script writes into the plugin's rust/target directory.
+      - name: Xcode build (unsigned)
+        run: |
+          set -e
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP_PATH=$(find build/ios -type d -name Runner.app | head -1)
+          test -n "$APP_PATH"
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr simplebrowser-unsigned.ipa Payload
+          ls -lh simplebrowser-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simplebrowser-ipa
+          path: simplebrowser-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Read version from pubspec
+        id: ver
+        run: |
+          V=$(grep -m1 '^version:' pubspec.yaml | sed 's/^version:[[:space:]]*//' | tr -d '\r')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$(echo "$V" | tr '+' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to GitHub Releases
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${{ steps.ver.outputs.tag }}"
+          TITLE="SimpleBrowser ${{ steps.ver.outputs.version }}"
+          FILE="simplebrowser-unsigned.ipa"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$FILE" --clobber
+            gh release edit "$TAG" --title "$TITLE" --latest
+          else
+            gh release create "$TAG" "$FILE" \
+              --title "$TITLE" \
+              --notes "Auto build (commit ${{ github.sha }} / run #${{ github.run_number }})" \
+              --latest
+          fi

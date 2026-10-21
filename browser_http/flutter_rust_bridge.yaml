@@ -1,0 +1,9 @@
+rust_input: crate::api
+rust_root: rust
+dart_output: lib/src/ffi
+# The generator runs in CI/containers without a Dart SDK. Generated files are
+# formatted by the developer's toolchain, not here.
+dart_format: false
+dart_fix: false
+deps_check: false
+build_runner: false

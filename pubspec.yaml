@@ -1,0 +1,25 @@
+name: simplebrowser
+description: >-
+  Small iOS test browser built on browser_http: real WKWebView browsing plus
+  native fingerprint request capture.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Vendored so the whole app builds from a single GitHub repository.
+  browser_http:
+    path: browser_http
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
