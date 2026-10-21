@@ -223,7 +223,7 @@ final class BrowserChallengePlatformViewFactory: NSObject, FlutterPlatformViewFa
         BrowserChallengePlatformView(frame: frame, bridge: bridge, args: args as? [String: Any])
     }
 
-    func createArgsCodec() -> (FlutterMessageCodec & NSObjectProtocol)? {
+    func createArgsCodec() -> (FlutterMessageCodec & NSObjectProtocol) {
         FlutterStandardMessageCodec.sharedInstance()
     }
 }
