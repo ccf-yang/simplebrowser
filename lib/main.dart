@@ -5,8 +5,12 @@ import 'dart:typed_data';
 
 import 'package:browser_http/browser_http.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, rootBundle;
 
-import 'dev_panel.dart';
+import 'request_format.dart';
+import 'settings_sheet.dart';
+import 'theme.dart';
 
 void main() => runApp(const SimpleBrApp());
 
@@ -15,11 +19,11 @@ class SimpleBrApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'SimpleBrowser',
-    debugShowCheckedModeBanner: false,
-    theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-    home: const BrowserPage(),
-  );
+        title: 'SimpleBrowser',
+        debugShowCheckedModeBanner: false,
+        theme: buildAppTheme(),
+        home: const BrowserPage(),
+      );
 }
 
 /// One entry of the user-agent preset list.
@@ -31,7 +35,7 @@ class _UaPreset {
 }
 
 const List<_UaPreset> _uaPresets = <_UaPreset>[
-  _UaPreset('无（默认 UA）', null),
+  _UaPreset('Default (profile UA)', null),
   _UaPreset(
     'iPhone Safari 18',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) '
@@ -76,6 +80,11 @@ const List<_UaPreset> _uaPresets = <_UaPreset>[
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) '
         'Gecko/20100101 Firefox/139.0',
   ),
+  _UaPreset(
+    'Googlebot (desktop)',
+    'Mozilla/5.0 (compatible; Googlebot/2.1; '
+        '+http://www.google.com/bot.html)',
+  ),
 ];
 
 enum _RefererMode { none, currentDomain }
@@ -95,41 +104,47 @@ class BrowserPage extends StatefulWidget {
 
 class _BrowserPageState extends State<BrowserPage>
     with SingleTickerProviderStateMixin {
-  static final Uri _initialUri = Uri.parse('https://example.com');
+  static const double _erudaPillHeight = 28;
+  static const List<String> _erudaUrls = <String>[
+    'https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js',
+    'https://unpkg.com/eruda@3.4.3/eruda.js',
+  ];
 
   final StreamLogSink _logSink = StreamLogSink(400);
-  final TextEditingController _urlController = TextEditingController(
-    text: _initialUri.toString(),
-  );
+  final TextEditingController _urlController = TextEditingController();
   final TextEditingController _cookieController = TextEditingController();
   final FocusNode _urlFocus = FocusNode();
   final List<RequestLogEvent> _events = <RequestLogEvent>[];
 
+  /// fetch/XHR/beacon observations merged into one entry per request, keyed by
+  /// `page:id` so a response overwrites its own request row.
+  final Map<String, PageNetworkEvent> _pageRequests =
+      <String, PageNetworkEvent>{};
+
   late final BrowserSession _session;
   late final BrowserController _browser;
   late final StreamSubscription<RequestLogEvent> _logSubscription;
+  late final StreamSubscription<PageNetworkEvent> _pageSubscription;
   late final TabController _tabs;
 
   CapturedExchange? _capture;
   String? _captureError;
   bool _busy = false;
 
-  final List<CapturedExchange> _devCaptures = <CapturedExchange>[];
-  final Map<String, PageNetworkEvent> _pageRequests =
-      <String, PageNetworkEvent>{};
-  late final StreamSubscription<PageNetworkEvent> _pageSubscription;
-  bool _devPanelOpen = false;
-  double _devPanelFraction = 0.62;
-  String? _autoCapturedUrl;
-  String? _pendingAutoCaptureUrl;
-
-  bool _showHeaders = false;
   int _uaIndex = 0;
   _RefererMode _refererMode = _RefererMode.none;
   String? _defaultUserAgent;
+  String? _profileLabel;
 
-  /// Share of the body height taken by the info/log panel; draggable.
+  bool _urlFocused = false;
+  bool _started = false;
+
+  /// Share of the body height taken by the info panel; draggable.
   double _panelFraction = 0.4;
+  bool _panelVisible = true;
+  bool _didHidePanelForEruda = false;
+
+  int _logFilter = 0; // 0 all, 1 warn, 2 error
 
   String? _seenUrl;
   String? _seenTitle;
@@ -138,112 +153,61 @@ class _BrowserPageState extends State<BrowserPage>
   bool _seenForward = false;
   int _seenResources = 0;
 
+  // Eruda overlay state.
+  bool _erudaOpen = false;
+  bool _erudaBusy = false;
+  double _erudaSize = 50;
+  String? _erudaSource;
+  Timer? _erudaRestoreTimer;
+  Timer? _erudaSyncTimer;
+
   @override
   void initState() {
     super.initState();
     _session = BrowserHttp.session(logSink: _logSink);
     _browser = BrowserController(session: _session)
       ..addListener(_onBrowserChanged);
-    _tabs = TabController(length: 3, vsync: this);
+    _tabs = TabController(length: 4, vsync: this);
+    _urlFocus.addListener(_onUrlFocusChanged);
     _logSubscription = _logSink.stream.listen((event) {
       if (!mounted) return;
       setState(() => _events.insert(0, event));
     });
+    // Buffered even while the panel is closed, so opening "Page" shows the
+    // requests of the current document instead of an empty list.
     _pageSubscription = _browser.networkEvents.listen(_onPageNetworkEvent);
-    unawaited(_loadDefaultUserAgent());
+    unawaited(_loadProfileInfo());
   }
 
-  /// Merges the injected script's request/response events into one row per
-  /// request. Headers and body come from the request event; status, timing and
-  /// response headers come from the matching response event.
-  ///
-  /// Events are buffered even while the panel is closed (bounded to 50), so
-  /// opening it shows the current document's requests instead of an empty list.
-  void _onPageNetworkEvent(PageNetworkEvent event) {
-    if (!mounted) return;
-    setState(() {
-      final existing = _pageRequests[event.key];
-      _pageRequests[event.key] = existing == null
-          ? _normalizePageEvent(event)
-          : _mergePageEvent(existing, event);
-      while (_pageRequests.length > 50) {
-        _pageRequests.remove(_pageRequests.keys.first);
-      }
-    });
-  }
-
-  static PageNetworkEvent _normalizePageEvent(PageNetworkEvent event) {
-    if (event.phase == PageNetworkPhase.request) return event;
-    return PageNetworkEvent(
-      sessionId: event.sessionId,
-      page: event.page,
-      id: event.id,
-      phase: event.phase,
-      timestamp: event.timestamp,
-      method: event.method,
-      url: event.url,
-      headers: const <String, String>{},
-      responseHeaders: event.headers,
-      body: event.body,
-      responseBody: event.responseBody,
-      statusCode: event.statusCode,
-      duration: event.duration,
-      size: event.size,
-      message: event.message,
-    );
-  }
-
-  static PageNetworkEvent _mergePageEvent(
-    PageNetworkEvent request,
-    PageNetworkEvent update,
-  ) {
-    return PageNetworkEvent(
-      sessionId: update.sessionId.isEmpty
-          ? request.sessionId
-          : update.sessionId,
-      page: request.page,
-      id: request.id,
-      phase: update.phase == PageNetworkPhase.body
-          ? request.phase
-          : update.phase,
-      timestamp: request.timestamp,
-      method: request.method ?? update.method,
-      url: request.url ?? update.url,
-      headers: request.headers,
-      responseHeaders: update.headers.isNotEmpty
-          ? update.headers
-          : request.responseHeaders,
-      body: request.body ?? update.body,
-      responseBody: update.responseBody ?? request.responseBody,
-      statusCode: update.statusCode ?? request.statusCode,
-      duration: update.duration ?? request.duration,
-      size: update.size ?? request.size,
-      message: update.message ?? request.message,
-    );
-  }
-
-  /// Page-script requests, newest first.
-  List<PageNetworkEvent> get _pageRequestList {
-    final list = _pageRequests.values.toList()
-      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
-    return list;
-  }
-
-  Future<void> _loadDefaultUserAgent() async {
+  Future<void> _loadProfileInfo() async {
     try {
       final info = await _session.profileInfo();
-      if (mounted) setState(() => _defaultUserAgent = info.userAgent);
+      if (!mounted) return;
+      setState(() {
+        _defaultUserAgent = info.userAgent;
+        _profileLabel =
+            info.family.isNotEmpty ? info.family : info.profileId;
+      });
     } on Object {
-      // Keep null; the WebView keeps the UA it was created with.
+      // Keep null; the engine still works with its defaults.
     }
+  }
+
+  void _onUrlFocusChanged() {
+    final focused = _urlFocus.hasFocus;
+    if (focused) {
+      final length = _urlController.text.length;
+      _urlController.selection =
+          TextSelection(baseOffset: 0, extentOffset: length);
+    }
+    if (focused != _urlFocused) setState(() => _urlFocused = focused);
   }
 
   /// The controller polls the WebView; rebuild only on real changes so the
   /// platform view is not re-laid-out every tick.
   void _onBrowserChanged() {
     if (!mounted) return;
-    final changed =
-        _seenUrl != _browser.url ||
+    final changed = _seenUrl != _browser.url ||
         _seenTitle != _browser.title ||
         _seenStatus != _browser.statusCode ||
         _seenBack != _browser.canGoBack ||
@@ -251,6 +215,7 @@ class _BrowserPageState extends State<BrowserPage>
         _seenResources != _browser.resourceTimings.length;
     if (!changed) return;
 
+    final previousUrl = _seenUrl;
     _seenUrl = _browser.url;
     _seenTitle = _browser.title;
     _seenStatus = _browser.statusCode;
@@ -259,17 +224,18 @@ class _BrowserPageState extends State<BrowserPage>
     _seenResources = _browser.resourceTimings.length;
 
     setState(() {
-      if (!_urlFocus.hasFocus && (_browser.url ?? '').isNotEmpty) {
-        _urlController.text = _browser.url!;
+      final url = _browser.url;
+      if (!_urlFocus.hasFocus &&
+          url != null &&
+          url.isNotEmpty &&
+          url != 'about:blank') {
+        _urlController.text = url;
       }
     });
 
-    if (_devPanelOpen) {
-      final url = _browser.url;
-      if (url != null && url != _autoCapturedUrl) {
-        unawaited(_captureCurrent(auto: true));
-      }
-    }
+    // A new document means a fresh JS context: put eruda back once the page
+    // has committed. Only while the panel is open.
+    if (_erudaOpen && previousUrl != _browser.url) _scheduleErudaRestore();
   }
 
   Uri? _parseUrl(String raw) {
@@ -286,6 +252,13 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   Uri? _currentUri() => _parseUrl(_browser.url ?? _urlController.text);
+
+  /// A fresh WKWebView may report an empty string or `about:blank`; neither is
+  /// a real document for the start page / Eruda.
+  bool get _hasDocument {
+    final url = _browser.url;
+    return url != null && url.isNotEmpty && url != 'about:blank';
+  }
 
   /// UA sent to the engine capture; `null` means "use the profile default".
   String? get _uaOverride => _uaPresets[_uaIndex].value;
@@ -322,6 +295,7 @@ class _BrowserPageState extends State<BrowserPage>
       return;
     }
     _urlFocus.unfocus();
+    setState(() => _started = true);
     try {
       await _browser.load(
         uri,
@@ -329,8 +303,16 @@ class _BrowserPageState extends State<BrowserPage>
         userAgent: _effectiveUserAgent,
       );
     } on Object catch (error) {
-      if (mounted) _snack('Load failed: $error');
+      if (mounted) {
+        if (!_hasDocument) setState(() => _started = false);
+        _snack('Load failed: $error');
+      }
     }
+  }
+
+  void _openShortcut(String url) {
+    _urlController.text = url;
+    unawaited(_go());
   }
 
   Future<void> _reload() async {
@@ -345,48 +327,65 @@ class _BrowserPageState extends State<BrowserPage>
     }
   }
 
-  Future<void> _saveHeaders() async {
+  Future<void> _openSettings() async {
+    final result = await showModalBottomSheet<SettingsValues>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(88),
+      builder: (context) => SettingsSheet(
+        initial: SettingsValues(
+          uaIndex: _uaIndex,
+          refererMode: _refererMode == _RefererMode.currentDomain ? 1 : 0,
+          cookie: _cookieController.text,
+          showPanel: _panelVisible,
+        ),
+        uaLabels: <String>[for (final preset in _uaPresets) preset.label],
+        onShowPanelChanged: _setPanelVisible,
+      ),
+    );
+    if (result == null || !mounted) return;
+
+    setState(() {
+      _uaIndex = result.uaIndex;
+      _refererMode = result.refererMode == 1
+          ? _RefererMode.currentDomain
+          : _RefererMode.none;
+      _panelVisible = result.showPanel;
+    });
+    _cookieController.text = result.cookie;
+
     final userAgent = _effectiveUserAgent;
     await _browser.setUserAgent(userAgent);
     if (!mounted) return;
-    setState(() => _showHeaders = false);
 
     final uri = _currentUri();
     if (uri != null) {
-      await _browser.reload(headers: _headersFor(uri), userAgent: userAgent);
+      await _browser.reload(
+        headers: _headersFor(uri),
+        userAgent: userAgent,
+      );
     }
     if (!mounted) return;
     _snack(
-      uri == null
-          ? 'Header settings saved'
-          : 'Saved, reloaded with new headers',
+      uri == null ? 'Settings saved' : 'Saved, reloaded with new headers',
     );
   }
 
-  void _resetHeaders() {
-    setState(() {
-      _uaIndex = 0;
-      _refererMode = _RefererMode.none;
-      _cookieController.clear();
-    });
+  void _setPanelVisible(bool value) {
+    if (_panelVisible == value) return;
+    setState(() => _panelVisible = value);
   }
 
   /// Runs the current URL through the native (Rust/wreq) engine so the panel
   /// can show ordered request headers, status, response headers, body and
   /// timing.
-  ///
-  /// [auto] is used by the devtools panel: it follows the WebView URL and stays
-  /// silent when there is nothing to capture yet.
-  Future<void> _captureCurrent({bool auto = false}) async {
-    if (_busy) {
-      if (auto) _pendingAutoCaptureUrl = _browser.url;
-      return;
-    }
-    final uri = auto
-        ? Uri.tryParse(_browser.url ?? '')
-        : (_parseUrl(_urlController.text) ?? Uri.tryParse(_browser.url ?? ''));
-    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
-      if (!auto) _snack('Nothing to capture yet');
+  Future<void> _captureCurrent() async {
+    if (_busy) return;
+    final uri = _parseUrl(_urlController.text) ??
+        (_browser.url == null ? null : Uri.tryParse(_browser.url!));
+    if (uri == null) {
+      _snack('Nothing to capture yet');
       return;
     }
 
@@ -396,21 +395,13 @@ class _BrowserPageState extends State<BrowserPage>
         OrderedHeader(entry.key, entry.value),
     ];
 
-    _autoCapturedUrl = uri.toString();
     setState(() {
       _busy = true;
       _captureError = null;
     });
     try {
       final capture = await _session.capture(uri, headers: headers);
-      if (!mounted) return;
-      setState(() {
-        _capture = capture;
-        _devCaptures.insert(0, capture);
-        while (_devCaptures.length > 30) {
-          _devCaptures.removeLast();
-        }
-      });
+      if (mounted) setState(() => _capture = capture);
     } on BrowserHttpException catch (error) {
       if (mounted) {
         setState(() => _captureError = '${error.code}: ${error.message}');
@@ -420,19 +411,144 @@ class _BrowserPageState extends State<BrowserPage>
         setState(() => _captureError = error.toString());
       }
     } finally {
-      if (mounted) {
-        setState(() => _busy = false);
-        final pending = _pendingAutoCaptureUrl;
-        _pendingAutoCaptureUrl = null;
-        if (pending != null && _devPanelOpen && pending != _autoCapturedUrl) {
-          unawaited(_captureCurrent(auto: true));
-        }
-      }
+      if (mounted) setState(() => _busy = false);
     }
   }
 
-  /// Re-sends one captured exchange with the current header settings so the
-  /// result can be compared against the original packet.
+  // ---------------------------------------------------------------------------
+  // Page-script requests (fetch / XHR / sendBeacon)
+  // ---------------------------------------------------------------------------
+
+  /// Merges the injected script's request/response events into one entry per
+  /// request: headers and body come from the request, status/timing/response
+  /// body from the matching response.
+  void _onPageNetworkEvent(PageNetworkEvent event) {
+    if (!mounted) return;
+    setState(() {
+      final existing = _pageRequests[event.key];
+      _pageRequests[event.key] = existing == null
+          ? _normalizePageEvent(event)
+          : _mergePageEvent(existing, event);
+      while (_pageRequests.length > 50) {
+        _pageRequests.remove(_pageRequests.keys.first);
+      }
+    });
+  }
+
+  /// A lone response/error event has no request row to merge into, so its
+  /// response headers are moved into the response slot.
+  static PageNetworkEvent _normalizePageEvent(PageNetworkEvent event) {
+    if (event.phase == PageNetworkPhase.request) return event;
+    return PageNetworkEvent(
+      sessionId: event.sessionId,
+      page: event.page,
+      id: event.id,
+      phase: event.phase,
+      timestamp: event.timestamp,
+      method: event.method,
+      url: event.url,
+      headers: const <String, String>{},
+      responseHeaders: event.headers,
+      body: event.body,
+      responseBody: event.responseBody,
+      statusCode: event.statusCode,
+      duration: event.duration,
+      size: event.size,
+      message: event.message,
+    );
+  }
+
+  static PageNetworkEvent _mergePageEvent(
+    PageNetworkEvent request,
+    PageNetworkEvent update,
+  ) {
+    return PageNetworkEvent(
+      sessionId:
+          update.sessionId.isEmpty ? request.sessionId : update.sessionId,
+      page: request.page,
+      id: request.id,
+      phase: update.phase == PageNetworkPhase.body
+          ? request.phase
+          : update.phase,
+      timestamp: request.timestamp,
+      method: request.method ?? update.method,
+      url: request.url ?? update.url,
+      headers: request.headers,
+      responseHeaders:
+          update.headers.isNotEmpty ? update.headers : request.responseHeaders,
+      body: request.body ?? update.body,
+      responseBody: update.responseBody ?? request.responseBody,
+      statusCode: update.statusCode ?? request.statusCode,
+      duration: update.duration ?? request.duration,
+      size: update.size ?? request.size,
+      message: update.message ?? request.message,
+    );
+  }
+
+  /// Newest first.
+  List<PageNetworkEvent> get _pageRequestList {
+    final list = _pageRequests.values.toList()
+      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    return list;
+  }
+
+  void _clearPageRequests() {
+    if (_pageRequests.isEmpty) return;
+    setState(_pageRequests.clear);
+  }
+
+  /// Replays a page-script request through the native engine, keeping its
+  /// method, caller headers and body. The fingerprint is applied natively.
+  Future<void> _replayPageEvent(PageNetworkEvent source) async {
+    if (_busy) return;
+    final uri = Uri.tryParse(source.url ?? '');
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      _snack('This row has no replayable URL');
+      return;
+    }
+    final currentHeaders = _headersFor(uri);
+    final headers = <OrderedHeader>[
+      if (_uaOverride != null) OrderedHeader('User-Agent', _uaOverride!),
+      for (final entry in currentHeaders.entries)
+        OrderedHeader(entry.key, entry.value),
+      // Settings win: they describe the identity the user asked for now.
+      for (final entry in source.headers.entries)
+        if (!currentHeaders.containsKey(entry.key))
+          OrderedHeader(entry.key, entry.value),
+    ];
+    final body = source.body == null
+        ? null
+        : Uint8List.fromList(utf8.encode(source.body!));
+
+    setState(() {
+      _busy = true;
+      _captureError = null;
+    });
+    try {
+      final capture = await _session.capture(
+        uri,
+        method: source.method ?? 'GET',
+        headers: headers,
+        body: body,
+      );
+      if (!mounted) return;
+      setState(() {
+        _capture = capture;
+        _tabs.index = 1;
+      });
+      _snack('Replayed through the native engine');
+    } on BrowserHttpException catch (error) {
+      if (mounted) {
+        setState(() => _captureError = '${error.code}: ${error.message}');
+      }
+    } on Object catch (error) {
+      if (mounted) setState(() => _captureError = error.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// Re-sends a captured exchange with the current header settings.
   Future<void> _replayCapture(CapturedExchange source) async {
     if (_busy) return;
     final headers = <OrderedHeader>[
@@ -451,127 +567,52 @@ class _BrowserPageState extends State<BrowserPage>
         headers: headers,
         body: source.requestBody,
       );
-      if (!mounted) return;
-      setState(() {
-        _capture = capture;
-        _devCaptures.insert(0, capture);
-        while (_devCaptures.length > 30) {
-          _devCaptures.removeLast();
-        }
-      });
+      if (mounted) setState(() => _capture = capture);
     } on BrowserHttpException catch (error) {
       if (mounted) {
         setState(() => _captureError = '${error.code}: ${error.message}');
       }
     } on Object catch (error) {
-      if (mounted) {
-        setState(() => _captureError = error.toString());
-      }
+      if (mounted) setState(() => _captureError = error.toString());
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
-  /// Replays a page-script request through the native engine, reusing its
-  /// method, caller headers and body.
-  Future<void> _replayPageEvent(PageNetworkEvent source) async {
-    if (_busy) return;
-    final uri = Uri.tryParse(source.url ?? '');
-    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
-      _snack('这条记录没有可重发的 URL');
+  void _copyText(String text, String label) {
+    if (text.isEmpty) {
+      _snack('Nothing to copy');
       return;
     }
-    final currentHeaders = _headersFor(uri);
-    final headers = <OrderedHeader>[
-      if (_uaOverride != null) OrderedHeader('User-Agent', _uaOverride!),
-      for (final entry in currentHeaders.entries)
-        OrderedHeader(entry.key, entry.value),
-      for (final entry in source.headers.entries)
-        if (!currentHeaders.containsKey(entry.key))
-          OrderedHeader(entry.key, entry.value),
-    ];
-    final body = source.body == null
-        ? null
-        : Uint8List.fromList(utf8.encode(source.body!));
-    setState(() {
-      _busy = true;
-      _captureError = null;
-    });
-    try {
-      final capture = await _session.capture(
-        uri,
-        method: source.method ?? 'GET',
-        headers: headers,
-        body: body,
-      );
-      if (!mounted) return;
-      setState(() {
-        _capture = capture;
-        _devCaptures.insert(0, capture);
-        while (_devCaptures.length > 30) {
-          _devCaptures.removeLast();
-        }
-      });
-    } on BrowserHttpException catch (error) {
-      if (mounted) {
-        setState(() => _captureError = '${error.code}: ${error.message}');
-      }
-    } on Object catch (error) {
-      if (mounted) {
-        setState(() => _captureError = error.toString());
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+    unawaited(Clipboard.setData(ClipboardData(text: text)));
+    _snack('$label copied');
   }
 
-  void _toggleDevPanel() {
-    if (_devPanelOpen) {
-      _closeDevPanel();
-      return;
-    }
-    setState(() {
-      _devPanelOpen = true;
-      _autoCapturedUrl = null;
-    });
-    unawaited(_browser.refreshResources());
-    unawaited(_captureCurrent(auto: true));
-  }
+  // ---------------------------------------------------------------------------
+  // Page request detail
+  // ---------------------------------------------------------------------------
 
-  /// Close = clean the collected packets/logs, then refresh the page so the
-  /// next open starts from a fresh document.
-  void _closeDevPanel() {
-    setState(() {
-      _devPanelOpen = false;
-      _devCaptures.clear();
-      _pageRequests.clear();
-      _events.clear();
-      _capture = null;
-      _captureError = null;
-      _autoCapturedUrl = null;
-      _pendingAutoCaptureUrl = null;
-    });
-    unawaited(_refreshAfterDevPanel());
-  }
-
-  Future<void> _refreshAfterDevPanel() async {
-    final uri = _currentUri();
-    try {
-      if (uri == null) {
-        await _browser.refreshResources();
-        return;
-      }
-      await _browser.reload(
-        headers: _headersFor(uri),
-        userAgent: _effectiveUserAgent,
-      );
-    } on Object catch (error) {
-      if (mounted) _snack('Refresh failed: $error');
-    }
+  void _openPageDetail(PageNetworkEvent event) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(88),
+      builder: (_) => _PageRequestDetail(
+        event: event,
+        onReplay: () {
+          Navigator.of(context).pop();
+          unawaited(_replayPageEvent(event));
+        },
+      ),
+    );
   }
 
   @override
   void dispose() {
+    _erudaRestoreTimer?.cancel();
+    _stopErudaSync();
+    _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
     unawaited(_pageSubscription.cancel());
     _browser.removeListener(_onBrowserChanged);
@@ -584,15 +625,19 @@ class _BrowserPageState extends State<BrowserPage>
     super.dispose();
   }
 
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: AppColors.surface,
       body: SafeArea(
         child: Column(
           children: <Widget>[
             _buildToolbar(),
-            if (_showHeaders) _buildHeaderSettings(),
-            const Divider(height: 1),
+            _buildContextBar(),
             Expanded(child: _buildSplitBody()),
           ],
         ),
@@ -600,32 +645,62 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  Widget _buildDevButton() {
+  Widget _buildToolbar() {
+    return Container(
+      color: AppColors.surface,
+      padding: const EdgeInsets.fromLTRB(6, 2, 8, 8),
+      child: Row(
+        children: <Widget>[
+          _toolButton(
+            Icons.chevron_left_rounded,
+            'Back',
+            _browser.canGoBack ? () => unawaited(_browser.goBack()) : null,
+            size: 24,
+          ),
+          _toolButton(
+            Icons.chevron_right_rounded,
+            'Forward',
+            _browser.canGoForward ? () => unawaited(_browser.goForward()) : null,
+            size: 24,
+          ),
+          Expanded(child: _buildAddressField()),
+          _toolButton(
+            Icons.tune_rounded,
+            'Settings',
+            () => unawaited(_openSettings()),
+          ),
+          _buildErudaButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _toolButton(
+    IconData icon,
+    String tooltip,
+    VoidCallback? onTap, {
+    bool active = false,
+    double size = 21,
+  }) {
     return Tooltip(
-      message: _devPanelOpen ? '关闭 DevTools' : '打开 DevTools',
+      message: tooltip,
       child: Material(
-        color: Colors.transparent,
+        color: active ? AppColors.ink : Colors.transparent,
+        borderRadius: BorderRadius.circular(11),
         child: InkWell(
-          borderRadius: BorderRadius.circular(26),
-          onTap: _toggleDevPanel,
-          child: Opacity(
-            opacity: 0.78,
-            child: Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: const Color(0xFF1B1F23),
-                shape: BoxShape.circle,
-                border: Border.all(color: const Color(0x664DD0B1)),
-                boxShadow: const <BoxShadow>[
-                  BoxShadow(color: Color(0x55000000), blurRadius: 10),
-                ],
-              ),
-              child: Icon(
-                _devPanelOpen ? Icons.close : Icons.terminal,
-                color: const Color(0xFF4DD0B1),
-                size: 22,
-              ),
+          borderRadius: BorderRadius.circular(11),
+          onTap: onTap,
+          child: SizedBox(
+            width: 34,
+            height: 34,
+            child: Icon(
+              icon,
+              size: size,
+              color: onTap == null
+                  ? AppColors.faint.withAlpha(150)
+                  : active
+                      ? AppColors.onInk
+                      : AppColors.ink,
             ),
           ),
         ),
@@ -633,267 +708,258 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  Widget _buildToolbar() {
-    final scheme = Theme.of(context).colorScheme;
+  Widget _buildErudaButton() {
+    if (_erudaBusy) {
+      return const SizedBox(
+        width: 34,
+        height: 34,
+        child: Center(
+          child: SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: AppColors.ink,
+            ),
+          ),
+        ),
+      );
+    }
+    return _toolButton(
+      Icons.terminal_rounded,
+      _erudaOpen ? 'Close Eruda' : 'Eruda half-screen',
+      () => unawaited(_toggleEruda()),
+      active: _erudaOpen,
+      size: 19,
+    );
+  }
+
+  Widget _buildAddressField() {
     return Container(
-      color: scheme.surfaceContainerHigh,
-      padding: const EdgeInsets.fromLTRB(2, 6, 4, 6),
+      height: 38,
+      margin: const EdgeInsets.symmetric(horizontal: 2),
+      padding: const EdgeInsets.only(left: 11, right: 3),
+      decoration: BoxDecoration(
+        color: AppColors.wash,
+        borderRadius: BorderRadius.circular(19),
+      ),
       child: Row(
         children: <Widget>[
-          _compactIcon(
-            Icons.arrow_back,
-            'Back',
-            _browser.canGoBack ? () => unawaited(_browser.goBack()) : null,
+          _addressLeading(),
+          const SizedBox(width: 7),
+          Expanded(
+            child: _urlFocused ? _buildUrlEditor() : _buildUrlPreview(),
           ),
-          _compactIcon(
-            Icons.arrow_forward,
-            'Forward',
-            _browser.canGoForward
-                ? () => unawaited(_browser.goForward())
-                : null,
-          ),
-          _compactIcon(Icons.refresh, 'Reload', () => unawaited(_reload())),
-          Expanded(child: _buildUrlField()),
-          _compactIcon(
-            _showHeaders ? Icons.tune : Icons.tune_outlined,
-            'Request headers',
-            () => setState(() => _showHeaders = !_showHeaders),
-          ),
+          _urlFocused
+              ? _pillAction(Icons.arrow_forward_rounded, 'Go', () {
+                  _urlFocus.unfocus();
+                  unawaited(_go());
+                })
+              : _pillAction(
+                  Icons.refresh_rounded,
+                  'Reload',
+                  () => unawaited(_reload()),
+                ),
         ],
       ),
     );
   }
 
-  Widget _buildUrlField() {
-    final scheme = Theme.of(context).colorScheme;
-    return ValueListenableBuilder<TextEditingValue>(
-      valueListenable: _urlController,
-      builder: (context, value, _) {
-        return TextField(
-          controller: _urlController,
-          focusNode: _urlFocus,
-          keyboardType: TextInputType.url,
-          textInputAction: TextInputAction.go,
-          autocorrect: false,
-          enableSuggestions: false,
-          style: const TextStyle(fontSize: 13),
-          decoration: InputDecoration(
-            isDense: true,
-            filled: true,
-            fillColor: scheme.surface,
-            hintText: 'https://example.com',
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 12,
-              vertical: 10,
+  Widget _addressLeading() {
+    final text = _urlController.text.trim();
+    if (text.isEmpty) {
+      return const Icon(
+        Icons.search_rounded,
+        size: 14,
+        color: AppColors.faint,
+      );
+    }
+    if (text.startsWith('https://')) {
+      return const Icon(
+        Icons.lock_outline_rounded,
+        size: 12,
+        color: AppColors.muted,
+      );
+    }
+    return const Icon(
+      Icons.public_rounded,
+      size: 13,
+      color: AppColors.muted,
+    );
+  }
+
+  Widget _buildUrlEditor() {
+    return TextField(
+      controller: _urlController,
+      focusNode: _urlFocus,
+      keyboardType: TextInputType.url,
+      textInputAction: TextInputAction.go,
+      autocorrect: false,
+      enableSuggestions: false,
+      style: const TextStyle(fontSize: 12.5, color: AppColors.ink),
+      cursorColor: AppColors.ink,
+      decoration: const InputDecoration(
+        isCollapsed: true,
+        border: InputBorder.none,
+      ),
+      onSubmitted: (_) => unawaited(_go()),
+    );
+  }
+
+  Widget _buildUrlPreview() {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => _urlFocus.requestFocus(),
+      child: ValueListenableBuilder<TextEditingValue>(
+        valueListenable: _urlController,
+        builder: (context, value, _) {
+          final raw = value.text.trim();
+          if (raw.isEmpty) {
+            return const Text(
+              'Search or enter address',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12.5, color: AppColors.faint),
+            );
+          }
+          final uri = Uri.tryParse(
+            raw.contains('://') ? raw : 'https://$raw',
+          );
+          if (uri == null || uri.host.isEmpty) {
+            return Text(
+              raw,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12.5, color: AppColors.ink),
+            );
+          }
+          final index = raw.indexOf(uri.host);
+          final rest = index < 0
+              ? ''
+              : raw.substring(index + uri.host.length);
+          return Text.rich(
+            TextSpan(
+              children: <InlineSpan>[
+                TextSpan(
+                  text: uri.host,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.ink,
+                  ),
+                ),
+                TextSpan(
+                  text: rest,
+                  style: const TextStyle(color: AppColors.muted),
+                ),
+              ],
             ),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(20),
-              borderSide: BorderSide.none,
-            ),
-            suffixIconConstraints: const BoxConstraints(minWidth: 0),
-            suffixIcon: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                if (value.text.isNotEmpty)
-                  _compactIcon(Icons.close, 'Clear', () {
-                    _urlController.clear();
-                    _urlFocus.requestFocus();
-                  }),
-                _compactIcon(Icons.arrow_forward, 'Go', () => unawaited(_go())),
-                const SizedBox(width: 2),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 12.5),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _pillAction(IconData icon, String tooltip, VoidCallback onTap) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(9),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(9),
+          onTap: onTap,
+          child: SizedBox(
+            width: 27,
+            height: 27,
+            child: Icon(icon, size: 15, color: AppColors.ink),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildContextBar() {
+    final fingerprint = _capture?.response.fingerprint;
+    return Container(
+      height: 26,
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      decoration: const BoxDecoration(
+        color: Color(0xFFF6F6F1),
+        border: Border(
+          top: BorderSide(color: AppColors.line),
+          bottom: BorderSide(color: AppColors.line),
+        ),
+      ),
+      child: Row(
+        children: <Widget>[
+          Container(
+            width: 6,
+            height: 6,
+            decoration: BoxDecoration(
+              color: AppColors.signal,
+              shape: BoxShape.circle,
+              boxShadow: <BoxShadow>[
+                BoxShadow(
+                  color: AppColors.signal.withAlpha(80),
+                  spreadRadius: 2,
+                ),
               ],
             ),
           ),
-          onSubmitted: (_) => unawaited(_go()),
-        );
-      },
-    );
-  }
-
-  Widget _buildHeaderSettings() {
-    final scheme = Theme.of(context).colorScheme;
-    final labelStyle = TextStyle(fontSize: 11, color: scheme.onSurfaceVariant);
-    return Container(
-      width: double.infinity,
-      color: scheme.surfaceContainer,
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          const Text(
-            'Request headers',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          InputDecorator(
-            decoration: const InputDecoration(
-              labelText: 'User-Agent',
-              isDense: true,
-              border: OutlineInputBorder(),
-              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 2),
-            ),
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<int>(
-                value: _uaIndex,
-                isDense: true,
-                isExpanded: true,
-                items: <DropdownMenuItem<int>>[
-                  for (var i = 0; i < _uaPresets.length; i++)
-                    DropdownMenuItem<int>(
-                      value: i,
-                      child: Text(
-                        _uaPresets[i].label,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 13),
-                      ),
-                    ),
-                ],
-                onChanged: (value) {
-                  if (value != null) setState(() => _uaIndex = value);
-                },
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              'Engine ready · ${_profileLabel ?? 'native profile'}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 9.5,
+                color: AppColors.muted,
+                letterSpacing: 0.1,
               ),
             ),
           ),
-          const SizedBox(height: 8),
-          InputDecorator(
-            decoration: const InputDecoration(
-              labelText: 'Referer',
-              isDense: true,
-              border: OutlineInputBorder(),
-              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+          Text(
+            fingerprint == null
+                ? 'WKWebView + wreq'
+                : '${fingerprint.tlsVersion} · ${fingerprint.alpn}',
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 9,
+              color: AppColors.faint,
             ),
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<_RefererMode>(
-                value: _refererMode,
-                isDense: true,
-                isExpanded: true,
-                items: const <DropdownMenuItem<_RefererMode>>[
-                  DropdownMenuItem<_RefererMode>(
-                    value: _RefererMode.none,
-                    child: Text('无', style: TextStyle(fontSize: 13)),
-                  ),
-                  DropdownMenuItem<_RefererMode>(
-                    value: _RefererMode.currentDomain,
-                    child: Text('当前域名', style: TextStyle(fontSize: 13)),
-                  ),
-                ],
-                onChanged: (value) {
-                  if (value != null) setState(() => _refererMode = value);
-                },
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _cookieController,
-            autocorrect: false,
-            enableSuggestions: false,
-            style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-            decoration: const InputDecoration(
-              labelText: 'Cookie',
-              hintText: 'name=value; name2=value2',
-              isDense: true,
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: <Widget>[
-              Expanded(child: Text('保存后会用新的请求头重新加载当前页面。', style: labelStyle)),
-              TextButton(onPressed: _resetHeaders, child: const Text('重置')),
-              const SizedBox(width: 4),
-              FilledButton.icon(
-                onPressed: () => unawaited(_saveHeaders()),
-                icon: const Icon(Icons.check, size: 18),
-                label: const Text('保存并刷新'),
-              ),
-            ],
           ),
         ],
       ),
     );
   }
 
-  Widget _compactIcon(IconData icon, String tooltip, VoidCallback? onPressed) {
-    return IconButton(
-      tooltip: tooltip,
-      onPressed: onPressed,
-      icon: Icon(icon, size: 20),
-      padding: EdgeInsets.zero,
-      visualDensity: VisualDensity.compact,
-      constraints: const BoxConstraints.tightFor(width: 34, height: 34),
-    );
-  }
+  // ---------------------------------------------------------------------------
+  // Web area + start page
+  // ---------------------------------------------------------------------------
 
   Widget _buildSplitBody() {
-    const handleHeight = 14.0;
+    const handleHeight = 15.0;
     return LayoutBuilder(
       builder: (context, constraints) {
-        final total = math.max(0.0, constraints.maxHeight);
-        final panelSpace = _devPanelOpen
-            ? total
-            : math.max(0.0, total - handleHeight);
-        final fraction = _devPanelOpen ? _devPanelFraction : _panelFraction;
-        final panelHeight = (panelSpace * fraction)
-            .clamp(0.0, panelSpace)
-            .toDouble();
-        final webHeight = panelSpace - panelHeight;
-
+        final available = math.max(
+          0.0,
+          constraints.maxHeight - (_panelVisible ? handleHeight : 0),
+        );
+        final panelHeight = _panelVisible
+            ? (available * _panelFraction)
+                .clamp(0.0, available * 0.85)
+                .toDouble()
+            : 0.0;
+        final webHeight = math.max(0.0, available - panelHeight);
         return Column(
           children: <Widget>[
-            SizedBox(
-              height: webHeight,
-              child: Stack(
-                children: <Widget>[
-                  Positioned.fill(child: _buildWebView()),
-                  Positioned(right: 14, bottom: 14, child: _buildDevButton()),
-                ],
-              ),
-            ),
-            if (_devPanelOpen)
-              SizedBox(
-                height: panelHeight,
-                child: DevPanel(
-                  captures: _devCaptures,
-                  pageRequests: _pageRequestList,
-                  events: _events,
-                  busy: _busy,
-                  captureError: _captureError,
-                  page: DevPageState(
-                    title: _browser.title,
-                    url: _browser.url,
-                    statusCode: _browser.statusCode,
-                    userAgentLabel: _uaPresets[_uaIndex].label,
-                    profileId: _browser.session.profile.id,
-                    canGoBack: _browser.canGoBack,
-                    canGoForward: _browser.canGoForward,
-                    resources: _browser.resourceTimings,
-                  ),
-                  onResize: (delta) {
-                    if (panelSpace <= 0) return;
-                    setState(() {
-                      _devPanelFraction =
-                          (_devPanelFraction + delta / panelSpace)
-                              .clamp(0.2, 0.85)
-                              .toDouble();
-                    });
-                  },
-                  onCapture: () => unawaited(_captureCurrent()),
-                  onClear: () => setState(() {
-                    _devCaptures.clear();
-                    _pageRequests.clear();
-                    _events.clear();
-                    _capture = null;
-                    _captureError = null;
-                    _autoCapturedUrl = null;
-                  }),
-                  onClose: _closeDevPanel,
-                  onReplay: (capture) => unawaited(_replayCapture(capture)),
-                  onReplayPage: (event) => unawaited(_replayPageEvent(event)),
-                ),
-              )
-            else ...<Widget>[
-              _buildDragHandle(panelSpace),
+            SizedBox(height: webHeight, child: _buildWebArea()),
+            if (_panelVisible) ...<Widget>[
+              _buildDragHandle(available),
               SizedBox(height: panelHeight, child: _buildPanel()),
             ],
           ],
@@ -902,26 +968,53 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
+  Widget _buildWebArea() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final height = constraints.maxHeight;
+        final top = (height * (1 - _erudaSize / 100) - _erudaPillHeight / 2)
+            .clamp(0.0, math.max(0.0, height - _erudaPillHeight))
+            .toDouble();
+        return Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            BrowserView(controller: _browser),
+            if (!_started && !_hasDocument)
+              _StartPage(onOpen: _openShortcut),
+            if (_erudaOpen)
+              Positioned(
+                left: 0,
+                right: 0,
+                top: top,
+                height: _erudaPillHeight,
+                child: Center(child: _buildErudaPill(height)),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
   Widget _buildDragHandle(double available) {
-    final scheme = Theme.of(context).colorScheme;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onVerticalDragUpdate: (details) {
         if (available <= 0) return;
         setState(() {
-          _panelFraction = (_panelFraction - details.delta.dy / available)
-              .clamp(0.15, 0.85)
-              .toDouble();
+          _panelFraction =
+              (_panelFraction - details.delta.dy / available)
+                  .clamp(0.15, 0.8)
+                  .toDouble();
         });
       },
       child: SizedBox(
-        height: 14,
+        height: 15,
         child: Center(
           child: Container(
-            width: 44,
+            width: 42,
             height: 4,
             decoration: BoxDecoration(
-              color: scheme.outlineVariant,
+              color: const Color(0xFFCFD1C6),
               borderRadius: BorderRadius.circular(2),
             ),
           ),
@@ -930,250 +1023,2317 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  Widget _buildWebView() {
-    return BrowserView(controller: _browser, initialUri: _initialUri);
-  }
+  // ---------------------------------------------------------------------------
+  // Panel
+  // ---------------------------------------------------------------------------
 
   Widget _buildPanel() {
-    return Column(
-      children: <Widget>[
-        TabBar(
-          controller: _tabs,
-          tabs: <Widget>[
-            const Tab(text: 'WebView'),
-            const Tab(text: 'Engine'),
-            Tab(text: 'Log (${_events.length})'),
-          ],
-        ),
-        Expanded(
-          child: TabBarView(
-            controller: _tabs,
-            children: <Widget>[
-              _buildWebViewInfo(),
-              _buildEngineInfo(),
-              _buildLog(),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  /// Main-document facts reported by WKWebView plus the resource timings the
-  /// Performance API exposes. Subresource headers and bodies are not available
-  /// to host apps, which is why the Engine tab exists.
-  Widget _buildWebViewInfo() {
-    final resources = _browser.resourceTimings;
-    return ListView(
-      padding: const EdgeInsets.all(12),
-      children: <Widget>[
-        _kv('Title', _browser.title ?? '—'),
-        _kv('URL', _browser.url ?? '—'),
-        _kv('HTTP status', '${_browser.statusCode ?? '—'}'),
-        _kv(
-          'History',
-          'back=${_browser.canGoBack} forward=${_browser.canGoForward}',
-        ),
-        _kv('User-Agent', _uaPresets[_uaIndex].label),
-        const SizedBox(height: 8),
-        Row(
-          children: <Widget>[
-            const Expanded(
-              child: Text(
-                'Resource timings',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-            ),
-            TextButton(
-              onPressed: () {
-                unawaited(_browser.refreshResources());
-              },
-              child: const Text('Refresh'),
-            ),
-          ],
-        ),
-        const Text(
-          'WebKit does not expose headers or bodies of WebView subresources. '
-          'Use Engine for a full request/response capture of the current URL.',
-          style: TextStyle(fontSize: 11),
-        ),
-        const SizedBox(height: 8),
-        if (resources.isEmpty)
-          const Text('No PerformanceResourceTiming entries yet.')
-        else
-          for (final resource in resources)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 3),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Text(
-                    resource.url,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 11,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                  Text(
-                    '${resource.initiatorType.isEmpty ? 'resource' : resource.initiatorType}'
-                    ' · ${resource.duration.toStringAsFixed(1)} ms'
-                    ' · transfer ${resource.transferSize ?? 0} B'
-                    ' · body ${resource.encodedBodySize ?? 0} B',
-                    style: const TextStyle(fontSize: 10, color: Colors.grey),
-                  ),
-                ],
-              ),
-            ),
-        const SizedBox(height: 12),
-        _kv(
-          'Shared jar',
-          '${_browser.session.profile.id} · persistent WKWebsiteDataStore',
-        ),
-      ],
-    );
-  }
-
-  Widget _buildEngineInfo() {
-    final error = _captureError;
-    final capture = _capture;
-
-    return ListView(
-      padding: const EdgeInsets.all(12),
-      children: <Widget>[
-        Row(
-          children: <Widget>[
-            const Expanded(
-              child: Text(
-                'Native engine capture',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-            ),
-            TextButton.icon(
-              onPressed: _busy ? null : () => unawaited(_captureCurrent()),
-              icon: const Icon(Icons.radar, size: 18),
-              label: const Text('Capture URL'),
-            ),
-          ],
-        ),
-        const Text(
-          'Same persistent cookie jar as the WebView. UA, Referer and Cookie '
-          'from the header settings are applied to the capture request.',
-          style: TextStyle(fontSize: 11),
-        ),
-        if (error != null)
+    return Container(
+      color: AppColors.surface,
+      child: Column(
+        children: <Widget>[
           Padding(
-            padding: const EdgeInsets.only(top: 8),
-            child: Text(error, style: const TextStyle(color: Colors.red)),
-          ),
-        if (capture == null)
-          const Padding(
-            padding: EdgeInsets.only(top: 16),
-            child: Text('No capture yet. Load a page, then tap Capture URL.'),
-          )
-        else ...<Widget>[
-          const Divider(),
-          _kv('Request id', capture.requestId),
-          _kv('Method', '${capture.method} ${capture.uri}'),
-          _kv('Status', '${capture.response.statusCode}'),
-          _kv('Elapsed', '${capture.elapsed.inMilliseconds} ms'),
-          _kv('Response body', '${capture.responseBodyLength} bytes'),
-          _kv('Profile', capture.profile.profileId),
-          const SizedBox(height: 8),
-          _section('Request headers (ordered, as handed to Rust)'),
-          for (final header in capture.requestHeaders)
-            _headerLine('${header.name}: ${header.value}'),
-          if (capture.requestHeaders.isEmpty)
-            const Text(
-              '(no caller headers; profile defaults are applied natively)',
+            padding: const EdgeInsets.fromLTRB(12, 9, 8, 6),
+            child: Row(
+              children: <Widget>[
+                Expanded(child: _buildSegmented()),
+                const SizedBox(width: 4),
+                _toolButton(
+                  Icons.keyboard_arrow_down_rounded,
+                  'Hide info panel',
+                  () => _setPanelVisible(false),
+                  size: 20,
+                ),
+              ],
             ),
-          const SizedBox(height: 6),
-          _section('Native identity'),
-          _headerLine('User-Agent: ${capture.profile.userAgent}'),
-          for (final hint in capture.profile.clientHints.entries)
-            _headerLine('${hint.key}: ${hint.value}'),
-          const SizedBox(height: 8),
-          _section('Response headers (received order)'),
-          for (final header in capture.response.headers)
-            _headerLine('${header.name}: ${header.value}'),
-          const SizedBox(height: 8),
-          _section('Body preview'),
-          SelectableText(
-            formatBodyPreview(capture.response),
-            style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+          ),
+          Expanded(
+            child: AnimatedBuilder(
+              animation: _tabs,
+              builder: (context, _) {
+                return IndexedStack(
+                  index: _tabs.index,
+                  children: <Widget>[
+                    _buildWebViewTab(),
+                    _buildEngineTab(),
+                    _buildPageTab(),
+                    _buildLogTab(),
+                  ],
+                );
+              },
+            ),
           ),
         ],
-      ],
+      ),
     );
   }
 
-  Widget _buildLog() {
-    if (_events.isEmpty) {
-      return const Center(child: Text('No request events yet.'));
-    }
-    return ListView.builder(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      itemCount: _events.length,
-      itemBuilder: (context, index) {
-        final event = _events[index];
-        final color = switch (event.level) {
-          RequestLogLevel.error => Colors.red,
-          RequestLogLevel.warn => Colors.orange,
-          _ => null,
-        };
-        return ListTile(
-          dense: true,
-          leading: Text(
-            event.phase.name,
-            style: TextStyle(fontSize: 11, color: color),
+  Widget _buildSegmented() {
+    return AnimatedBuilder(
+      animation: _tabs,
+      builder: (context, _) {
+        return Container(
+          height: 34,
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            color: AppColors.wash,
+            borderRadius: BorderRadius.circular(12),
           ),
-          title: Text(
-            '${event.method ?? ''} ${event.uri ?? ''}'.trim(),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
-          ),
-          subtitle: Text(
-            '${event.statusCode == null ? '' : '${event.statusCode} '}'
-            '${event.elapsed == null ? '' : '${event.elapsed!.inMilliseconds} ms '}'
-            '${event.errorCode ?? ''} ${event.message ?? ''}',
-            style: TextStyle(fontSize: 10, color: color),
-          ),
-          trailing: Text(
-            '${event.timestamp.hour.toString().padLeft(2, '0')}:'
-            '${event.timestamp.minute.toString().padLeft(2, '0')}:'
-            '${event.timestamp.second.toString().padLeft(2, '0')}',
-            style: const TextStyle(fontSize: 10),
+          child: Row(
+            children: <Widget>[
+              _segItem(0, 'WebView', null),
+              _segItem(1, 'Engine', null),
+              _segItem(2, 'Page', _pageRequests.length),
+              _segItem(3, 'Log', _events.length),
+            ],
           ),
         );
       },
     );
   }
 
-  static Widget _kv(String key, String value) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 2),
+  Widget _segItem(int index, String label, int? count) {
+    final selected = _tabs.index == index;
+    return Expanded(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _tabs.index = index,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          decoration: BoxDecoration(
+            color: selected ? AppColors.card : Colors.transparent,
+            borderRadius: BorderRadius.circular(9),
+            boxShadow: selected
+                ? const <BoxShadow>[
+                    BoxShadow(
+                      color: Color(0x140E0F0E),
+                      blurRadius: 2,
+                      offset: Offset(0, 1),
+                    ),
+                  ]
+                : null,
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: <Widget>[
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    letterSpacing: 0.1,
+                    fontWeight:
+                        selected ? FontWeight.w600 : FontWeight.w500,
+                    color: selected ? AppColors.ink : AppColors.muted,
+                  ),
+                ),
+              ),
+              if (count != null && count > 0) ...<Widget>[
+                const SizedBox(width: 5),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: selected ? AppColors.signal : AppColors.wash,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    count > 99 ? '99+' : '$count',
+                    style: TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 8.5,
+                      color: selected ? AppColors.ink : AppColors.faint,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // WebView tab
+  // ---------------------------------------------------------------------------
+
+  Widget _buildWebViewTab() {
+    final resources = _browser.resourceTimings;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(14, 2, 14, 18),
+      children: <Widget>[
+        _kv('Title', _browser.title ?? '—'),
+        _kv('URL', _browser.url ?? '—', mono: true),
+        _kv('Status', _browser.statusCode == null
+            ? '—'
+            : '${_browser.statusCode} · OK'),
+        _kv(
+          'History',
+          'back=${_browser.canGoBack} · forward=${_browser.canGoForward}',
+          mono: true,
+        ),
+        _kv('User-Agent', _uaPresets[_uaIndex].label),
+        const SizedBox(height: 10),
+        const _Notice(
+          'WebKit does not expose subresource headers or bodies. Page shows '
+          'fetch/XHR/beacon calls with POST bodies; Engine replays the URL '
+          'through the native fingerprint engine.',
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: <Widget>[
+            const Text(
+              'Resource timings',
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '${resources.length}',
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9,
+                color: AppColors.faint,
+              ),
+            ),
+            const Spacer(),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => unawaited(_browser.refreshResources()),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                child: Text(
+                  'Refresh',
+                  style: TextStyle(fontSize: 10, color: AppColors.muted),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        if (resources.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 10),
+            child: Text(
+              'No PerformanceResourceTiming entries yet.',
+              style: TextStyle(fontSize: 10.5, color: AppColors.faint),
+            ),
+          )
+        else
+          for (final resource in resources)
+            _ResourceRow(
+              type: resource.initiatorType.isEmpty
+                  ? 'resource'
+                  : resource.initiatorType,
+              url: resource.url,
+              duration: resource.duration,
+              transferSize: resource.transferSize,
+              bodySize: resource.encodedBodySize,
+            ),
+        const SizedBox(height: 12),
+        _kv(
+          'Shared jar',
+          '${_browser.session.profile.id} · persistent WKWebsiteDataStore',
+          mono: true,
+        ),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Engine tab
+  // ---------------------------------------------------------------------------
+
+  Widget _buildEngineTab() {
+    final error = _captureError;
+    final capture = _capture;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(14, 2, 14, 20),
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            const Expanded(
+              child: Text(
+                'Native engine capture',
+                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600),
+              ),
+            ),
+            _SmallButton(
+              label: _busy ? 'Capturing…' : 'Capture',
+              icon: Icons.radar_rounded,
+              onTap: _busy ? null : () => unawaited(_captureCurrent()),
+            ),
+          ],
+        ),
+        const SizedBox(height: 2),
+        const Text(
+          'Same cookie jar as the WebView. UA, Referer and Cookie from '
+          'settings are applied to the capture request.',
+          style: TextStyle(
+            fontSize: 9.5,
+            height: 1.5,
+            color: AppColors.muted,
+          ),
+        ),
+        if (error != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              error,
+              style: const TextStyle(
+                fontSize: 10.5,
+                color: AppColors.danger,
+              ),
+            ),
+          ),
+        if (capture == null) ...<Widget>[
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+            decoration: BoxDecoration(
+              color: AppColors.card,
+              border: Border.all(color: AppColors.line),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              children: <Widget>[
+                const Icon(
+                  Icons.radar_rounded,
+                  size: 26,
+                  color: AppColors.faint,
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'No capture yet',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                const Text(
+                  'Load a page, then tap Capture to replay the URL through '
+                  'the native engine.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 9.5,
+                    height: 1.5,
+                    color: AppColors.muted,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                _SmallButton(
+                  label: 'Capture URL',
+                  icon: Icons.radar_rounded,
+                  onTap: _busy
+                      ? null
+                      : () => unawaited(_captureCurrent()),
+                ),
+              ],
+            ),
+          ),
+        ] else ...<Widget>[
+          const SizedBox(height: 10),
+          Row(
+            children: <Widget>[
+              _Stat(
+                label: 'Status',
+                value: '${capture.response.statusCode}',
+              ),
+              const SizedBox(width: 7),
+              _Stat(
+                label: 'Elapsed',
+                value: '${capture.elapsed.inMilliseconds}',
+                unit: 'ms',
+              ),
+              const SizedBox(width: 7),
+              _Stat(
+                label: 'Body',
+                value: _kb(capture.responseBodyLength),
+                unit: 'KB',
+              ),
+            ],
+          ),
+          const SizedBox(height: 9),
+          _buildIdentityCard(capture),
+          const SizedBox(height: 12),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: <Widget>[
+                _ActionChip(
+                  label: 'cURL',
+                  icon: Icons.terminal_rounded,
+                  onTap: () => _copyText(buildCurl(capture), 'cURL'),
+                ),
+                const SizedBox(width: 6),
+                _ActionChip(
+                  label: 'URL',
+                  icon: Icons.link_rounded,
+                  onTap: () =>
+                      _copyText(capture.uri.toString(), 'URL'),
+                ),
+                const SizedBox(width: 6),
+                _ActionChip(
+                  label: 'Request headers',
+                  icon: Icons.list_alt_rounded,
+                  onTap: () => _copyText(
+                    headerBlock(capture.requestHeaders),
+                    'Headers',
+                  ),
+                ),
+                if (capture.requestBody != null &&
+                    capture.requestBody!.isNotEmpty) ...<Widget>[
+                  const SizedBox(width: 6),
+                  _ActionChip(
+                    label: 'Request body',
+                    icon: Icons.upload_rounded,
+                    onTap: () => _copyText(
+                      utf8.decode(
+                        capture.requestBody!,
+                        allowMalformed: true,
+                      ),
+                      'Request body',
+                    ),
+                  ),
+                ],
+                const SizedBox(width: 6),
+                _ActionChip(
+                  label: 'Response body',
+                  icon: Icons.download_rounded,
+                  onTap: () => _copyText(
+                    formatBodyPreview(capture.response),
+                    'Response body',
+                  ),
+                ),
+                const SizedBox(width: 6),
+                _ActionChip(
+                  label: 'Replay',
+                  icon: Icons.replay_rounded,
+                  onTap: _busy
+                      ? null
+                      : () => unawaited(_replayCapture(capture)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          const _SectionLabel('Request headers — wire order'),
+          for (var i = 0; i < capture.requestHeaders.length; i++)
+            _HeaderLine(
+              index: '${i + 1}'.padLeft(2, '0'),
+              name: capture.requestHeaders[i].name,
+              value: capture.requestHeaders[i].value,
+            ),
+          if (capture.requestHeaders.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: Text(
+                '(no caller headers; profile defaults are applied natively)',
+                style: TextStyle(fontSize: 9.5, color: AppColors.faint),
+              ),
+            ),
+          const SizedBox(height: 12),
+          _SectionLabel('Response headers · ${capture.response.headers.length}'),
+          for (var i = 0; i < capture.response.headers.length; i++)
+            _HeaderLine(
+              index: '${i + 1}'.padLeft(2, '0'),
+              name: capture.response.headers[i].name,
+              value: capture.response.headers[i].value,
+            ),
+          const SizedBox(height: 12),
+          const _SectionLabel('Body preview'),
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 2),
+            padding: const EdgeInsets.fromLTRB(11, 9, 11, 10),
+            decoration: BoxDecoration(
+              color: AppColors.dark,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              formatBodyPreview(capture.response),
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9,
+                height: 1.55,
+                color: AppColors.darkText,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildIdentityCard(CapturedExchange capture) {
+    final profile = capture.profile;
+    final fingerprint = capture.response.fingerprint;
+    final hints = profile.clientHints.keys.take(4).toList();
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 11, 12, 12),
+      decoration: BoxDecoration(
+        color: AppColors.dark,
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Container(
+                width: 5,
+                height: 5,
+                decoration: const BoxDecoration(
+                  color: AppColors.signal,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 6),
+              const Text(
+                'NATIVE PROFILE',
+                style: TextStyle(
+                  fontSize: 8,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.3,
+                  color: AppColors.darkMuted,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          _identityLine('profile', profile.profileId),
+          _identityLine('family', profile.family),
+          if (fingerprint != null) ...<Widget>[
+            _identityLine('JA4', fingerprint.ja4),
+            _identityLine('JA3', fingerprint.ja3),
+          ],
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 5,
+            runSpacing: 5,
+            children: <Widget>[
+              if (fingerprint != null) ...<Widget>[
+                _DarkChip(fingerprint.tlsVersion),
+                _DarkChip(fingerprint.alpn),
+                if (fingerprint.h2Settings.isNotEmpty)
+                  _DarkChip(_shorten(fingerprint.h2Settings, 18)),
+              ] else
+                const _DarkChip('TLS / H2 applied natively'),
+              for (final hint in hints) _DarkChip(_shorten(hint, 20)),
+              if (hints.isEmpty) const _DarkChip('UA applied'),
+            ],
+          ),
+          if (fingerprint == null) ...<Widget>[
+            const SizedBox(height: 7),
+            const Text(
+              'JA3 / JA4 export is not wired in this build; the identity is '
+              'still applied by the native profile.',
+              style: TextStyle(
+                fontSize: 8.5,
+                height: 1.45,
+                color: AppColors.darkMuted,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _identityLine(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 3),
+      child: Row(
+        children: <Widget>[
+          SizedBox(
+            width: 46,
+            child: Text(
+              label,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 8.5,
+                color: AppColors.darkMuted,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9.5,
+                color: Color(0xFFDCE0D3),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page tab
+  // ---------------------------------------------------------------------------
+
+  Widget _buildPageTab() {
+    final requests = _pageRequestList;
+    return Column(
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(14, 2, 8, 4),
+          child: Row(
+            children: <Widget>[
+              const Text(
+                'Page script requests',
+                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '${requests.length}',
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 9,
+                  color: AppColors.faint,
+                ),
+              ),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Clear',
+                onPressed: requests.isEmpty ? null : _clearPageRequests,
+                icon: const Icon(
+                  Icons.delete_outline_rounded,
+                  size: 17,
+                  color: AppColors.faint,
+                ),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                constraints:
+                    const BoxConstraints.tightFor(width: 30, height: 30),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: requests.isEmpty
+              ? ListView(
+                  padding: const EdgeInsets.fromLTRB(14, 10, 14, 20),
+                  children: const <Widget>[
+                    _EmptyRequests(),
+                  ],
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+                  itemCount: requests.length + 1,
+                  itemBuilder: (context, index) {
+                    if (index == 0) {
+                      return const _MutedLine(
+                        'Observed by the injected page script. Headers are '
+                        'caller-set; WebKit adds Cookie and Sec-Fetch-* — use '
+                        'Engine for the true wire packet.',
+                      );
+                    }
+                    final event = requests[index - 1];
+                    return _PageRequestRow(
+                      event: event,
+                      onTap: () => _openPageDetail(event),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Log tab
+  // ---------------------------------------------------------------------------
+
+  Widget _buildLogTab() {
+    final warn = _events
+        .where((event) => event.level == RequestLogLevel.warn)
+        .length;
+    final errors = _events
+        .where((event) => event.level == RequestLogLevel.error)
+        .length;
+    final filtered = switch (_logFilter) {
+      1 => _events
+          .where((event) => event.level == RequestLogLevel.warn)
+          .toList(),
+      2 => _events
+          .where((event) => event.level == RequestLogLevel.error)
+          .toList(),
+      _ => _events,
+    };
+
+    return Column(
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(14, 2, 8, 4),
+          child: Row(
+            children: <Widget>[
+              _FilterChip(
+                label: 'All ${_events.length}',
+                selected: _logFilter == 0,
+                onTap: () => setState(() => _logFilter = 0),
+              ),
+              const SizedBox(width: 6),
+              _FilterChip(
+                label: 'Warn $warn',
+                selected: _logFilter == 1,
+                onTap: () => setState(() => _logFilter = 1),
+              ),
+              const SizedBox(width: 6),
+              _FilterChip(
+                label: 'Error $errors',
+                selected: _logFilter == 2,
+                onTap: () => setState(() => _logFilter = 2),
+              ),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Clear log',
+                onPressed: _events.isEmpty
+                    ? null
+                    : () => setState(_events.clear),
+                icon: const Icon(
+                  Icons.delete_outline_rounded,
+                  size: 17,
+                  color: AppColors.faint,
+                ),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                constraints:
+                    const BoxConstraints.tightFor(width: 30, height: 30),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: filtered.isEmpty
+              ? const Center(
+                  child: Text(
+                    'No request events yet.',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      color: AppColors.faint,
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  itemCount: filtered.length,
+                  itemBuilder: (context, index) =>
+                      _LogRow(event: filtered[index]),
+                ),
+        ),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Eruda overlay
+  // ---------------------------------------------------------------------------
+
+  Future<void> _toggleEruda() async {
+    if (_erudaBusy) return;
+
+    if (_erudaOpen) {
+      setState(() {
+        _erudaOpen = false;
+        if (_didHidePanelForEruda && !_panelVisible) _panelVisible = true;
+        _didHidePanelForEruda = false;
+      });
+      _stopErudaSync();
+      _evalQuiet('window.eruda && eruda.hide();');
+      return;
+    }
+
+    if (!_hasDocument) {
+      _snack('Open a page first');
+      return;
+    }
+
+    setState(() => _erudaBusy = true);
+    try {
+      final ok = await _ensureEruda();
+      if (!mounted) return;
+      if (!ok) {
+        _snack('Eruda injection failed: no usable JS context yet');
+        return;
+      }
+      setState(() {
+        _erudaOpen = true;
+        _didHidePanelForEruda = _panelVisible;
+        _panelVisible = false;
+      });
+      _startErudaSync();
+    } on Object catch (error) {
+      if (mounted) _snack('Eruda failed: $error');
+    } finally {
+      if (mounted) setState(() => _erudaBusy = false);
+    }
+  }
+
+  Future<bool> _ensureEruda() async {
+    final present = await _browser.evaluate(
+      '!!(window.eruda && window.__bhEruda)',
+    );
+    if (present != true) {
+      final source = await _loadErudaSource();
+      // End with a serializable expression: WKWebView reports an error when
+      // the last value of the bundle cannot be bridged to Foundation types.
+      await _browser.evaluate('$source\n;0;');
+    }
+    final shown = await _browser.evaluate(_erudaBootScript());
+    return shown == 'ok';
+  }
+
+  /// Prefers the bundle shipped as an asset (fetched at CI build time), then
+  /// falls back to the CDN through the native transport. Cached in memory.
+  Future<String> _loadErudaSource() async {
+    final cached = _erudaSource;
+    if (cached != null) return cached;
+
+    try {
+      final bundled = await rootBundle.loadString('assets/eruda/eruda.js');
+      if (_looksLikeEruda(bundled)) {
+        _erudaSource = bundled;
+        return bundled;
+      }
+    } on Object {
+      // Asset absent in local builds; fall through to the network.
+    }
+
+    Object? lastError;
+    for (final url in _erudaUrls) {
+      try {
+        final response = await _session
+            .get(Uri.parse(url))
+            .timeout(const Duration(seconds: 25));
+        final source = utf8.decode(response.body, allowMalformed: true);
+        if (response.statusCode == 200 && _looksLikeEruda(source)) {
+          _erudaSource = source;
+          return source;
+        }
+        lastError = 'HTTP ${response.statusCode} from $url';
+      } on Object catch (error) {
+        lastError = error;
+      }
+    }
+    throw StateError('could not load eruda.js ($lastError)');
+  }
+
+  bool _looksLikeEruda(String source) =>
+      source.length > 20000 && !source.trimLeft().startsWith('<');
+
+  String _erudaBootScript() {
+    final size = _erudaSize.toStringAsFixed(1);
+    return '''
+(function () {
+  if (!window.eruda) return 'no-bundle';
+  try {
+    if (!window.__bhEruda) {
+      eruda.init({ defaults: { displaySize: $size } });
+      try { eruda.get('entryBtn').hide(); } catch (e) {}
+      window.__bhEruda = true;
+      eruda.show('network');
+    } else {
+      eruda.show();
+    }
+    eruda.get().config.set('displaySize', $size);
+  } catch (e) {
+    return 'error:' + e;
+  }
+  return 'ok';
+})();
+''';
+  }
+
+  void _applyErudaSize(double value) {
+    final size = value.clamp(40.0, 100.0).toDouble();
+    if ((size - _erudaSize).abs() < 0.01) return;
+    setState(() => _erudaSize = size);
+    _evalQuiet(
+      'try{eruda.get().config.set("displaySize", '
+      '${size.toStringAsFixed(1)})}catch(e){}',
+    );
+  }
+
+  void _evalQuiet(String script) {
+    unawaited(_browser.evaluate(script).catchError((Object _) => null));
+  }
+
+  void _startErudaSync() {
+    _erudaSyncTimer?.cancel();
+    _erudaSyncTimer = Timer.periodic(
+      const Duration(milliseconds: 800),
+      (_) => unawaited(_syncErudaSize()),
+    );
+  }
+
+  void _stopErudaSync() {
+    _erudaSyncTimer?.cancel();
+    _erudaSyncTimer = null;
+  }
+
+  Future<void> _syncErudaSize() async {
+    if (!_erudaOpen || !mounted) return;
+    try {
+      final value = await _browser.evaluate(
+        '(function(){try{var d=eruda.get();'
+        'return d?d.config.get("displaySize"):null}catch(e){return null}})()',
+      );
+      if (!mounted || value is! num) return;
+      final next = value.toDouble().clamp(40.0, 100.0).toDouble();
+      if ((next - _erudaSize).abs() > 0.5) setState(() => _erudaSize = next);
+    } on Object {
+      // Mid-navigation; the restore timer handles the new document.
+    }
+  }
+
+  void _scheduleErudaRestore() {
+    _erudaRestoreTimer?.cancel();
+    _erudaRestoreTimer = Timer(const Duration(milliseconds: 700), () {
+      unawaited(_restoreEruda());
+    });
+  }
+
+  Future<void> _restoreEruda() async {
+    if (!_erudaOpen || _erudaBusy || !mounted) return;
+    setState(() => _erudaBusy = true);
+    try {
+      final ok = await _ensureEruda();
+      if (!mounted) return;
+      if (!ok) {
+        setState(() {
+          _erudaOpen = false;
+          if (_didHidePanelForEruda && !_panelVisible) _panelVisible = true;
+          _didHidePanelForEruda = false;
+        });
+        _stopErudaSync();
+        _snack('Page changed; Eruda could not be restored');
+      }
+    } on Object {
+      if (mounted) {
+        setState(() {
+          _erudaOpen = false;
+          if (_didHidePanelForEruda && !_panelVisible) _panelVisible = true;
+          _didHidePanelForEruda = false;
+        });
+        _stopErudaSync();
+      }
+    } finally {
+      if (mounted) setState(() => _erudaBusy = false);
+    }
+  }
+
+  Widget _buildErudaPill(double viewHeight) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onVerticalDragUpdate: (details) {
+        if (viewHeight <= 0) return;
+        _applyErudaSize(_erudaSize - details.delta.dy / viewHeight * 100);
+      },
+      child: Container(
+        width: 104,
+        height: _erudaPillHeight,
+        decoration: BoxDecoration(
+          color: Colors.white.withAlpha(245),
+          border: Border.all(color: AppColors.line2),
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: const <BoxShadow>[
+            BoxShadow(
+              color: Color(0x290E0F0E),
+              blurRadius: 12,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const SizedBox(width: 8),
+            const Icon(
+              Icons.drag_handle_rounded,
+              size: 14,
+              color: AppColors.faint,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              '${_erudaSize.round()}%',
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9.5,
+                color: AppColors.muted,
+              ),
+            ),
+            const SizedBox(width: 4),
+            GestureDetector(
+              onTap: () => unawaited(_toggleEruda()),
+              child: Container(
+                width: 16,
+                height: 16,
+                decoration: const BoxDecoration(
+                  color: AppColors.ink,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.close_rounded,
+                  size: 10,
+                  color: Colors.white,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------------
+
+  static Widget _kv(String label, String value, {bool mono = false}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 4.5),
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Color(0xFFECEDE4)),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 78,
+            child: Text(
+              label,
+              style: const TextStyle(fontSize: 10, color: AppColors.muted),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(
+                fontSize: 11,
+                height: 1.35,
+                color: AppColors.ink2,
+                fontFamily: mono ? 'monospace' : null,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _kb(int bytes) =>
+      (bytes / 1024).toStringAsFixed(bytes < 10240 ? 1 : 0);
+
+  static String _shorten(String value, int max) =>
+      value.length <= max ? value : '${value.substring(0, max)}…';
+}
+
+// -----------------------------------------------------------------------------
+// Widgets
+// -----------------------------------------------------------------------------
+
+class _Notice extends StatelessWidget {
+  const _Notice(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: AppColors.signalWash,
+        border: Border.all(color: AppColors.signalLine),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          const Icon(
+            Icons.info_outline_rounded,
+            size: 13,
+            color: Color(0xFF6E7A3C),
+          ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontSize: 9,
+                height: 1.5,
+                color: Color(0xFF4C5430),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ResourceRow extends StatelessWidget {
+  const _ResourceRow({
+    required this.type,
+    required this.url,
+    required this.duration,
+    required this.transferSize,
+    required this.bodySize,
+  });
+
+  final String type;
+  final String url;
+  final double duration;
+  final int? transferSize;
+  final int? bodySize;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.fromLTRB(9, 7, 9, 7),
+      decoration: BoxDecoration(
+        color: AppColors.card,
+        border: Border.all(color: AppColors.line),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Text(
+                type.toUpperCase(),
+                style: const TextStyle(
+                  fontSize: 8,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.6,
+                  color: AppColors.muted,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '${duration.toStringAsFixed(1)} ms',
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 9,
+                  color: AppColors.ink,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 3),
+          Text(
+            url,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 9,
+              color: AppColors.ink2,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            'transfer ${transferSize ?? 0} B · body ${bodySize ?? 0} B',
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 8,
+              color: AppColors.faint,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Stat extends StatelessWidget {
+  const _Stat({required this.label, required this.value, this.unit});
+
+  final String label;
+  final String value;
+  final String? unit;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(9, 7, 9, 7),
+        decoration: BoxDecoration(
+          color: AppColors.card,
+          border: Border.all(color: AppColors.line),
+          borderRadius: BorderRadius.circular(11),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              label.toUpperCase(),
+              style: const TextStyle(
+                fontSize: 8,
+                letterSpacing: 0.8,
+                color: AppColors.faint,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text.rich(
+              TextSpan(
+                children: <InlineSpan>[
+                  TextSpan(
+                    text: value,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: -0.2,
+                      color: AppColors.ink,
+                    ),
+                  ),
+                  if (unit != null)
+                    TextSpan(
+                      text: ' $unit',
+                      style: const TextStyle(
+                        fontSize: 9,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SectionLabel extends StatelessWidget {
+  const _SectionLabel(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Text(
+        text.toUpperCase(),
+        style: const TextStyle(
+          fontSize: 8.5,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 1.1,
+          color: AppColors.faint,
+        ),
+      );
+}
+
+class _HeaderLine extends StatelessWidget {
+  const _HeaderLine({
+    required this.index,
+    required this.name,
+    required this.value,
+  });
+
+  final String index;
+  final String name;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 16,
+            child: Text(
+              index,
+              textAlign: TextAlign.right,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 8.5,
+                color: AppColors.faint,
+              ),
+            ),
+          ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text.rich(
+              TextSpan(
+                children: <InlineSpan>[
+                  TextSpan(
+                    text: '$name: ',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.ink,
+                    ),
+                  ),
+                  TextSpan(
+                    text: value,
+                    style: const TextStyle(color: AppColors.ink2),
+                  ),
+                ],
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9,
+                height: 1.45,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DarkChip extends StatelessWidget {
+  const _DarkChip(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2.5),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.white.withAlpha(40)),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontFamily: 'monospace',
+          fontSize: 8,
+          letterSpacing: 0.2,
+          color: Color(0xFFD8DCCD),
+        ),
+      ),
+    );
+  }
+}
+
+class _SmallButton extends StatelessWidget {
+  const _SmallButton({
+    required this.label,
+    required this.icon,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onTap != null;
+    return Material(
+      color: enabled ? AppColors.ink : AppColors.ink.withAlpha(90),
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(icon, size: 12, color: AppColors.onInk),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.onInk,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FilterChip extends StatelessWidget {
+  const _FilterChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+        decoration: BoxDecoration(
+          color: selected ? AppColors.ink : AppColors.card,
+          border: Border.all(
+            color: selected ? AppColors.ink : AppColors.line,
+          ),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 9.5,
+            color: selected ? AppColors.onInk : AppColors.muted,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LogRow extends StatelessWidget {
+  const _LogRow({required this.event});
+
+  final RequestLogEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final isError = event.level == RequestLogLevel.error;
+    final isWarn = event.level == RequestLogLevel.warn;
+    final color = isError
+        ? AppColors.danger
+        : isWarn
+            ? AppColors.warn
+            : null;
+
+    final phase = switch (event.phase) {
+      RequestLogPhase.start => 'SEND',
+      RequestLogPhase.response => 'RECV',
+      RequestLogPhase.redirect => 'RDIR',
+      RequestLogPhase.challengeDetected => 'CHAL',
+      RequestLogPhase.challengeResolved => 'OK',
+      RequestLogPhase.retry => 'RETRY',
+      RequestLogPhase.error => 'ERR',
+      RequestLogPhase.cancelled => 'CANCEL',
+    };
+
+    final time = '${event.timestamp.hour.toString().padLeft(2, '0')}:'
+        '${event.timestamp.minute.toString().padLeft(2, '0')}:'
+        '${event.timestamp.second.toString().padLeft(2, '0')}';
+    final right = <String>[
+      if (event.statusCode != null) '${event.statusCode}',
+      if (event.elapsed != null) '${event.elapsed!.inMilliseconds}ms',
+      if (event.statusCode == null && event.elapsed == null)
+        event.errorCode ?? '',
+    ].where((part) => part.isNotEmpty).join(' · ');
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: Color(0xFFECEDE4))),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 40,
+            child: Text(
+              time,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 8.5,
+                color: AppColors.faint,
+              ),
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1.5),
+            decoration: BoxDecoration(
+              color: isError
+                  ? AppColors.danger.withAlpha(20)
+                  : isWarn
+                      ? AppColors.warn.withAlpha(24)
+                      : event.phase == RequestLogPhase.response
+                          ? AppColors.signal.withAlpha(70)
+                          : AppColors.wash,
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              phase,
+              style: TextStyle(
+                fontSize: 7.5,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.3,
+                color: color ?? AppColors.muted,
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '${event.method ?? ''} ${event.uri ?? ''}'.trim(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 8.5,
+                    color: color ?? AppColors.ink2,
+                  ),
+                ),
+                if (event.message != null && event.message!.isNotEmpty)
+                  Text(
+                    '${event.errorCode ?? ''} ${event.message}'.trim(),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 8,
+                      color: color ?? AppColors.faint,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            right,
+            style: TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 8.5,
+              color: color ?? AppColors.muted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Widget _statusBadge(int? status) {
+  final color = _statusTint(status);
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+    decoration: BoxDecoration(
+      color: color.withAlpha(18),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    child: Text(
+      status == null ? '—' : '$status',
+      style: TextStyle(
+        fontFamily: 'monospace',
+        fontSize: 9.5,
+        fontWeight: FontWeight.w700,
+        color: color,
+      ),
+    ),
+  );
+}
+
+Widget _detailRow(String label, String value) {
+  return Container(
+    padding: const EdgeInsets.symmetric(vertical: 4.5),
+    decoration: const BoxDecoration(
+      border: Border(bottom: BorderSide(color: Color(0xFFECEDE4))),
+    ),
     child: Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
         SizedBox(
-          width: 110,
-          child: Text(key, style: const TextStyle(fontWeight: FontWeight.w600)),
+          width: 70,
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 10, color: AppColors.muted),
+          ),
         ),
         Expanded(
-          child: SelectableText(value, style: const TextStyle(fontSize: 12)),
+          child: SelectableText(
+            value,
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 10,
+              height: 1.4,
+              color: AppColors.ink2,
+            ),
+          ),
         ),
       ],
     ),
   );
+}
 
-  static Widget _section(String title) => Padding(
-    padding: const EdgeInsets.only(top: 8, bottom: 4),
-    child: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+Widget _bodyBlock(String text) {
+  return Container(
+    width: double.infinity,
+    margin: const EdgeInsets.only(top: 4),
+    padding: const EdgeInsets.fromLTRB(11, 9, 11, 10),
+    decoration: BoxDecoration(
+      color: AppColors.dark,
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: SelectableText(
+      text,
+      style: const TextStyle(
+        fontFamily: 'monospace',
+        fontSize: 9,
+        height: 1.55,
+        color: AppColors.darkText,
+      ),
+    ),
   );
+}
 
-  static Widget _headerLine(String line) => SelectableText(
-    line,
-    style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
-  );
+/// Bottom sheet for one observed page request: copy actions with inline
+/// "copied" feedback (a SnackBar would sit behind the sheet) and a native
+/// replay button.
+class _PageRequestDetail extends StatefulWidget {
+  const _PageRequestDetail({required this.event, required this.onReplay});
+
+  final PageNetworkEvent event;
+  final VoidCallback onReplay;
+
+  @override
+  State<_PageRequestDetail> createState() => _PageRequestDetailState();
+}
+
+class _PageRequestDetailState extends State<_PageRequestDetail> {
+  String? _copied;
+  Timer? _copiedTimer;
+
+  Future<void> _copy(String text, String label) async {
+    if (text.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    _copiedTimer?.cancel();
+    setState(() => _copied = label);
+    _copiedTimer = Timer(const Duration(milliseconds: 1400), () {
+      if (mounted) setState(() => _copied = null);
+    });
+  }
+
+  @override
+  void dispose() {
+    _copiedTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final event = widget.event;
+    final body = event.body;
+    final responseBody = event.responseBody;
+    return DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.72,
+      minChildSize: 0.4,
+      maxChildSize: 0.94,
+      builder: (context, scrollController) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+          ),
+          child: Column(
+            children: <Widget>[
+              const SizedBox(height: 8),
+              Container(
+                width: 38,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.line2,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 10, 4),
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text(
+                        '${event.method ?? 'GET'} request',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: -0.2,
+                        ),
+                      ),
+                    ),
+                    AnimatedOpacity(
+                      opacity: _copied == null ? 0 : 1,
+                      duration: const Duration(milliseconds: 160),
+                      child: Container(
+                        margin: const EdgeInsets.only(right: 6),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppColors.signal,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          '${_copied ?? ''} copied',
+                          style: const TextStyle(
+                            fontSize: 8,
+                            fontWeight: FontWeight.w700,
+                            color: AppColors.ink,
+                          ),
+                        ),
+                      ),
+                    ),
+                    _statusBadge(event.statusCode),
+                    const SizedBox(width: 2),
+                    IconButton(
+                      tooltip: 'Close',
+                      onPressed: () => Navigator.of(context).pop(),
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        size: 18,
+                        color: AppColors.faint,
+                      ),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 32,
+                        height: 32,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                child: SelectableText(
+                  event.url ?? '',
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 9.5,
+                    height: 1.4,
+                    color: AppColors.muted,
+                  ),
+                ),
+              ),
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Row(
+                  children: <Widget>[
+                    _ActionChip(
+                      label: 'cURL',
+                      icon: Icons.terminal_rounded,
+                      onTap: () => _copy(buildPageCurl(event), 'cURL'),
+                    ),
+                    const SizedBox(width: 6),
+                    _ActionChip(
+                      label: 'URL',
+                      icon: Icons.link_rounded,
+                      onTap: () => _copy(event.url ?? '', 'URL'),
+                    ),
+                    const SizedBox(width: 6),
+                    _ActionChip(
+                      label: 'Request headers',
+                      icon: Icons.list_alt_rounded,
+                      onTap: () => _copy(mapBlock(event.headers), 'Headers'),
+                    ),
+                    if (body != null && body.isNotEmpty) ...<Widget>[
+                      const SizedBox(width: 6),
+                      _ActionChip(
+                        label: 'Request body',
+                        icon: Icons.upload_rounded,
+                        onTap: () => _copy(body, 'Body'),
+                      ),
+                    ],
+                    if (responseBody != null && responseBody.isNotEmpty) ...<Widget>[
+                      const SizedBox(width: 6),
+                      _ActionChip(
+                        label: 'Response body',
+                        icon: Icons.download_rounded,
+                        onTap: () => _copy(responseBody, 'Response'),
+                      ),
+                    ],
+                    const SizedBox(width: 6),
+                    _ActionChip(
+                      label: 'Replay natively',
+                      icon: Icons.replay_rounded,
+                      onTap: widget.onReplay,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 6),
+              Expanded(
+                child: ListView(
+                  controller: scrollController,
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 28),
+                  children: <Widget>[
+                    _detailRow('Status', '${event.statusCode ?? '—'}'),
+                    _detailRow(
+                      'Duration',
+                      event.duration == null ? '—' : '${event.duration} ms',
+                    ),
+                    _detailRow(
+                      'Size',
+                      event.size == null ? '—' : '${event.size} bytes',
+                    ),
+                    if (event.message != null)
+                      _detailRow('Error', event.message!),
+                    const SizedBox(height: 14),
+                    _SectionLabel(
+                      'Request headers · ${event.headers.length}',
+                    ),
+                    if (event.headers.isEmpty)
+                      const _MutedLine(
+                        'The page set no headers; WebKit adds Cookie, '
+                        'Sec-Fetch-* and the rest natively.',
+                      )
+                    else
+                      for (var i = 0; i < event.headers.length; i++)
+                        _HeaderLine(
+                          index: '${i + 1}'.padLeft(2, '0'),
+                          name: event.headers.keys.elementAt(i),
+                          value: event.headers.values.elementAt(i),
+                        ),
+                    const SizedBox(height: 14),
+                    const _SectionLabel('Request body'),
+                    if (body == null || body.isEmpty)
+                      const _MutedLine('No request body.')
+                    else
+                      _bodyBlock(body),
+                    const SizedBox(height: 14),
+                    _SectionLabel(
+                      'Response headers · ${event.responseHeaders.length}',
+                    ),
+                    if (event.responseHeaders.isEmpty)
+                      const _MutedLine(
+                        'Not readable from the page — likely cross-origin '
+                        'or the response has not completed.',
+                      )
+                    else
+                      for (var i = 0;
+                          i < event.responseHeaders.length;
+                          i++)
+                        _HeaderLine(
+                          index: '${i + 1}'.padLeft(2, '0'),
+                          name: event.responseHeaders.keys.elementAt(i),
+                          value: event.responseHeaders.values.elementAt(i),
+                        ),
+                    const SizedBox(height: 14),
+                    const _SectionLabel('Response body'),
+                    if (responseBody == null || responseBody.isEmpty)
+                      const _MutedLine(
+                        'Not captured — binary, too large, or unreadable.',
+                      )
+                    else
+                      _bodyBlock(responseBody),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+Color _statusTint(int? status) {
+  if (status == null) return AppColors.faint;
+  if (status >= 500) return AppColors.danger;
+  if (status >= 400) return AppColors.warn;
+  if (status >= 300) return AppColors.muted;
+  return const Color(0xFF4C6B2F);
+}
+
+class _ActionChip extends StatelessWidget {
+  const _ActionChip({
+    required this.label,
+    required this.icon,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onTap != null;
+    return Material(
+      color: AppColors.card,
+      borderRadius: BorderRadius.circular(9),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(9),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+          decoration: BoxDecoration(
+            border: Border.all(color: AppColors.line),
+            borderRadius: BorderRadius.circular(9),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(
+                icon,
+                size: 12,
+                color: enabled ? AppColors.ink : AppColors.faint,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600,
+                  color: enabled ? AppColors.ink : AppColors.faint,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MutedLine extends StatelessWidget {
+  const _MutedLine(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 2),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 9,
+          height: 1.5,
+          color: AppColors.faint,
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptyRequests extends StatelessWidget {
+  const _EmptyRequests();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+      decoration: BoxDecoration(
+        color: AppColors.card,
+        border: Border.all(color: AppColors.line),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: const Column(
+        children: <Widget>[
+          Icon(Icons.hub_rounded, size: 26, color: AppColors.faint),
+          SizedBox(height: 8),
+          Text(
+            'No page requests yet',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          SizedBox(height: 3),
+          Text(
+            'Open a page that calls fetch, XHR or sendBeacon. Requests appear '
+            'here live, including POST bodies that WebKit never exposes.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 9.5,
+              height: 1.5,
+              color: AppColors.muted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PageRequestRow extends StatelessWidget {
+  const _PageRequestRow({required this.event, required this.onTap});
+
+  final PageNetworkEvent event;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final uri = Uri.tryParse(event.url ?? '');
+    final path = uri == null || uri.host.isEmpty
+        ? (event.url ?? '(unknown)')
+        : '${uri.host}${uri.path.isEmpty ? '/' : uri.path}';
+    final method = event.method ?? 'GET';
+    final failed = event.phase == PageNetworkPhase.error;
+    final hasBody = event.body != null && event.body!.isNotEmpty;
+    final tint = failed ? AppColors.danger : _statusTint(event.statusCode);
+    final meta = <String>[
+      if (event.statusCode != null) '${event.statusCode}',
+      if (event.duration != null) '${event.duration} ms',
+      if (event.size != null) '${event.size} B',
+    ].join(' · ');
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Material(
+        color: AppColors.card,
+        borderRadius: BorderRadius.circular(11),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(11),
+          onTap: onTap,
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+            decoration: BoxDecoration(
+              border: Border.all(color: AppColors.line),
+              borderRadius: BorderRadius.circular(11),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Row(
+                  children: <Widget>[
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 5,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: hasBody ? AppColors.ink : AppColors.wash,
+                        borderRadius: BorderRadius.circular(5),
+                      ),
+                      child: Text(
+                        method,
+                        style: TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 8,
+                          fontWeight: FontWeight.w700,
+                          color: hasBody ? AppColors.onInk : AppColors.muted,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 9.5,
+                          color: AppColors.ink,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      failed ? 'FAILED' : meta,
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 8.5,
+                        color: tint,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  event.url ?? '',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 8,
+                    color: AppColors.faint,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Start page + app mark
+// -----------------------------------------------------------------------------
+
+class _StartPage extends StatelessWidget {
+  const _StartPage({required this.onOpen});
+
+  final ValueChanged<String> onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: AppColors.surface,
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(34, 24, 34, 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const _AppMark(size: 64),
+              const SizedBox(height: 18),
+              const Text(
+                'Where to?',
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: -0.5,
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Browse with WKWebView. Verify the real fingerprint and '
+                'headers with the native engine.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 10.5,
+                  height: 1.55,
+                  color: AppColors.muted,
+                ),
+              ),
+              const SizedBox(height: 20),
+              _QuickLink(
+                letter: 'E',
+                title: 'example.com',
+                subtitle: 'https://example.com',
+                filled: true,
+                onTap: () => onOpen('https://example.com'),
+              ),
+              const SizedBox(height: 8),
+              _QuickLink(
+                letter: 'W',
+                title: 'Wikipedia',
+                subtitle: 'https://en.wikipedia.org',
+                onTap: () => onOpen('https://en.wikipedia.org'),
+              ),
+              const SizedBox(height: 8),
+              _QuickLink(
+                letter: '?',
+                title: 'httpbin',
+                subtitle: 'https://httpbin.org/headers',
+                onTap: () => onOpen('https://httpbin.org/headers'),
+              ),
+              const SizedBox(height: 22),
+              const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Icon(
+                    Icons.tune_rounded,
+                    size: 12,
+                    color: AppColors.faint,
+                  ),
+                  SizedBox(width: 6),
+                  Text(
+                    'UA / Referer / Cookie live in Settings',
+                    style: TextStyle(
+                      fontSize: 9,
+                      color: AppColors.faint,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _QuickLink extends StatelessWidget {
+  const _QuickLink({
+    required this.letter,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+    this.filled = false,
+  });
+
+  final String letter;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+  final bool filled;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.card,
+      borderRadius: BorderRadius.circular(13),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(13),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            border: Border.all(color: AppColors.line),
+            borderRadius: BorderRadius.circular(13),
+          ),
+          child: Row(
+            children: <Widget>[
+              Container(
+                width: 24,
+                height: 24,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: filled ? AppColors.ink : AppColors.wash,
+                  borderRadius: BorderRadius.circular(7),
+                ),
+                child: Text(
+                  letter,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                    color: filled ? AppColors.onInk : AppColors.ink,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 1),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 8.5,
+                        color: AppColors.faint,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(
+                Icons.chevron_right_rounded,
+                size: 16,
+                color: AppColors.faint,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The Route / Socket app mark, drawn with the same geometry as the SVG in
+/// ui.html so the start page and the icon stay in sync.
+class _AppMark extends StatelessWidget {
+  const _AppMark({this.size = 64});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: CustomPaint(painter: _AppMarkPainter()),
+    );
+  }
+}
+
+class _AppMarkPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final s = size.width / 1024;
+
+    final rrect = RRect.fromRectAndRadius(
+      Offset.zero & size,
+      Radius.circular(232 * s),
+    );
+    canvas.drawRRect(
+      rrect,
+      Paint()..color = const Color(0xFFF5F5F1),
+    );
+    canvas.drawRRect(
+      rrect.deflate(1.5 * s),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2 * s
+        ..color = const Color(0x140E0F10),
+    );
+
+    final ink = Paint()
+      ..color = AppColors.ink
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 74 * s
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    final path = Path()
+      ..moveTo(706 * s, 302 * s)
+      ..cubicTo(
+        706 * s,
+        176 * s,
+        318 * s,
+        176 * s,
+        318 * s,
+        302 * s,
+      )
+      ..cubicTo(
+        318 * s,
+        428 * s,
+        706 * s,
+        428 * s,
+        706 * s,
+        554 * s,
+      )
+      ..cubicTo(
+        706 * s,
+        680 * s,
+        318 * s,
+        680 * s,
+        318 * s,
+        806 * s,
+      );
+    canvas.drawPath(path, ink);
+
+    final ring = Paint()
+      ..color = AppColors.ink
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 44 * s;
+    canvas.drawCircle(Offset(706 * s, 302 * s), 116 * s, ring);
+    canvas.drawCircle(Offset(318 * s, 806 * s), 116 * s, ring);
+
+    final dot = Paint()..color = AppColors.ink;
+    canvas.drawCircle(Offset(706 * s, 302 * s), 54 * s, dot);
+    canvas.drawCircle(Offset(318 * s, 806 * s), 54 * s, dot);
+  }
+
+  @override
+  bool shouldRepaint(covariant _AppMarkPainter oldDelegate) => false;
 }

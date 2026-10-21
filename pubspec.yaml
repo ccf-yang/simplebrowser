@@ -23,3 +23,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    # The iOS workflow downloads eruda@3.4.3 here before building. Keeping the
+    # directory (with placeholder.txt) makes local builds work too; at runtime
+    # the app falls back to the CDN when eruda.js is absent.
+    - assets/eruda/

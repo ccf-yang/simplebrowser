@@ -1,0 +1,4 @@
+The eruda.js bundle is not committed. The iOS GitHub Actions workflow
+downloads eruda@3.4.3 into this directory before building, so the app can
+inject it from assets and work offline.
+Local builds without it fall back to fetching eruda.js at runtime.

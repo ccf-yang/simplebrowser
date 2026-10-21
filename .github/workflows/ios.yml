@@ -19,6 +19,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Eruda is injected into the WKWebView at runtime. Pin the version and
+      # ship it as an asset so the app works offline; without this file the
+      # app falls back to fetching the same version from a CDN.
+      - name: Fetch Eruda bundle (pinned)
+        run: |
+          set -e
+          mkdir -p assets/eruda
+          curl -fsSL --retry 3 \
+            https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js \
+            -o assets/eruda/eruda.js
+          SIZE=$(wc -c < assets/eruda/eruda.js)
+          test "$SIZE" -gt 20000
+          echo "eruda.js: $SIZE bytes"
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
