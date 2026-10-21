@@ -33,6 +33,20 @@ final class WebViewBridge {
         return holder
     }
 
+    /// Builds a request carrying the caller-supplied headers (UA overrides go
+    /// through `customUserAgent`, so they are not part of this map).
+    private func request(for url: URL, headers: Any?) -> URLRequest {
+        var request = URLRequest(url: url)
+        if let fields = headers as? [String: Any] {
+            for (name, value) in fields {
+                if let text = value as? String, !text.isEmpty {
+                    request.setValue(text, forHTTPHeaderField: name)
+                }
+            }
+        }
+        return request
+    }
+
     func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         let args = call.arguments as? [String: Any] ?? [:]
 
@@ -54,7 +68,7 @@ final class WebViewBridge {
                 result(FlutterError(code: "webview.load", message: "bad arguments", details: nil))
                 return
             }
-            holder.load(url) { error in
+            holder.load(request(for: url, headers: args["headers"])) { error in
                 if let error {
                     result(FlutterError(code: "webview.load",
                                         message: error.localizedDescription,
@@ -76,8 +90,46 @@ final class WebViewBridge {
                 result(FlutterError(code: "webview.navigate", message: "bad arguments", details: nil))
                 return
             }
-            holder.webView.load(URLRequest(url: url))
+            holder.webView.load(request(for: url, headers: args["headers"]))
             result(nil)
+
+        case "setUserAgent":
+            guard let holder = session(args, result) else { return }
+            holder.webView.customUserAgent = args["userAgent"] as? String
+            result(nil)
+
+        case "setCookie":
+            guard let id = args["id"] as? String,
+                  let holder = sessions[id],
+                  let raw = args["url"] as? String,
+                  let host = URL(string: raw)?.host,
+                  let header = args["cookie"] as? String else {
+                result(FlutterError(code: "webview.cookie", message: "bad arguments", details: nil))
+                return
+            }
+            let store = holder.webView.configuration.websiteDataStore.httpCookieStore
+            let group = DispatchGroup()
+            for pair in header.split(separator: ";") {
+                let item = String(pair)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let separator = item.firstIndex(of: "=") else { continue }
+                let name = String(item[..<separator])
+                    .trimmingCharacters(in: .whitespaces)
+                let value = String(item[item.index(after: separator)...])
+                    .trimmingCharacters(in: .whitespaces)
+                if name.isEmpty { continue }
+                let properties: [HTTPCookiePropertyKey: Any] = [
+                    .domain: host,
+                    .path: "/",
+                    .name: name,
+                    .value: value,
+                ]
+                if let cookie = HTTPCookie(properties: properties) {
+                    group.enter()
+                    store.setCookie(cookie) { group.leave() }
+                }
+            }
+            group.notify(queue: .main) { result(nil) }
 
         case "goBack":
             guard let holder = session(args, result) else { return }
@@ -274,9 +326,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate {
     }
 
     func load(_ url: URL, completion: @escaping (Error?) -> Void) {
+        load(URLRequest(url: url), completion: completion)
+    }
+
+    func load(_ request: URLRequest, completion: @escaping (Error?) -> Void) {
         lastStatusCode = nil
         loadCompletion = completion
-        webView.load(URLRequest(url: url))
+        webView.load(request)
     }
 
     func webView(_ webView: WKWebView,

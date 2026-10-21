@@ -63,11 +63,25 @@ abstract interface class WebViewSession {
   /// owns the user's challenge session.
   String get id;
 
-  Future<WebViewLoadResult> load(Uri uri, {Duration? timeout});
+  Future<WebViewLoadResult> load(
+    Uri uri, {
+    Duration? timeout,
+    Map<String, String> headers = const <String, String>{},
+  });
 
   /// Navigates the WebView (keeps history, unlike [load] which is also a
   /// normal navigation but is used for the initial challenge page).
-  Future<void> navigate(Uri uri);
+  Future<void> navigate(
+    Uri uri, {
+    Map<String, String> headers = const <String, String>{},
+  });
+
+  /// Overrides `WKWebView.customUserAgent`. Pass `null` to clear the override.
+  Future<void> setUserAgent(String? userAgent);
+
+  /// Stores the cookies in [cookieHeader] (`name=value; name2=value2`) in the
+  /// WebView's shared `WKHTTPCookieStore` for [uri]'s host.
+  Future<void> setCookie(Uri uri, String cookieHeader);
 
   Future<bool> canGoBack();
   Future<bool> canGoForward();

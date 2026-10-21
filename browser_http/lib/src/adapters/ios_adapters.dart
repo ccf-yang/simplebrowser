@@ -381,10 +381,18 @@ final class _ChannelWebViewSession implements WebViewSession {
   String get id => _id;
 
   @override
-  Future<WebViewLoadResult> load(Uri uri, {Duration? timeout}) async {
+  Future<WebViewLoadResult> load(
+    Uri uri, {
+    Duration? timeout,
+    Map<String, String> headers = const <String, String>{},
+  }) async {
     var call = _channel.invokeMethod<Map<Object?, Object?>>(
       'load',
-      <String, Object?>{'id': _id, 'url': uri.toString()},
+      <String, Object?>{
+        'id': _id,
+        'url': uri.toString(),
+        'headers': headers,
+      },
     );
     if (timeout != null) {
       call = call.timeout(
@@ -405,10 +413,29 @@ final class _ChannelWebViewSession implements WebViewSession {
   }
 
   @override
-  Future<void> navigate(Uri uri) =>
+  Future<void> navigate(
+    Uri uri, {
+    Map<String, String> headers = const <String, String>{},
+  }) =>
       _channel.invokeMethod<void>('navigate', <String, Object?>{
         'id': _id,
         'url': uri.toString(),
+        'headers': headers,
+      });
+
+  @override
+  Future<void> setUserAgent(String? userAgent) =>
+      _channel.invokeMethod<void>('setUserAgent', <String, Object?>{
+        'id': _id,
+        'userAgent': userAgent,
+      });
+
+  @override
+  Future<void> setCookie(Uri uri, String cookieHeader) =>
+      _channel.invokeMethod<void>('setCookie', <String, Object?>{
+        'id': _id,
+        'url': uri.toString(),
+        'cookie': cookieHeader,
       });
 
   @override

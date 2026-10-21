@@ -85,18 +85,53 @@ final class BrowserController extends ChangeNotifier {
     }
   }
 
-  Future<void> load(Uri uri) async {
+  /// Overrides the WebView user agent for subsequent navigations.
+  ///
+  /// Pass `null` to return to WebKit's default agent.
+  Future<void> setUserAgent(String? userAgent) async {
+    await start();
+    await _webView?.setUserAgent(userAgent);
+  }
+
+  Future<void> load(
+    Uri uri, {
+    Map<String, String> headers = const <String, String>{},
+    String? userAgent,
+  }) async {
     await start();
     final webView = _webView;
     if (webView == null) return;
-    await webView.navigate(uri);
+    if (userAgent != null) await webView.setUserAgent(userAgent);
+    final cookie = headers['Cookie'];
+    if (cookie != null && cookie.isNotEmpty) {
+      await webView.setCookie(uri, cookie);
+    }
+    await webView.navigate(uri, headers: headers);
     await refresh();
   }
 
-  Future<void> reload() async {
+  Future<void> reload({
+    Map<String, String> headers = const <String, String>{},
+    String? userAgent,
+  }) async {
     final webView = _webView;
     if (webView == null) return;
-    await webView.reload();
+    if (userAgent != null) await webView.setUserAgent(userAgent);
+    if (headers.isEmpty) {
+      await webView.reload();
+    } else {
+      final current = await webView.currentUrl();
+      final uri = current == null ? null : Uri.tryParse(current);
+      if (uri == null) {
+        await webView.reload();
+      } else {
+        final cookie = headers['Cookie'];
+        if (cookie != null && cookie.isNotEmpty) {
+          await webView.setCookie(uri, cookie);
+        }
+        await webView.navigate(uri, headers: headers);
+      }
+    }
     await refresh();
   }
 

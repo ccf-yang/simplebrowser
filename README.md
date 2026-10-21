@@ -6,8 +6,12 @@ fingerprint engine so you can inspect the actual request/response metadata.
 
 ## What it shows
 
-- **URL bar** — Go / back / forward / reload. Links are clicked inside the
-  WKWebView itself (real user navigation).
+- **URL bar** — no separate app header: back / forward / reload, an editable URL
+  field with a clear button and Go action, and a request-header toggle.
+- **Request headers** — optional User-Agent presets (Safari, Chrome, Edge,
+  Firefox on phone and desktop), Referer (none or current origin) and a custom
+  Cookie string. Save applies them and reloads the page so the next request
+  carries the new headers.
 - **WebView tab** — main-frame URL, title, HTTP status, history flags and the
   page's `PerformanceResourceTiming` entries. WebKit does not expose
   subresource headers or bodies to host apps.
@@ -16,6 +20,8 @@ fingerprint engine so you can inspect the actual request/response metadata.
   cookie jar's `Cookie`, profile user-agent/client hints, response status,
   ordered response headers, elapsed time, body size and preview.
 - **Log tab** — live `RequestLogEvent`s (start / redirect / response / error).
+- **Resizable panel** — drag the divider above the tabs to resize the
+  WebView/Engine/Log area.
 
 Both engines use the same persistent `WKWebsiteDataStore`, so cookies obtained
 by browsing are reused by the native capture and vice versa.

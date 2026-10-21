@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:browser_http/browser_http.dart';
 import 'package:flutter/material.dart';
@@ -17,6 +18,64 @@ class SimpleBrApp extends StatelessWidget {
         home: const BrowserPage(),
       );
 }
+
+/// One entry of the user-agent preset list.
+class _UaPreset {
+  const _UaPreset(this.label, this.value);
+
+  final String label;
+  final String? value;
+}
+
+const List<_UaPreset> _uaPresets = <_UaPreset>[
+  _UaPreset('无（默认 UA）', null),
+  _UaPreset(
+    'iPhone Safari 18',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) '
+        'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 '
+        'Mobile/15E148 Safari/604.1',
+  ),
+  _UaPreset(
+    'iPad Safari 18',
+    'Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) '
+        'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 '
+        'Mobile/15E148 Safari/604.1',
+  ),
+  _UaPreset(
+    'macOS Safari 18',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15',
+  ),
+  _UaPreset(
+    'Windows Chrome 149',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+  ),
+  _UaPreset(
+    'macOS Chrome 149',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+  ),
+  _UaPreset(
+    'Android Chrome 149',
+    'Mozilla/5.0 (Linux; Android 15; Pixel 9) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 '
+        'Mobile Safari/537.36',
+  ),
+  _UaPreset(
+    'Windows Edge 149',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 '
+        'Safari/537.36 Edg/149.0.0.0',
+  ),
+  _UaPreset(
+    'Windows Firefox 139',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) '
+        'Gecko/20100101 Firefox/139.0',
+  ),
+];
+
+enum _RefererMode { none, currentDomain }
 
 /// Hybrid test browser.
 ///
@@ -38,6 +97,7 @@ class _BrowserPageState extends State<BrowserPage>
   final StreamLogSink _logSink = StreamLogSink(400);
   final TextEditingController _urlController =
       TextEditingController(text: _initialUri.toString());
+  final TextEditingController _cookieController = TextEditingController();
   final FocusNode _urlFocus = FocusNode();
   final List<RequestLogEvent> _events = <RequestLogEvent>[];
 
@@ -49,6 +109,14 @@ class _BrowserPageState extends State<BrowserPage>
   CapturedExchange? _capture;
   String? _captureError;
   bool _busy = false;
+
+  bool _showHeaders = false;
+  int _uaIndex = 0;
+  _RefererMode _refererMode = _RefererMode.none;
+  String? _defaultUserAgent;
+
+  /// Share of the body height taken by the info/log panel; draggable.
+  double _panelFraction = 0.4;
 
   String? _seenUrl;
   String? _seenTitle;
@@ -68,6 +136,16 @@ class _BrowserPageState extends State<BrowserPage>
       if (!mounted) return;
       setState(() => _events.insert(0, event));
     });
+    unawaited(_loadDefaultUserAgent());
+  }
+
+  Future<void> _loadDefaultUserAgent() async {
+    try {
+      final info = await _session.profileInfo();
+      if (mounted) setState(() => _defaultUserAgent = info.userAgent);
+    } on Object {
+      // Keep null; the WebView keeps the UA it was created with.
+    }
   }
 
   /// The controller polls the WebView; rebuild only on real changes so the
@@ -109,6 +187,31 @@ class _BrowserPageState extends State<BrowserPage>
     return uri;
   }
 
+  Uri? _currentUri() => _parseUrl(_browser.url ?? _urlController.text);
+
+  /// UA sent to the engine capture; `null` means "use the profile default".
+  String? get _uaOverride => _uaPresets[_uaIndex].value;
+
+  /// UA applied to the WebView. "No override" keeps the profile agent that the
+  /// WebView was created with.
+  String? get _effectiveUserAgent => _uaOverride ?? _defaultUserAgent;
+
+  String? get _cookieValue {
+    final value = _cookieController.text.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  /// Headers applied to both the WebView navigation and the engine capture.
+  Map<String, String> _headersFor(Uri uri) {
+    final headers = <String, String>{};
+    if (_refererMode == _RefererMode.currentDomain) {
+      headers['Referer'] = '${uri.scheme}://${uri.authority}/';
+    }
+    final cookie = _cookieValue;
+    if (cookie != null) headers['Cookie'] = cookie;
+    return headers;
+  }
+
   void _snack(String message) {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
@@ -121,7 +224,49 @@ class _BrowserPageState extends State<BrowserPage>
       return;
     }
     _urlFocus.unfocus();
-    await _browser.load(uri);
+    try {
+      await _browser.load(
+        uri,
+        headers: _headersFor(uri),
+        userAgent: _effectiveUserAgent,
+      );
+    } on Object catch (error) {
+      if (mounted) _snack('Load failed: $error');
+    }
+  }
+
+  Future<void> _reload() async {
+    final uri = _currentUri();
+    try {
+      await _browser.reload(
+        headers: uri == null ? const <String, String>{} : _headersFor(uri),
+        userAgent: _effectiveUserAgent,
+      );
+    } on Object catch (error) {
+      if (mounted) _snack('Reload failed: $error');
+    }
+  }
+
+  Future<void> _saveHeaders() async {
+    final userAgent = _effectiveUserAgent;
+    await _browser.setUserAgent(userAgent);
+    if (!mounted) return;
+    setState(() => _showHeaders = false);
+
+    final uri = _currentUri();
+    if (uri != null) {
+      await _browser.reload(headers: _headersFor(uri), userAgent: userAgent);
+    }
+    if (!mounted) return;
+    _snack(uri == null ? 'Header settings saved' : 'Saved, reloaded with new headers');
+  }
+
+  void _resetHeaders() {
+    setState(() {
+      _uaIndex = 0;
+      _refererMode = _RefererMode.none;
+      _cookieController.clear();
+    });
   }
 
   /// Runs the current URL through the native (Rust/wreq) engine so the panel
@@ -136,19 +281,27 @@ class _BrowserPageState extends State<BrowserPage>
       return;
     }
 
+    final headers = <OrderedHeader>[
+      if (_uaOverride != null) OrderedHeader('User-Agent', _uaOverride!),
+      for (final entry in _headersFor(uri).entries)
+        OrderedHeader(entry.key, entry.value),
+    ];
+
     setState(() {
       _busy = true;
       _captureError = null;
     });
     try {
-      final capture = await _session.capture(uri);
+      final capture = await _session.capture(uri, headers: headers);
       if (mounted) setState(() => _capture = capture);
     } on BrowserHttpException catch (error) {
       if (mounted) {
         setState(() => _captureError = '${error.code}: ${error.message}');
       }
     } on Object catch (error) {
-      if (mounted) setState(() => _captureError = error.toString());
+      if (mounted) {
+        setState(() => _captureError = error.toString());
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -162,6 +315,7 @@ class _BrowserPageState extends State<BrowserPage>
     unawaited(_session.close());
     _tabs.dispose();
     _urlController.dispose();
+    _cookieController.dispose();
     _urlFocus.dispose();
     super.dispose();
   }
@@ -169,74 +323,265 @@ class _BrowserPageState extends State<BrowserPage>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('SimpleBrowser'),
-        actions: <Widget>[
-          IconButton(
-            tooltip: 'Capture through native engine',
-            onPressed: _busy ? null : _captureCurrent,
-            icon: _busy
-                ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.radar),
-          ),
-        ],
-      ),
       body: SafeArea(
         child: Column(
           children: <Widget>[
-            _buildUrlBar(),
-            Expanded(flex: 3, child: _buildWebView()),
+            _buildToolbar(),
+            if (_showHeaders) _buildHeaderSettings(),
             const Divider(height: 1),
-            Expanded(flex: 2, child: _buildPanel()),
+            Expanded(child: _buildSplitBody()),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildUrlBar() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 4, 8, 4),
+  Widget _buildToolbar() {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      color: scheme.surfaceContainerHigh,
+      padding: const EdgeInsets.fromLTRB(2, 6, 4, 6),
       child: Row(
         children: <Widget>[
-          IconButton(
-            tooltip: 'Back',
-            onPressed: _browser.canGoBack ? _browser.goBack : null,
-            icon: const Icon(Icons.arrow_back),
+          _compactIcon(
+            Icons.arrow_back,
+            'Back',
+            _browser.canGoBack ? () => unawaited(_browser.goBack()) : null,
           ),
-          IconButton(
-            tooltip: 'Forward',
-            onPressed: _browser.canGoForward ? _browser.goForward : null,
-            icon: const Icon(Icons.arrow_forward),
+          _compactIcon(
+            Icons.arrow_forward,
+            'Forward',
+            _browser.canGoForward ? () => unawaited(_browser.goForward()) : null,
           ),
-          IconButton(
-            tooltip: 'Reload',
-            onPressed: _browser.reload,
-            icon: const Icon(Icons.refresh),
+          _compactIcon(Icons.refresh, 'Reload', () => unawaited(_reload())),
+          Expanded(child: _buildUrlField()),
+          _compactIcon(
+            _showHeaders ? Icons.tune : Icons.tune_outlined,
+            'Request headers',
+            () => setState(() => _showHeaders = !_showHeaders),
           ),
-          Expanded(
-            child: TextField(
-              controller: _urlController,
-              focusNode: _urlFocus,
-              keyboardType: TextInputType.url,
-              textInputAction: TextInputAction.go,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                isDense: true,
-                border: OutlineInputBorder(),
-                hintText: 'https://example.com',
-              ),
-              onSubmitted: (_) => _go(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildUrlField() {
+    final scheme = Theme.of(context).colorScheme;
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: _urlController,
+      builder: (context, value, _) {
+        return TextField(
+          controller: _urlController,
+          focusNode: _urlFocus,
+          keyboardType: TextInputType.url,
+          textInputAction: TextInputAction.go,
+          autocorrect: false,
+          enableSuggestions: false,
+          style: const TextStyle(fontSize: 13),
+          decoration: InputDecoration(
+            isDense: true,
+            filled: true,
+            fillColor: scheme.surface,
+            hintText: 'https://example.com',
+            contentPadding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(20),
+              borderSide: BorderSide.none,
+            ),
+            suffixIconConstraints: const BoxConstraints(minWidth: 0),
+            suffixIcon: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                if (value.text.isNotEmpty)
+                  _compactIcon(Icons.close, 'Clear', () {
+                    _urlController.clear();
+                    _urlFocus.requestFocus();
+                  }),
+                _compactIcon(Icons.arrow_forward, 'Go', () => unawaited(_go())),
+                const SizedBox(width: 2),
+              ],
             ),
           ),
-          const SizedBox(width: 8),
-          FilledButton(onPressed: _go, child: const Text('Go')),
+          onSubmitted: (_) => unawaited(_go()),
+        );
+      },
+    );
+  }
+
+  Widget _buildHeaderSettings() {
+    final scheme = Theme.of(context).colorScheme;
+    final labelStyle = TextStyle(fontSize: 11, color: scheme.onSurfaceVariant);
+    return Container(
+      width: double.infinity,
+      color: scheme.surfaceContainer,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          const Text(
+            'Request headers',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          InputDecorator(
+            decoration: const InputDecoration(
+              labelText: 'User-Agent',
+              isDense: true,
+              border: OutlineInputBorder(),
+              contentPadding:
+                  EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+            ),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<int>(
+                value: _uaIndex,
+                isDense: true,
+                isExpanded: true,
+                items: <DropdownMenuItem<int>>[
+                  for (var i = 0; i < _uaPresets.length; i++)
+                    DropdownMenuItem<int>(
+                      value: i,
+                      child: Text(
+                        _uaPresets[i].label,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                ],
+                onChanged: (value) {
+                  if (value != null) setState(() => _uaIndex = value);
+                },
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          InputDecorator(
+            decoration: const InputDecoration(
+              labelText: 'Referer',
+              isDense: true,
+              border: OutlineInputBorder(),
+              contentPadding:
+                  EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+            ),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<_RefererMode>(
+                value: _refererMode,
+                isDense: true,
+                isExpanded: true,
+                items: const <DropdownMenuItem<_RefererMode>>[
+                  DropdownMenuItem<_RefererMode>(
+                    value: _RefererMode.none,
+                    child: Text('无', style: TextStyle(fontSize: 13)),
+                  ),
+                  DropdownMenuItem<_RefererMode>(
+                    value: _RefererMode.currentDomain,
+                    child: Text('当前域名', style: TextStyle(fontSize: 13)),
+                  ),
+                ],
+                onChanged: (value) {
+                  if (value != null) setState(() => _refererMode = value);
+                },
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _cookieController,
+            autocorrect: false,
+            enableSuggestions: false,
+            style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+            decoration: const InputDecoration(
+              labelText: 'Cookie',
+              hintText: 'name=value; name2=value2',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  '保存后会用新的请求头重新加载当前页面。',
+                  style: labelStyle,
+                ),
+              ),
+              TextButton(
+                onPressed: _resetHeaders,
+                child: const Text('重置'),
+              ),
+              const SizedBox(width: 4),
+              FilledButton.icon(
+                onPressed: () => unawaited(_saveHeaders()),
+                icon: const Icon(Icons.check, size: 18),
+                label: const Text('保存并刷新'),
+              ),
+            ],
+          ),
         ],
+      ),
+    );
+  }
+
+  Widget _compactIcon(
+    IconData icon,
+    String tooltip,
+    VoidCallback? onPressed,
+  ) {
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      icon: Icon(icon, size: 20),
+      padding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+    );
+  }
+
+  Widget _buildSplitBody() {
+    const handleHeight = 14.0;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final available = math.max(0.0, constraints.maxHeight - handleHeight);
+        final panelHeight =
+            (available * _panelFraction).clamp(0.0, available).toDouble();
+        final webHeight = available - panelHeight;
+        return Column(
+          children: <Widget>[
+            SizedBox(height: webHeight, child: _buildWebView()),
+            _buildDragHandle(available),
+            SizedBox(height: panelHeight, child: _buildPanel()),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildDragHandle(double available) {
+    final scheme = Theme.of(context).colorScheme;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onVerticalDragUpdate: (details) {
+        if (available <= 0) return;
+        setState(() {
+          _panelFraction =
+              (_panelFraction - details.delta.dy / available)
+                  .clamp(0.15, 0.85)
+                  .toDouble();
+        });
+      },
+      child: SizedBox(
+        height: 14,
+        child: Center(
+          child: Container(
+            width: 44,
+            height: 4,
+            decoration: BoxDecoration(
+              color: scheme.outlineVariant,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -285,6 +630,7 @@ class _BrowserPageState extends State<BrowserPage>
           'History',
           'back=${_browser.canGoBack} forward=${_browser.canGoForward}',
         ),
+        _kv('User-Agent', _uaPresets[_uaIndex].label),
         const SizedBox(height: 8),
         Row(
           children: <Widget>[
@@ -361,15 +707,15 @@ class _BrowserPageState extends State<BrowserPage>
               ),
             ),
             TextButton.icon(
-              onPressed: _busy ? null : _captureCurrent,
+              onPressed: _busy ? null : () => unawaited(_captureCurrent()),
               icon: const Icon(Icons.radar, size: 18),
               label: const Text('Capture URL'),
             ),
           ],
         ),
         const Text(
-          'Same persistent cookie jar as the WebView; UA, header order, TLS '
-          'and HTTP/2 settings come from the native profile.',
+          'Same persistent cookie jar as the WebView. UA, Referer and Cookie '
+          'from the header settings are applied to the capture request.',
           style: TextStyle(fontSize: 11),
         ),
         if (error != null)
