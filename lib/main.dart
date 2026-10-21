@@ -176,7 +176,8 @@ class _BrowserPageState extends State<BrowserPage>
   String? _erudaSource;
   Timer? _erudaVerifyTimer;
   Timer? _debugSizeTimer;
-  Timer? _erudaNudgeTimer;
+  /// Bumped to abandon a running show/repair loop.
+  int _erudaWatchId = 0;
 
   @override
   void initState() {
@@ -774,7 +775,7 @@ class _BrowserPageState extends State<BrowserPage>
   void dispose() {
     _erudaVerifyTimer?.cancel();
     _debugSizeTimer?.cancel();
-    _erudaNudgeTimer?.cancel();
+    _erudaWatchId++;
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
     unawaited(_pageSubscription.cancel());
@@ -1881,7 +1882,7 @@ class _BrowserPageState extends State<BrowserPage>
       });
       _erudaVerifyTimer?.cancel();
       _debugSizeTimer?.cancel();
-      _erudaNudgeTimer?.cancel();
+      _erudaWatchId++;
       _applyPanelCollection();
       await _browser.setDebugOverlay(enabled: false);
       return;
@@ -1917,17 +1918,14 @@ class _BrowserPageState extends State<BrowserPage>
       });
       if (open) {
         _applyPanelCollection();
-        // `eruda.show('console')` alone leaves the panel hidden. The native
-        // boot calls `show()`, but a framework built before that fix does not;
-        // nudging it from here makes the console visible either way.
+        // The native boot already calls `show()`; doing it here as well covers
+        // a framework built before that fix. The loop keeps trying because the
+        // bundle may still be parsing and the panel can need a forced repaint.
         _showErudaNow();
-        _erudaNudgeTimer?.cancel();
-        _erudaNudgeTimer = Timer(const Duration(milliseconds: 900), () {
-          if (mounted && _erudaOpen) _showErudaNow();
-        });
+        _watchEruda();
         debugPrint('[console] native=$native status=$status');
         _pushToConsole('调试通道 $native ($status)');
-        if (native != 'n3') {
+        if (native != 'n4') {
           _snack('Console is up, but the webview core is old ($native); '
               'reinstall the new IPA');
         }
@@ -1988,30 +1986,47 @@ class _BrowserPageState extends State<BrowserPage>
     });
   }
 
+  /// Brings the console up in the current document and returns what was found:
+  /// `missing`, `nopanel`, `err:…` or `visible:<height>/<viewport>`.
+  ///
+  /// `eruda.show()` alone is not enough. The panel is revealed through
+  /// `transition: opacity .3s`, and that transition can stay at 0: the panel
+  /// gets its 50% height and position but paints fully transparent, which is
+  /// why only the Flutter handle was visible. Writing the end state inline
+  /// with no transition makes it paint no matter what the compositor did.
+  static const String _erudaSyncScript =
+      '(function(){try{'
+      'if(!(window.eruda&&window.eruda._isInit))return "missing";'
+      'window.eruda.show();'
+      'try{window.eruda.show("console")}catch(e){}'
+      'var h=document.getElementById("eruda");'
+      'var s=h&&h.shadowRoot;'
+      'var p=s&&s.querySelector(".eruda-dev-tools");'
+      'if(!p)return "nopanel";'
+      'p.style.transition="none";'
+      'p.style.display="block";'
+      'p.style.opacity="1";'
+      'var r=p.getBoundingClientRect();'
+      'return "visible:"+Math.round(r.height)+"/"+window.innerHeight;'
+      '}catch(e){return "err:"+e}})()';
+
+  Future<String> _erudaState() async {
+    try {
+      final value = await _browser.evaluate(_erudaSyncScript);
+      return value?.toString() ?? 'null';
+    } on Object catch (error) {
+      // Mid-navigation: the next URL change retries.
+      return 'eval:$error';
+    }
+  }
+
   Future<void> _verifyEruda() async {
     if (!_erudaOpen || !mounted) return;
-    Object? state;
-    try {
-      // Presence alone is not enough: selecting the console tool without
-      // `eruda.show()` leaves the devtools panel at `display:none`. Ask for
-      // the state and show it right there when it is loaded but hidden.
-      state = await _browser.evaluate(
-        '(function(){try{'
-        'if(!(window.eruda&&window.eruda._isInit))return "missing";'
-        'var h=document.getElementById("eruda");'
-        'var d=h&&h.shadowRoot&&h.shadowRoot.querySelector(".eruda-dev-tools");'
-        'if(d&&d.getBoundingClientRect().height>0)return "visible";'
-        'eruda.show();eruda.show("console");'
-        'return "showing";'
-        '}catch(e){return "missing"}})()',
-      );
-    } on Object {
-      // Mid-navigation: the next URL change retries.
-      return;
-    }
-    if (state != 'missing') return;
+    final state = await _erudaState();
+    if (!mounted || !_erudaOpen || state.startsWith('visible')) return;
+    if (!state.startsWith('missing') && state != 'nopanel') return;
     final source = _erudaSource;
-    if (!mounted || source == null) return;
+    if (source == null) return;
     await _browser.setDebugOverlay(
       enabled: true,
       source: source,
@@ -2021,11 +2036,48 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   /// Shows the console in whatever document is loaded now. Harmless while the
-  /// bundle is still parsing; the retry after it settles covers that.
+  /// bundle is still parsing; the watch loop covers that.
   void _showErudaNow() {
-    _evalQuiet(
-      'try{if(window.eruda){eruda.show();eruda.show("console")}}catch(e){};0;',
-    );
+    unawaited(_erudaState().then((state) {
+      debugPrint('[console] show: $state');
+    }));
+  }
+
+  /// Bounded repair loop after opening: the bundle may still be parsing, the
+  /// page may be mid-navigation, or the native commit injection may have been
+  /// skipped. Polls until the panel is actually visible; never runs twice.
+  void _watchEruda() {
+    final id = ++_erudaWatchId;
+    unawaited(_runErudaWatch(id));
+  }
+
+  Future<void> _runErudaWatch(int id) async {
+    var reinjected = false;
+    for (var tick = 1; tick <= 20; tick++) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (!mounted || !_erudaOpen || id != _erudaWatchId) return;
+      final state = await _erudaState();
+      if (!mounted || !_erudaOpen || id != _erudaWatchId) return;
+      debugPrint('[console] watch#$tick $state');
+      if (state.startsWith('visible')) {
+        if (tick > 1) _pushToConsole('Console panel ready ($state)');
+        return;
+      }
+      if (!reinjected &&
+          tick >= 2 &&
+          (state.startsWith('missing') || state == 'nopanel')) {
+        reinjected = true;
+        final source = _erudaSource;
+        if (source != null) {
+          await _browser.setDebugOverlay(
+            enabled: true,
+            source: source,
+            displaySize: _erudaSize,
+          );
+          _showErudaNow();
+        }
+      }
+    }
   }
 
   void _applyErudaSize(double value) {

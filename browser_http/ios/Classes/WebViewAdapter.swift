@@ -529,7 +529,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             if (present as? Bool) == true {
                 self.debugInjecting = false
                 self.webView.evaluateJavaScript(
-                    "try{eruda.show();eruda.show('console')}catch(e){};0;"
+                    WebViewHolder.debugShowScript
                 ) { _, _ in completion?("already") }
                 return
             }
@@ -613,15 +613,50 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// Bumped whenever the native debug pipeline changes. Appended to every
     /// setDebugOverlay status so the host can tell a stale embedded framework
     /// from a real failure.
-    static let debugBuildStamp = "n3"
+    static let debugBuildStamp = "n4"
 
     private static func stamped(_ detail: String) -> String {
         "\(detail)|\(debugBuildStamp)"
     }
 
-    /// Whether the current document already has a live console.
-    private static let debugPresentScript =
-        "!!(window.__bhEruda && window.eruda && window.eruda._isInit)"
+    /// Whether the current document already has a live console, including its
+    /// panel element. A page that replaces `documentElement` can leave
+    /// `window.eruda` initialised while its host is gone; that has to count as
+    /// absent so the next pass builds a fresh instance.
+    private static let debugPresentScript = """
+    (function () {
+      try {
+        var h = document.getElementById('eruda');
+        return !!(window.__bhEruda && window.eruda && window.eruda._isInit &&
+                  h && h.shadowRoot &&
+                  h.shadowRoot.querySelector('.eruda-dev-tools'));
+      } catch (e) { return false; }
+    })()
+    """
+
+    /// Shows the console and forces the panel to paint.
+    ///
+    /// `eruda.show()` only flips `display:block`; the panel's opacity is then
+    /// raised by a 50 ms timer through a `transition: opacity .3s`. That
+    /// transition can stay at 0 — the panel is laid out (50% height, correct
+    /// position) but fully transparent, which looks exactly like "only the
+    /// white handle is there". Setting the final values inline with no
+    /// transition sidesteps it and is harmless when the transition works.
+    private static let debugShowScript = #"""
+    try {
+      window.eruda.show();
+      try { window.eruda.show('console'); } catch (e) {}
+      var host = document.getElementById('eruda');
+      var panel = host && host.shadowRoot &&
+                  host.shadowRoot.querySelector('.eruda-dev-tools');
+      if (panel) {
+        panel.style.transition = 'none';
+        panel.style.display = 'block';
+        panel.style.opacity = '1';
+      }
+    } catch (e) {}
+    ;0;
+    """#
 
     /// The snippet that shows the console and prints the jump that produced
     /// this document.
@@ -649,7 +684,10 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             fn.call(console, '[跳转] ' + text);
           } catch (e) {}
         };
-        if (!window.__bhEruda) {
+        if (!window.__bhEruda || !window.eruda._isInit) {
+          // A half-initialised instance from an earlier document can leave
+          // its host behind; drop it before building a new one.
+          try { var old = document.getElementById('eruda'); if (old) old.remove(); } catch (e) {}
           eruda.init({ defaults: { displaySize: size } });
           try { eruda.get('entryBtn').hide(); } catch (e) {}
           window.__bhEruda = true;
@@ -659,6 +697,18 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         eruda.show();
         try { eruda.get().config.set('displaySize', size); } catch (e) {}
         eruda.show('console');
+        // The panel's reveal is an opacity transition; force the end state so
+        // it cannot stay transparent (see debugShowScript).
+        try {
+          var host = document.getElementById('eruda');
+          var panel = host && host.shadowRoot &&
+                      host.shadowRoot.querySelector('.eruda-dev-tools');
+          if (panel) {
+            panel.style.transition = 'none';
+            panel.style.display = 'block';
+            panel.style.opacity = '1';
+          }
+        } catch (e) {}
       } catch (e) { return 'error:' + e; }
       return 'ok';
     })();
