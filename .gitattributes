@@ -1,0 +1,18 @@
+# Line endings are pinned to LF for everything a shell or a POSIX toolchain
+# reads, because a Windows checkout with core.autocrlf=true would otherwise hand
+# Xcode's /bin/sh script phase a CRLF `browser_http/rust/build_ios.sh` and fail
+# with `set: - invalid option`.
+*.sh text eol=lf
+*.swift text eol=lf
+*.dart text eol=lf
+*.rs text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+Podfile text eol=lf
+*.podspec text eol=lf
+*.xcconfig text eol=lf
