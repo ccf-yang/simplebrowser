@@ -147,6 +147,10 @@ class _BrowserPageState extends State<BrowserPage>
   /// Share of the body height taken by the info panel; draggable.
   double _panelFraction = 0.4;
   bool _panelVisible = true;
+  /// The user's panel switch. Unlike [_panelVisible] this is not touched when
+  /// the debug console temporarily hides the panel, so collection keeps
+  /// following the switch the user actually set.
+  bool _panelPreference = true;
   bool _didHidePanelForEruda = false;
 
   /// Cancel navigations that would open another app. On by default: a test
@@ -182,11 +186,12 @@ class _BrowserPageState extends State<BrowserPage>
     _tabs = TabController(length: 4, vsync: this);
     _urlFocus.addListener(_onUrlFocusChanged);
     _logSubscription = _logSink.stream.listen((event) {
-      if (!mounted) return;
+      if (!mounted || !_panelVisible) return;
       setState(() => _events.insert(0, event));
     });
-    // Buffered even while the panel is closed, so opening "Page" shows the
-    // requests of the current document instead of an empty list.
+    // The page hooks are installed by the native side; start in whatever state
+    // the panel is in, and let the first document load with them or without.
+    unawaited(_browser.setPageNetworkEnabled(_panelVisible));
     _pageSubscription = _browser.networkEvents.listen(_onPageNetworkEvent);
     _navigationSubscription =
         _browser.navigationEvents.listen(_onNavigationEvent);
@@ -262,6 +267,42 @@ class _BrowserPageState extends State<BrowserPage>
   void _onNavigationEvent(WebViewNavigationEvent event) {
     if (!mounted) return;
     if (!event.isMainFrame) return;
+
+    // A blocked jump is always worth a toast: it is the moment the app would
+    // have disappeared.
+    if (event.isBlocked && mounted) {
+      final host = Uri.tryParse(event.url)?.host;
+      _snack('已阻止跳转到外部应用${host == null ? '' : '：$host'}');
+    }
+
+    // Mirror it into the eruda console; the page's own context prints the
+    // landing line, the host prints what the page cannot see. The console
+    // keeps working while the info panel is closed (it even hides it).
+    if (_erudaOpen) {
+      _pushToConsole(
+        switch (event.kind) {
+          'blocked' =>
+            '已拦截外部跳转 ${event.method} ${event.url} '
+                '(${event.navigationType})',
+          'in-app' => '点击链接改为站内加载 ${event.url}',
+          'failed' => '加载失败 ${event.url} ${event.message ?? ''}',
+          'redirect' => '${event.statusCode} 跳转 ${event.url}',
+          'committed' =>
+            '页面已打开 ${event.statusCode ?? ''} ${event.url}',
+          _ => null,
+        },
+        level: event.isBlocked
+            ? 'warn'
+            : event.isFailed
+                ? 'error'
+                : 'info',
+      );
+    }
+
+    // Everything below is the Log tab. While the panel is closed (including
+    // the console hiding it) nothing is collected: no rows are kept.
+    if (!_panelVisible) return;
+
     final log = RequestLogEvent(
       id: 'nav-${_navSeq++}',
       phase: switch (event.kind) {
@@ -298,34 +339,6 @@ class _BrowserPageState extends State<BrowserPage>
         _events.removeLast();
       }
     });
-
-    // Mirror it into the eruda console; the page's own context prints the
-    // landing line, the host prints what the page cannot see.
-    if (_erudaOpen) {
-      _pushToConsole(
-        switch (event.kind) {
-          'blocked' =>
-            '已拦截外部跳转 ${event.method} ${event.url} '
-                '(${event.navigationType})',
-          'in-app' => '点击链接改为站内加载 ${event.url}',
-          'failed' => '加载失败 ${event.url} ${event.message ?? ''}',
-          'redirect' => '${event.statusCode} 跳转 ${event.url}',
-          'committed' =>
-            '页面已打开 ${event.statusCode ?? ''} ${event.url}',
-          _ => null,
-        },
-        level: event.isBlocked
-            ? 'warn'
-            : event.isFailed
-                ? 'error'
-                : 'info',
-      );
-    }
-
-    if (event.isBlocked && mounted) {
-      final host = Uri.tryParse(event.url)?.host;
-      _snack('已阻止跳转到外部应用${host == null ? '' : '：$host'}');
-    }
   }
 
   /// Prints one line into the eruda console of the current document.
@@ -446,7 +459,7 @@ class _BrowserPageState extends State<BrowserPage>
           uaIndex: _uaIndex,
           refererMode: _refererMode == _RefererMode.currentDomain ? 1 : 0,
           cookie: _cookieController.text,
-          showPanel: _panelVisible,
+          showPanel: _panelPreference,
           blockExternal: _blockExternal,
         ),
         uaLabels: <String>[for (final preset in _uaPresets) preset.label],
@@ -461,9 +474,11 @@ class _BrowserPageState extends State<BrowserPage>
       _refererMode = result.refererMode == 1
           ? _RefererMode.currentDomain
           : _RefererMode.none;
-      _panelVisible = result.showPanel;
       _blockExternal = result.blockExternal;
     });
+    // The live switch already applied this; calling again keeps the saved
+    // value authoritative if the sheet is dismissed in a weird state.
+    _setPanelVisible(result.showPanel);
     unawaited(_browser.setNavigationPolicy(
       blockExternal: _blockExternal,
       reissueTaps: _blockExternal,
@@ -488,8 +503,26 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   void _setPanelVisible(bool value) {
-    if (_panelVisible == value) return;
-    setState(() => _panelVisible = value);
+    if (_panelVisible == value && _panelPreference == value) return;
+    setState(() {
+      _panelPreference = value;
+      _panelVisible = value;
+    });
+    _applyPanelCollection(clear: !value);
+  }
+
+  /// The info panel is the only consumer of Page/Log data. While it is closed
+  /// the native page hooks are off and the Dart side drops what is still in
+  /// flight; turning the panel off also clears what it had collected.
+  ///
+  /// The console hides the panel without changing the user's switch, so this
+  /// follows [_panelVisible], not [_panelPreference].
+  void _applyPanelCollection({bool clear = false}) {
+    unawaited(_browser.setPageNetworkEnabled(_panelVisible));
+    if (clear) {
+      _pageRequests.clear();
+      _events.clear();
+    }
   }
 
   /// Applied immediately, not only on "Save": while the sheet is open the user
@@ -549,7 +582,9 @@ class _BrowserPageState extends State<BrowserPage>
   /// request: headers and body come from the request, status/timing/response
   /// body from the matching response.
   void _onPageNetworkEvent(PageNetworkEvent event) {
-    if (!mounted) return;
+    // The Page tab is the only consumer; while the panel is closed the native
+    // hooks are off and anything still in flight is dropped.
+    if (!mounted || !_panelVisible) return;
     setState(() {
       final existing = _pageRequests[event.key];
       _pageRequests[event.key] = existing == null
@@ -1844,6 +1879,7 @@ class _BrowserPageState extends State<BrowserPage>
       });
       _erudaVerifyTimer?.cancel();
       _debugSizeTimer?.cancel();
+      _applyPanelCollection();
       await _browser.setDebugOverlay(enabled: false);
       return;
     }
@@ -1856,20 +1892,24 @@ class _BrowserPageState extends State<BrowserPage>
     setState(() => _erudaBusy = true);
     try {
       final source = await _loadErudaSource();
-      final shown = await _browser.setDebugOverlay(
+      final detail = await _browser.setDebugOverlay(
         enabled: true,
         source: source,
         displaySize: _erudaSize,
       );
       if (!mounted) return;
+      // `queued` means the script is registered and the next commit (or the
+      // native one-off reload) brings the console up, so treat it as open.
+      final open = detail == 'ok' || detail.startsWith('queued');
       setState(() {
-        _erudaOpen = true;
-        _didHidePanelForEruda = _panelVisible;
-        _panelVisible = false;
+        _erudaOpen = open;
+        if (open) {
+          _didHidePanelForEruda = _panelVisible;
+          _panelVisible = false;
+        }
       });
-      // Registered as a native user script, so every later document gets the
-      // console back. A page that has not finished loading shows it on commit.
-      if (!shown) _snack('Console appears when this page finishes loading');
+      if (open) _applyPanelCollection();
+      if (!open) _snack('Console failed: $detail');
     } on Object catch (error) {
       if (mounted) _snack('Eruda failed: $error');
     } finally {
@@ -1929,7 +1969,15 @@ class _BrowserPageState extends State<BrowserPage>
     if (!_erudaOpen || !mounted) return;
     Object? present;
     try {
-      present = await _browser.evaluate('!!(window.eruda && window.__bhEruda)');
+      // Presence alone is not enough: the old boot selected the console tool
+      // without showing the devtools panel, which left an invisible console.
+      present = await _browser.evaluate(
+        '!!(window.__bhEruda && window.eruda && window.eruda._isInit)'
+        ' && (function(){try{var h=document.getElementById("eruda");'
+        'var d=h&&h.shadowRoot&&h.shadowRoot.querySelector(".eruda-dev-tools");'
+        'return !!d && d.getBoundingClientRect().height > 0;}'
+        'catch(e){return false}})()',
+      );
     } on Object {
       // Mid-navigation: the next URL change retries.
       return;

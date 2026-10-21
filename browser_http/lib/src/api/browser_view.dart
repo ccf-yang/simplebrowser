@@ -96,6 +96,7 @@ final class BrowserController extends ChangeNotifier {
       _navigationSubscription ??= webView.navigationEvents.listen((event) {
         if (!_navigationEvents.isClosed) _navigationEvents.add(event);
       });
+      if (!_pageNetwork) await webView.setPageNetworkEnabled(false);
       if (initialUri != null) await webView.navigate(initialUri);
       _poll = Timer.periodic(
         const Duration(milliseconds: 800),
@@ -224,24 +225,36 @@ final class BrowserController extends ChangeNotifier {
     return webView.evaluate(script);
   }
 
+  /// Whether the page-script hooks are installed. Off means the Page tab is
+  /// closed and nothing from the page is collected.
+  bool _pageNetwork = true;
+
   /// Installs (or removes) the debug console for this WebView and every
   /// document it loads afterwards.
   ///
-  /// [source] is the eruda bundle; it is cached natively, so later navigations
-  /// need no host help. Returns whether the current document already shows it.
-  Future<bool> setDebugOverlay({
+  /// [source] is the eruda bundle; it is cached natively and evaluated by the
+  /// native side on every navigation commit, so later documents need no help
+  /// from Dart. Returns `ok`, `queued` or the reason it failed.
+  Future<String> setDebugOverlay({
     required bool enabled,
     String? source,
     double displaySize = 50,
   }) async {
     await start();
     final webView = _webView;
-    if (webView == null) return false;
+    if (webView == null) return 'no-webview';
     return webView.setDebugOverlay(
       enabled: enabled,
       source: source,
       displaySize: displaySize,
     );
+  }
+
+  /// Turns the page-script hooks on or off. Buffered until the WebView exists.
+  Future<void> setPageNetworkEnabled(bool enabled) async {
+    _pageNetwork = enabled;
+    final webView = _webView;
+    if (webView != null) await webView.setPageNetworkEnabled(enabled);
   }
 
   /// Updates the panel size used by the next documents. Cheap: the injected

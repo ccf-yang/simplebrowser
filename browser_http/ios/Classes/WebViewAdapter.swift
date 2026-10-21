@@ -132,13 +132,18 @@ final class WebViewBridge {
                 enabled: args["enabled"] as? Bool ?? false,
                 source: args["source"] as? String ?? "",
                 displaySize: (args["displaySize"] as? NSNumber)?.doubleValue ?? 50
-            ) { ok in result(ok) }
+            ) { detail in result(detail) }
 
         case "setDebugDisplaySize":
             guard let holder = session(args, result) else { return }
             if let size = (args["displaySize"] as? NSNumber)?.doubleValue {
                 holder.setDebugDisplaySize(size)
             }
+            result(nil)
+
+        case "setPageNetwork":
+            guard let holder = session(args, result) else { return }
+            holder.setPageNetwork(args["enabled"] as? Bool ?? true)
             result(nil)
 
         case "setCookie":
@@ -391,24 +396,23 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// untouched or the re-issue would cancel itself forever.
     private var programmaticURLs: Set<String> = []
 
+    /// When a URL was cancelled and re-issued. Guards against a cancel/re-issue
+    /// loop when WebKit reports the reload with a normalised URL string.
+    private var reissuedAt: [String: Date] = [:]
+
     /// Method and trigger of the last main-frame action, reused by the response
     /// and commit callbacks so a log row reads like the request it belongs to.
     private var lastMethod = "GET"
     private var lastNavigationType = "other"
 
-    /// Scripts every document gets: the fetch/XHR hooks plus, while the debug
-    /// console is open, the eruda bundle.
-    private var userScripts: [InjectedScript] = []
     private(set) var debugOverlayEnabled = false
     private var debugSource = ""
     private var debugDisplaySize = 50.0
-
-    /// One `WKUserScript` tagged as debug overlay or not, so the overlay can be
-    /// swapped without rebuilding the request-hook script.
-    private struct InjectedScript {
-        let script: WKUserScript
-        let isDebugOverlay: Bool
-    }
+    /// Page requests are observed only while the host shows the Page tab.
+    private(set) var pageNetworkEnabled = true
+    /// One console injection at a time; the bundle is large, so overlapping
+    /// evaluations would race each other.
+    private var debugInjecting = false
 
     /// Schemes WebKit may load inside this browser. Anything else is an exit.
     private static let inAppSchemes: Set<String> = [
@@ -427,15 +431,8 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         webView.navigationDelegate = self
         webView.uiDelegate = self
 
-        // Inject the fetch/XHR hooks before the first document script runs.
-        // The handler is weak so the holder can be released when the session
-        // is disposed.
-        userScripts.append(InjectedScript(
-            script: WKUserScript(
-                source: WebViewHolder.networkScript,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false),
-            isDebugOverlay: false))
+        // Install the fetch/XHR hooks (and nothing else yet). The handler is
+        // weak so the holder can be released when the session is disposed.
         applyUserScripts()
         webView.configuration.userContentController.add(
             WeakScriptMessageHandler(delegate: self),
@@ -446,96 +443,173 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         webView.allowsBackForwardNavigationGestures = !headless
     }
 
-    /// Replaces the controller's script list with `userScripts`.
-    ///
-    /// `WKUserContentController` only offers `removeAllUserScripts()`, so the
-    /// whole list is rebuilt whenever the debug overlay is switched on or off.
-    /// Applies to the next document; the current one is handled by the explicit
-    /// `evaluateJavaScript` calls in `setDebugOverlay`.
+    /// Rebuilds the page-request hook. The console is *not* a user script:
+    /// WebKit applies a large script added at runtime to the next reload but
+    /// not reliably to the next navigation, so it is evaluated from code on
+    /// every commit instead (see `injectDebug`).
     private func applyUserScripts() {
         let controller = webView.configuration.userContentController
         controller.removeAllUserScripts()
-        for entry in userScripts {
-            controller.addUserScript(entry.script)
-        }
+        guard pageNetworkEnabled else { return }
+        controller.addUserScript(WKUserScript(
+            source: WebViewHolder.networkScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false))
     }
 
-    private func rebuildDebugScript() {
-        userScripts.removeAll { $0.isDebugOverlay }
-        guard debugOverlayEnabled, !debugSource.isEmpty else { return }
-        userScripts.append(InjectedScript(
-            script: WKUserScript(
-                source: WebViewHolder.debugBundle(
-                    source: debugSource, displaySize: debugDisplaySize),
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: true),
-            isDebugOverlay: true))
+    /// Enables or disables the page-script hook. The current document keeps the
+    /// hook it already installed; its events are dropped in `didReceive`.
+    func setPageNetwork(_ enabled: Bool) {
+        guard pageNetworkEnabled != enabled else { return }
+        pageNetworkEnabled = enabled
+        applyUserScripts()
     }
 
-    /// Turns the persistent debug console on or off for *all later documents*.
+    /// Turns the debug console on or off. Once on, every document gets one:
+    /// the currently loaded one right away, later ones from `didCommit`.
     ///
-    /// A `WKUserScript` survives navigations, which is what keeps eruda visible
-    /// no matter how deep the user clicks into a site. The currently loaded
-    /// document is patched immediately as well.
+    /// The completion carries a short status: `ok`, `queued` (a document is
+    /// loading, the commit injects it) or the reason the bundle could not run.
     func setDebugOverlay(enabled: Bool, source: String, displaySize: Double,
-                         completion: @escaping (Bool) -> Void) {
+                         completion: @escaping (String) -> Void) {
         debugOverlayEnabled = enabled
         if enabled, !source.isEmpty { debugSource = source }
         debugDisplaySize = displaySize
-        rebuildDebugScript()
-        applyUserScripts()
 
         guard enabled else {
             webView.evaluateJavaScript("try{eruda.hide()}catch(e){};0;") { _, _ in
-                completion(true)
+                completion("ok")
             }
             return
         }
+        guard !debugSource.isEmpty else {
+            completion("bundle: empty")
+            return
+        }
 
-        let bundle = WebViewHolder.debugBundle(
-            source: debugSource, displaySize: debugDisplaySize)
-        webView.evaluateJavaScript(bundle) { value, error in
-            if error != nil {
-                completion(false)
-                return
+        injectDebug { detail in
+            switch detail {
+            case "ok", "already":
+                completion("ok")
+            case "busy":
+                completion("queued: document loading")
+            default:
+                // A document that started while the bundle was parsed gets the
+                // console from its own commit callback.
+                completion("queued: \(detail)")
             }
-            // The boot snippet ends with 'ok'; a page without a JS context
-            // returns nil, which the caller can retry after the load commits.
-            completion((value as? String)?.contains("ok") ?? false)
         }
     }
 
-    /// Re-registers the debug user script with a new panel size.
+    /// Puts a visible console into the document loaded right now.
     ///
-    /// Cheap on purpose: the bundle is only concatenated again, nothing is
-    /// evaluated, so dragging the split does not re-initialise eruda.
+    /// Called when the switch flips on and from every main-frame commit.
+    /// Evaluating the bundle here (instead of relying on a registered user
+    /// script) is what makes it survive normal link taps, form posts,
+    /// redirects and `window.open` alike.
+    private func injectDebug(completion: ((String) -> Void)? = nil) {
+        guard debugOverlayEnabled, !debugSource.isEmpty else {
+            completion?("off")
+            return
+        }
+        guard !debugInjecting else {
+            completion?("busy")
+            return
+        }
+        let url = webView.url?.absoluteString
+        debugInjecting = true
+
+        // A document that already has the console (reload, same-page route
+        // change, or a second call for the same navigation) only needs to be
+        // shown again; re-evaluating the bundle would replace `window.eruda`
+        // with an uninitialised copy.
+        webView.evaluateJavaScript(WebViewHolder.debugPresentScript) {
+            [weak self] present, _ in
+            guard let self else { return }
+            if (present as? Bool) == true {
+                self.debugInjecting = false
+                self.webView.evaluateJavaScript(
+                    "try{eruda.show();eruda.show('console')}catch(e){};0;"
+                ) { _, _ in completion?("already") }
+                return
+            }
+            // `;0;` is mandatory: the bundle's own last value is its module
+            // object, which cannot cross the WKWebView bridge.
+            self.webView.evaluateJavaScript(
+                WebViewHolder.erudaSourceScript(self.debugSource)
+            ) { [weak self] _, error in
+                guard let self else { return }
+                if let error {
+                    self.debugInjecting = false
+                    completion?("bundle: \(error.localizedDescription)")
+                    return
+                }
+                // A new navigation may have replaced the document while the
+                // bundle was being evaluated; its commit injects itself.
+                guard self.webView.url?.absoluteString == url else {
+                    self.debugInjecting = false
+                    completion?("navigated")
+                    return
+                }
+                self.webView.evaluateJavaScript(
+                    WebViewHolder.debugBoot(displaySize: self.debugDisplaySize)
+                ) { [weak self] value, error in
+                    guard let self else { return }
+                    self.debugInjecting = false
+                    if let error {
+                        completion?("boot: \(error.localizedDescription)")
+                        return
+                    }
+                    completion?((value as? String) ?? "nil")
+                }
+            }
+        }
+    }
+
+    /// Live panel size for every following document and the current one.
     func setDebugDisplaySize(_ size: Double) {
         guard debugOverlayEnabled else { return }
         debugDisplaySize = size
-        rebuildDebugScript()
-        applyUserScripts()
+        webView.evaluateJavaScript(
+            "try{eruda.get().config.set('displaySize', "
+                + WebViewHolder.jsNumber(size) + ")}catch(e){};0;"
+        ) { _, _ in }
     }
 
-    /// The eruda bundle followed by the snippet that shows it and prints the
-    /// jump that produced this document.
-    private static func debugBundle(source: String, displaySize: Double) -> String {
-        let boot = String(
-            format: debugBootTemplate,
-            String(format: "%.1f", displaySize),
-            String(format: "%.1f", displaySize)
-        )
-        return source + "\n" + boot
+    /// A locale-independent number literal for injected JavaScript.
+    private static func jsNumber(_ value: Double) -> String {
+        String(format: "%.1f", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 
-    /// Two `%@` placeholders: the display size for `init` and for `config.set`.
+    /// The bundle with a serializable tail. `eruda.js` ends in a comment and its
+    /// module object cannot cross the WKWebView bridge, so `;0;` is not
+    /// optional.
+    private static func erudaSourceScript(_ source: String) -> String {
+        source + "\n;0;"
+    }
+
+    /// Whether the current document already has a live console.
+    private static let debugPresentScript =
+        "!!(window.__bhEruda && window.eruda && window.eruda._isInit)"
+
+    /// The snippet that shows the console and prints the jump that produced
+    /// this document.
+    private static func debugBoot(displaySize: Double) -> String {
+        String(format: debugBootTemplate, jsNumber(displaySize))
+    }
+
+    /// One `%@` placeholder: the initial display size.
     ///
-    /// Runs at document end on every frame of type main, so a page reload, a
-    /// link tap or a redirect all get a working console without any help from
-    /// Dart. `%1$@`/`%2$@` are the same value; keeping both lets a future change
-    /// separate the initial size from the live one.
+    /// `eruda.show('console')` only *selects* a tool; the panel itself stays
+    /// `display:none` until `eruda.show()` is called without a name. Both are
+    /// needed, and the `config.set` must not be allowed to abort the sequence.
+    ///
+    /// Runs once per document, from `didCommit`, so a reload, a link tap, a
+    /// form post or a redirect all get a working console without host help.
     private static let debugBootTemplate = #"""
     (function () {
       if (!window.eruda) { return 'no-bundle'; }
+      var size = %@;
       try {
         window.__bhDebugLog = function (text, level) {
           try {
@@ -545,15 +619,14 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           } catch (e) {}
         };
         if (!window.__bhEruda) {
-          eruda.init({ defaults: { displaySize: %@ } });
+          eruda.init({ defaults: { displaySize: size } });
           try { eruda.get('entryBtn').hide(); } catch (e) {}
           window.__bhEruda = true;
           var from = document.referrer || '';
           window.__bhDebugLog(location.href + (from ? '  ←  ' + from : ''));
-        } else {
-          eruda.show();
         }
-        eruda.get().config.set('displaySize', %@);
+        eruda.show();
+        try { eruda.get().config.set('displaySize', size); } catch (e) {}
         eruda.show('console');
       } catch (e) { return 'error:' + e; }
       return 'ok';
@@ -599,8 +672,22 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// The URL is remembered so its own policy call is allowed instead of being
     /// cancelled by the tap handling above.
     func loadInApp(_ request: URLRequest) {
-        if let url = request.url { programmaticURLs.insert(url.absoluteString) }
+        if let url = request.url {
+            programmaticURLs.insert(url.absoluteString)
+            markReissued(url)
+        }
         webView.load(request)
+    }
+
+    private func wasReissuedRecently(_ url: URL) -> Bool {
+        guard let at = reissuedAt[url.absoluteString] else { return false }
+        return Date().timeIntervalSince(at) < 2
+    }
+
+    private func markReissued(_ url: URL) {
+        // `programmaticURLs` is cleared on commit; keep this map small too.
+        if reissuedAt.count > 32 { reissuedAt.removeAll() }
+        reissuedAt[url.absoluteString] = Date()
     }
 
     func webView(_ webView: WKWebView,
@@ -640,21 +727,37 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             return
         }
 
-        // Universal links: iOS hands the app's own domain over to that app when
-        // a *user tap* moves the main frame. Re-issuing the identical GET from
-        // code is the only public way to keep the navigation in-process.
-        // Subframes are never re-issued: their content belongs in the frame.
-        let isTap = navigationAction.navigationType == .linkActivated
-            || navigationAction.navigationType == .formSubmitted
+        // A page jump must never leave the app, whatever triggered it:
+        // - taps and GET form submits (Universal Link handoff),
+        // - script-driven `location =` / `window.open` (`.other`): the "open in
+        //   app" banner and some news sites jump that way, and the pending user
+        //   gesture is enough for WebKit to honour the Universal Link.
+        // Back/forward and reload are left alone: those URLs are already inside
+        // this browser. POST bodies pass through untouched.
+        let trigger = navigationAction.navigationType
+        let isGesture = trigger == .linkActivated || trigger == .formSubmitted
+        let isScriptJump = trigger == .other
         let isWebURL = scheme == "http" || scheme == "https"
-        if blockExternalNavigations, reissueUserTaps, isTap, isWebURL,
+        if blockExternalNavigations, reissueUserTaps, isWebURL,
            method == "GET",
+           isGesture || isScriptJump,
            targetsMainFrame || opensWindow,
            navigationAction.request.httpBody == nil {
+            // The identical URL was just re-issued (a page that fires both a
+            // tap and a script jump, or a double tap). Cancel instead of
+            // allowing: allowing would hand a Universal Link to the other app.
+            if wasReissuedRecently(url) {
+                decisionHandler(.cancel)
+                reportNavigation(kind: "in-app", url: url, method: method,
+                                 mainFrame: targetsMainFrame, type: type,
+                                 message: "duplicate jump kept out")
+                return
+            }
+            markReissued(url)
             decisionHandler(.cancel)
             reportNavigation(kind: "in-app", url: url, method: method,
                              mainFrame: targetsMainFrame, type: type,
-                             message: "tap reloaded in-app (no external app)")
+                             message: "reloaded in-app (no external app)")
             DispatchQueue.main.async { [weak self] in
                 self?.loadInApp(navigationAction.request)
             }
@@ -669,7 +772,10 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// page -> Dart bridge. WebKit calls this on the main thread.
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
+        // The hooks stay installed in documents loaded while the Page tab was
+        // open; their events are dropped as soon as it closes.
         guard message.name == WebViewHolder.networkHandlerName,
+              pageNetworkEnabled,
               var body = message.body as? [String: Any] else { return }
         body["sessionId"] = id
         onNetworkEvent?(body)
@@ -682,8 +788,22 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            loadInApp(navigationAction.request)
+        // A new window must also stay in-app; a custom scheme is simply
+        // dropped instead of being handed to `webView.load` or the system.
+        if navigationAction.targetFrame == nil,
+           let url = navigationAction.request.url,
+           !programmaticURLs.contains(url.absoluteString) {
+            let scheme = (url.scheme ?? "").lowercased()
+            if blockExternalNavigations, !Self.inAppSchemes.contains(scheme) {
+                reportNavigation(
+                    kind: "blocked", url: url,
+                    method: (navigationAction.request.httpMethod ?? "GET").uppercased(),
+                    mainFrame: true,
+                    type: Self.navigationTypeName(navigationAction.navigationType),
+                    message: "external app jump blocked (new window)")
+            } else if !wasReissuedRecently(url) {
+                loadInApp(navigationAction.request)
+            }
         }
         return nil
     }
@@ -703,6 +823,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                  didStartProvisionalNavigation navigation: WKNavigation!) {
         // Do not report the previous page's status while the new one loads.
         lastStatusCode = nil
+    }
+
+    /// The new document exists. This is the earliest point where the console
+    /// can be put back into it, so every click, redirect or `window.open`
+    /// keeps it without waiting for the load to finish.
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        if debugOverlayEnabled { injectDebug() }
     }
 
     func webView(_ webView: WKWebView,
@@ -735,6 +862,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                 type: lastNavigationType,
                 status: lastStatusCode)
         }
+        // `didCommit` already injected; this second pass only matters when the
+        // page replaced its DOM or the first evaluation was still in flight.
+        if debugOverlayEnabled { injectDebug() }
         loadCompletion?(nil)
         loadCompletion = nil
     }

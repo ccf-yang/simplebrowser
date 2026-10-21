@@ -568,12 +568,12 @@ final class _ChannelWebViewSession implements WebViewSession {
       '';
 
   @override
-  Future<bool> setDebugOverlay({
+  Future<String> setDebugOverlay({
     required bool enabled,
     String? source,
     double displaySize = 50,
   }) async {
-    final ok = await _channel.invokeMethod<bool>(
+    final detail = await _channel.invokeMethod<String>(
       'setDebugOverlay',
       <String, Object?>{
         'id': _id,
@@ -582,8 +582,15 @@ final class _ChannelWebViewSession implements WebViewSession {
         'displaySize': displaySize,
       },
     );
-    return ok ?? false;
+    return detail ?? 'ok';
   }
+
+  @override
+  Future<void> setPageNetworkEnabled(bool enabled) =>
+      _channel.invokeMethod<void>('setPageNetwork', <String, Object?>{
+        'id': _id,
+        'enabled': enabled,
+      });
 
   @override
   Future<void> setDebugDisplaySize(double displaySize) =>

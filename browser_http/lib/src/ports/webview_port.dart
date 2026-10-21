@@ -134,17 +134,23 @@ abstract interface class WebViewSession {
 
   /// Installs the persistent debug console (eruda) for every later document.
   ///
-  /// The bundle is registered as a `WKUserScript`, so a page reload, a link tap
-  /// or a redirect all get the console back without host-side timing. Returns
-  /// whether the *currently loaded* document already shows it.
-  Future<bool> setDebugOverlay({
+  /// The native side evaluates the cached bundle on every navigation commit,
+  /// so a reload, a link tap, a form post or a redirect all get the console
+  /// back without host-side timing. Returns a short status: `ok` (the current
+  /// document shows it), `queued` (a document is loading, its commit brings it
+  /// up) or the reason it could not start.
+  Future<String> setDebugOverlay({
     required bool enabled,
     String? source,
     double displaySize = 50,
   });
 
-  /// Re-registers the debug console user script with a new panel size.
+  /// Updates the panel size of the console, current document included.
   Future<void> setDebugDisplaySize(double displaySize);
+
+  /// Installs or removes the page-script `fetch`/XHR hooks. While disabled the
+  /// host collects nothing from the page.
+  Future<void> setPageNetworkEnabled(bool enabled);
 
   /// Whether non-http(s) navigations are cancelled instead of opening another
   /// app, and whether Universal-Link taps are re-issued in-app.
