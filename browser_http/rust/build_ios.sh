@@ -23,7 +23,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ -z "${BUILT_PRODUCTS_DIR:-}" ] || [ -z "${PLATFORM_NAME:-}" ]; then
+if [ -z "${BUILT_PRODUCTS_DIR:-}" ] || [ -z "${PLATFORM_NAME:-}" ] || [ -z "${SYMROOT:-}" ]; then
   echo "error: this script must be run from an Xcode build phase." >&2
   exit 1
 fi
@@ -57,7 +57,11 @@ for target in $TARGETS; do
   LIBS="$LIBS $CARGO_TARGET_DIR/$target/$PROFILE_DIR/libbrowser_http_core.a"
 done
 
-OUT="${BUILT_PRODUCTS_DIR}/libbrowser_http_core.a"
+# Write into the shared products directory used by the app target. The pod
+# target's own BUILT_PRODUCTS_DIR has a pod-specific subdirectory, which the
+# Runner's force_load would not find.
+OUT="${SYMROOT}/${CONFIGURATION}${EFFECTIVE_PLATFORM_NAME}/libbrowser_http_core.a"
+mkdir -p "$(dirname "$OUT")"
 set -- $LIBS
 if [ "$#" -eq 1 ]; then
   cp "$1" "$OUT"

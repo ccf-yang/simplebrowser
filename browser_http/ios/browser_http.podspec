@@ -21,7 +21,7 @@ challenge hand-off and identity persistence.
     # Rust symbols are resolved by Dart through dlsym, so the linker cannot see
     # any references to them. force_load keeps every object in the archive.
     'OTHER_LDFLAGS' =>
-      '$(inherited) -Wl,-force_load,"${BUILT_PRODUCTS_DIR}/libbrowser_http_core.a" -lc++'
+      '$(inherited) -Wl,-force_load,"${SYMROOT}/${CONFIGURATION}${EFFECTIVE_PLATFORM_NAME}/libbrowser_http_core.a" -lc++'
   }
 
   # Compiles rust/ into a static library for the architecture Xcode is building.
@@ -30,6 +30,6 @@ challenge hand-off and identity persistence.
     :name => 'Build Rust library',
     :script => 'sh "$PODS_TARGET_SRCROOT/../rust/build_ios.sh"',
     :execution_position => :before_compile,
-    :output_files => ['${BUILT_PRODUCTS_DIR}/libbrowser_http_core.a']
+    :output_files => ['${SYMROOT}/${CONFIGURATION}${EFFECTIVE_PLATFORM_NAME}/libbrowser_http_core.a']
   }
 end

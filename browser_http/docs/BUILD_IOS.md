@@ -26,8 +26,9 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 2. `ios/browser_http.podspec` declares a `before_compile` script phase.
 3. `rust/build_ios.sh` reads `PLATFORM_NAME` and `ARCHS`, runs
    `cargo build --release --target …`, and writes
-   `$BUILT_PRODUCTS_DIR/libbrowser_http_core.a` (a `lipo` merge on simulator
-   builds).
+   `$SYMROOT/$CONFIGURATION$EFFECTIVE_PLATFORM_NAME/libbrowser_http_core.a`
+   (a `lipo` merge on simulator builds). This is the app target's
+   `BUILT_PRODUCTS_DIR`, which `-force_load` also references.
 4. `OTHER_LDFLAGS` links the archive with `-force_load`, because Dart resolves
    the bridge symbols at runtime and there are no link-time references.
 
