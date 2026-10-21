@@ -143,8 +143,10 @@ jobs:
       - name: Patch Info.plist (display name + allow http)
         run: |
           PLIST=ios/Runner/Info.plist
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName SimpleBrowser" "$PLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string SimpleBrowser" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName So~" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string So~" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName So~" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleName string So~" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoads true" "$PLIST" 2>/dev/null || true
@@ -186,20 +188,24 @@ jobs:
             build
 
       - name: Package unsigned IPA
+        id: pkg
         run: |
           set -e
           APP_PATH=$(find build/ios -type d -name Runner.app | head -1)
           test -n "$APP_PATH"
+          V=$(grep -m1 '^version:' pubspec.yaml | sed 's/^version:[[:space:]]*//' | tr -d '\r')
+          IPA="so-${V%%+*}.ipa"
           rm -rf Payload && mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-          zip -qr simplebrowser-unsigned.ipa Payload
-          ls -lh simplebrowser-unsigned.ipa
+          zip -qr "$IPA" Payload
+          ls -lh "$IPA"
+          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: simplebrowser-ipa
-          path: simplebrowser-unsigned.ipa
+          name: so-ipa
+          path: ${{ steps.pkg.outputs.ipa }}
           if-no-files-found: error
 
       - name: Read version from pubspec
@@ -216,8 +222,8 @@ jobs:
         run: |
           set -e
           TAG="${{ steps.ver.outputs.tag }}"
-          TITLE="SimpleBrowser ${{ steps.ver.outputs.version }}"
-          FILE="simplebrowser-unsigned.ipa"
+          TITLE="So~ ${{ steps.ver.outputs.version }}"
+          FILE="${{ steps.pkg.outputs.ipa }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$FILE" --clobber
             gh release edit "$TAG" --title "$TITLE" --latest

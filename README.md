@@ -1,7 +1,8 @@
-# SimpleBrowser
+# So~
 
-A small iOS test browser built on **browser_http**. It browses with a real
-`WKWebView` and, on demand, replays the current URL through the native
+A small iOS test browser built on **browser_http** (the app is named `So~`,
+`CFBundleDisplayName`/`CFBundleName` are patched in the build). It browses with
+a real `WKWebView` and, on demand, replays the current URL through the native
 fingerprint engine so you can inspect the actual request/response metadata.
 
 ## What it shows
@@ -11,8 +12,9 @@ fingerprint engine so you can inspect the actual request/response metadata.
   field is not focused, plus settings and Eruda buttons.
 - **Request headers** — a settings sheet with User-Agent presets (Safari,
   Chrome, Edge, Firefox on phone and desktop), Referer (none or current
-  origin), a custom Cookie string and an info-panel switch. Save applies the
-  headers and reloads the page so the next request carries them.
+  origin), a custom Cookie string, an info-panel switch and a "Stay in this
+  app" switch. Save applies the headers and reloads the page so the next
+  request carries them; the two switches apply immediately.
 - **Info panel** — a resizable bottom panel with four tabs:
   - **WebView** — main-frame URL, title, HTTP status, history flags, the page's
     `PerformanceResourceTiming` entries and the shared cookie jar. WebKit does
@@ -30,11 +32,32 @@ fingerprint engine so you can inspect the actual request/response metadata.
     response body (small textual responses only), then copy it as cURL or
     replay it through the native engine.
   - **Log** — live `RequestLogEvent`s (start / redirect / response / error)
-    with All / Warn / Error filters and a clear action.
+    with All / Warn / Error filters and a clear action. Every navigation the
+    WebView decides on is reported from Swift over `browser_http/webview`, so
+    page loads, redirects, committed pages and blocked app jumps all show up
+    here.
 - **Eruda** — the toolbar's terminal button overlays a half-screen eruda
   console above the WebView; drag its pill to change the split and tap the
-  button again to close it. The bundle is shipped as an asset in CI with a CDN
-  fallback.
+  circle in the pill to close it. The console lives in a `WKUserScript`
+  registered at document end, so it survives every navigation and is only
+  closed by that button; each page load prints
+  `[跳转] <new url> ← <referrer>` into the console. The bundle is shipped as an
+  asset in CI with a CDN fallback.
+
+## Staying inside the app
+
+`WKNavigationDelegate.decidePolicyFor navigationAction` owns the policy:
+
+- Custom schemes (`baiduboxapp://`, `weixin://`, `tel:`, …) are cancelled and
+  logged as a blocked jump, so a page can never hand the URL to another app.
+- Link taps and form submissions that would leave as a Universal Link are
+  cancelled and re-loaded from code, which is never the continuation of a user
+  gesture — the tap stays in the WebView.
+- Loads started by the app itself are registered in a small allow-set first, so
+  they run once as ordinary in-app navigations.
+
+Both behaviours are switchable in the settings sheet ("Stay in this app") and
+take effect without a reload.
 
 Both engines use the same persistent `WKWebsiteDataStore`, so cookies obtained
 by browsing are reused by the native capture and vice versa.
@@ -60,17 +83,26 @@ Rust core through the plugin's CocoaPods script phase.
 
 ## Build the IPA on GitHub
 
+The workflow only runs on `workflow_dispatch`, so pushing commits builds
+nothing by itself.
+
 1. Push this directory to a GitHub repository (default branch `main`).
 2. Actions → **Build iOS IPA** → **Run workflow**.
-3. When it finishes, download `simplebrowser-unsigned.ipa` from the run artifacts or
-   from the `v0.1.0-1` release.
+3. When it finishes, download `so-<version>.ipa` from the run artifacts or from
+   the matching release.
 
 The workflow needs no signing secrets: it builds with code signing disabled.
 Install the IPA on a device with a sideloading tool (AltStore, Sideloadly,
 TrollStore, etc.) or re-sign it with your own certificate.
 
-The first build is slow because BoringSSL is compiled from source; later runs
-reuse the Rust cache.
+The same steps run locally against a macOS host over SSH: `flutter create` the
+`ios/` project, patch the deployment target and `Info.plist` (name `So~`,
+`NSAllowsArbitraryLoads`), `pod install`, add
+`-Wl,-force_load,"${BUILT_PRODUCTS_DIR}/libbrowser_http_core.a"` to
+`Release.xcconfig`, then `xcodebuild` with signing off. It needs `cargo` with
+the three iOS targets, `go`, `cmake` and Xcode, because the CocoaPods script
+phase compiles the Rust core. The first build is slow because BoringSSL is
+compiled from source; later runs reuse `browser_http/rust/target`.
 
 ## Notes
 
