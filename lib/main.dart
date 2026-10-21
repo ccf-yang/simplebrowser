@@ -19,7 +19,7 @@ class SimpleBrApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'SimpleBrowser',
+        title: 'So~',
         debugShowCheckedModeBanner: false,
         theme: buildAppTheme(),
         home: const BrowserPage(),
@@ -95,6 +95,10 @@ enum _RefererMode { none, currentDomain }
 /// native fingerprint engine sees, plus the request log. Both sides share one
 /// persistent cookie jar, so a clearance obtained by browsing is reused by the
 /// capture button.
+///
+/// Every navigation stays inside the app: the WebView cancels custom-scheme
+/// jumps and re-issues Universal-Link taps from code, and the debug console is
+/// registered natively so it survives any number of page changes.
 class BrowserPage extends StatefulWidget {
   const BrowserPage({super.key});
 
@@ -104,7 +108,7 @@ class BrowserPage extends StatefulWidget {
 
 class _BrowserPageState extends State<BrowserPage>
     with SingleTickerProviderStateMixin {
-  static const double _erudaPillHeight = 28;
+  static const double _erudaPillHeight = 30;
   static const List<String> _erudaUrls = <String>[
     'https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js',
     'https://unpkg.com/eruda@3.4.3/eruda.js',
@@ -125,6 +129,7 @@ class _BrowserPageState extends State<BrowserPage>
   late final BrowserController _browser;
   late final StreamSubscription<RequestLogEvent> _logSubscription;
   late final StreamSubscription<PageNetworkEvent> _pageSubscription;
+  late final StreamSubscription<WebViewNavigationEvent> _navigationSubscription;
   late final TabController _tabs;
 
   CapturedExchange? _capture;
@@ -144,6 +149,13 @@ class _BrowserPageState extends State<BrowserPage>
   bool _panelVisible = true;
   bool _didHidePanelForEruda = false;
 
+  /// Cancel navigations that would open another app. On by default: a test
+  /// browser that leaves the app cannot be debugged.
+  bool _blockExternal = true;
+
+  /// Serial number for synthetic log rows (page jumps have no engine id).
+  int _navSeq = 0;
+
   int _logFilter = 0; // 0 all, 1 warn, 2 error
 
   String? _seenUrl;
@@ -158,8 +170,8 @@ class _BrowserPageState extends State<BrowserPage>
   bool _erudaBusy = false;
   double _erudaSize = 50;
   String? _erudaSource;
-  Timer? _erudaRestoreTimer;
-  Timer? _erudaSyncTimer;
+  Timer? _erudaVerifyTimer;
+  Timer? _debugSizeTimer;
 
   @override
   void initState() {
@@ -176,6 +188,8 @@ class _BrowserPageState extends State<BrowserPage>
     // Buffered even while the panel is closed, so opening "Page" shows the
     // requests of the current document instead of an empty list.
     _pageSubscription = _browser.networkEvents.listen(_onPageNetworkEvent);
+    _navigationSubscription =
+        _browser.navigationEvents.listen(_onNavigationEvent);
     unawaited(_loadProfileInfo());
   }
 
@@ -233,9 +247,103 @@ class _BrowserPageState extends State<BrowserPage>
       }
     });
 
-    // A new document means a fresh JS context: put eruda back once the page
-    // has committed. Only while the panel is open.
-    if (_erudaOpen && previousUrl != _browser.url) _scheduleErudaRestore();
+    // The console is registered as a native user script, so a new document
+    // restores itself. Only check when the URL changed, and never close the
+    // panel because a probe came back too early.
+    if (_erudaOpen && previousUrl != _browser.url) _scheduleErudaVerify();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page jumps (navigation delegate)
+  // ---------------------------------------------------------------------------
+
+  /// One navigation the WebView decided about: allowed, re-issued in-app,
+  /// blocked because it targeted another app, or failed.
+  void _onNavigationEvent(WebViewNavigationEvent event) {
+    if (!mounted) return;
+    if (!event.isMainFrame) return;
+    final log = RequestLogEvent(
+      id: 'nav-${_navSeq++}',
+      phase: switch (event.kind) {
+        'blocked' => RequestLogPhase.cancelled,
+        'failed' => RequestLogPhase.error,
+        'redirect' => RequestLogPhase.redirect,
+        'response' => RequestLogPhase.response,
+        'committed' => RequestLogPhase.response,
+        _ => RequestLogPhase.start,
+      },
+      timestamp: event.timestamp,
+      level: switch (event.kind) {
+        'blocked' => RequestLogLevel.warn,
+        'failed' => RequestLogLevel.error,
+        _ => RequestLogLevel.info,
+      },
+      method: event.method,
+      uri: Uri.tryParse(event.url),
+      statusCode: event.statusCode,
+      errorCode: switch (event.kind) {
+        'blocked' => 'webview.externalBlocked',
+        'failed' => 'webview.navigationFailed',
+        _ => null,
+      },
+      message: switch (event.kind) {
+        'blocked' => '${event.message ?? 'blocked'} (${event.navigationType})',
+        'in-app' => 'tap kept in-app',
+        _ => event.message,
+      },
+    );
+    setState(() {
+      _events.insert(0, log);
+      while (_events.length > 400) {
+        _events.removeLast();
+      }
+    });
+
+    // Mirror it into the eruda console; the page's own context prints the
+    // landing line, the host prints what the page cannot see.
+    if (_erudaOpen) {
+      _pushToConsole(
+        switch (event.kind) {
+          'blocked' =>
+            '已拦截外部跳转 ${event.method} ${event.url} '
+                '(${event.navigationType})',
+          'in-app' => '点击链接改为站内加载 ${event.url}',
+          'failed' => '加载失败 ${event.url} ${event.message ?? ''}',
+          'redirect' => '${event.statusCode} 跳转 ${event.url}',
+          'committed' =>
+            '页面已打开 ${event.statusCode ?? ''} ${event.url}',
+          _ => null,
+        },
+        level: event.isBlocked
+            ? 'warn'
+            : event.isFailed
+                ? 'error'
+                : 'info',
+      );
+    }
+
+    if (event.isBlocked && mounted) {
+      final host = Uri.tryParse(event.url)?.host;
+      _snack('已阻止跳转到外部应用${host == null ? '' : '：$host'}');
+    }
+  }
+
+  /// Prints one line into the eruda console of the current document.
+  void _pushToConsole(String? text, {String level = 'info'}) {
+    if (text == null || text.isEmpty) return;
+    final safe = _jsString(text);
+    _evalQuiet(
+      'window.__bhDebugLog && window.__bhDebugLog($safe, "$level");',
+    );
+  }
+
+  static String _jsString(String value) {
+    final escaped = value
+        .replaceAll(r'\', r'\\')
+        .replaceAll("'", r"\'")
+        .replaceAll('\n', r'\n')
+        .replaceAll('\r', '');
+    return "'$escaped'";
   }
 
   Uri? _parseUrl(String raw) {
@@ -339,9 +447,11 @@ class _BrowserPageState extends State<BrowserPage>
           refererMode: _refererMode == _RefererMode.currentDomain ? 1 : 0,
           cookie: _cookieController.text,
           showPanel: _panelVisible,
+          blockExternal: _blockExternal,
         ),
         uaLabels: <String>[for (final preset in _uaPresets) preset.label],
         onShowPanelChanged: _setPanelVisible,
+        onBlockExternalChanged: _setBlockExternal,
       ),
     );
     if (result == null || !mounted) return;
@@ -352,7 +462,12 @@ class _BrowserPageState extends State<BrowserPage>
           ? _RefererMode.currentDomain
           : _RefererMode.none;
       _panelVisible = result.showPanel;
+      _blockExternal = result.blockExternal;
     });
+    unawaited(_browser.setNavigationPolicy(
+      blockExternal: _blockExternal,
+      reissueTaps: _blockExternal,
+    ));
     _cookieController.text = result.cookie;
 
     final userAgent = _effectiveUserAgent;
@@ -375,6 +490,17 @@ class _BrowserPageState extends State<BrowserPage>
   void _setPanelVisible(bool value) {
     if (_panelVisible == value) return;
     setState(() => _panelVisible = value);
+  }
+
+  /// Applied immediately, not only on "Save": while the sheet is open the user
+  /// may tap a link in the page behind it.
+  void _setBlockExternal(bool value) {
+    if (_blockExternal == value) return;
+    setState(() => _blockExternal = value);
+    unawaited(_browser.setNavigationPolicy(
+      blockExternal: value,
+      reissueTaps: value,
+    ));
   }
 
   /// Runs the current URL through the native (Rust/wreq) engine so the panel
@@ -610,11 +736,12 @@ class _BrowserPageState extends State<BrowserPage>
 
   @override
   void dispose() {
-    _erudaRestoreTimer?.cancel();
-    _stopErudaSync();
+    _erudaVerifyTimer?.cancel();
+    _debugSizeTimer?.cancel();
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
     unawaited(_pageSubscription.cancel());
+    unawaited(_navigationSubscription.cancel());
     _browser.removeListener(_onBrowserChanged);
     _browser.dispose();
     unawaited(_session.close());
@@ -727,7 +854,7 @@ class _BrowserPageState extends State<BrowserPage>
     }
     return _toolButton(
       Icons.terminal_rounded,
-      _erudaOpen ? 'Close Eruda' : 'Eruda half-screen',
+      _erudaOpen ? 'Close console' : 'Debug console, stays open across pages',
       () => unawaited(_toggleEruda()),
       active: _erudaOpen,
       size: 19,
@@ -1715,8 +1842,9 @@ class _BrowserPageState extends State<BrowserPage>
         if (_didHidePanelForEruda && !_panelVisible) _panelVisible = true;
         _didHidePanelForEruda = false;
       });
-      _stopErudaSync();
-      _evalQuiet('window.eruda && eruda.hide();');
+      _erudaVerifyTimer?.cancel();
+      _debugSizeTimer?.cancel();
+      await _browser.setDebugOverlay(enabled: false);
       return;
     }
 
@@ -1727,37 +1855,26 @@ class _BrowserPageState extends State<BrowserPage>
 
     setState(() => _erudaBusy = true);
     try {
-      final ok = await _ensureEruda();
+      final source = await _loadErudaSource();
+      final shown = await _browser.setDebugOverlay(
+        enabled: true,
+        source: source,
+        displaySize: _erudaSize,
+      );
       if (!mounted) return;
-      if (!ok) {
-        _snack('Eruda injection failed: no usable JS context yet');
-        return;
-      }
       setState(() {
         _erudaOpen = true;
         _didHidePanelForEruda = _panelVisible;
         _panelVisible = false;
       });
-      _startErudaSync();
+      // Registered as a native user script, so every later document gets the
+      // console back. A page that has not finished loading shows it on commit.
+      if (!shown) _snack('Console appears when this page finishes loading');
     } on Object catch (error) {
       if (mounted) _snack('Eruda failed: $error');
     } finally {
       if (mounted) setState(() => _erudaBusy = false);
     }
-  }
-
-  Future<bool> _ensureEruda() async {
-    final present = await _browser.evaluate(
-      '!!(window.eruda && window.__bhEruda)',
-    );
-    if (present != true) {
-      final source = await _loadErudaSource();
-      // End with a serializable expression: WKWebView reports an error when
-      // the last value of the bundle cannot be bridged to Foundation types.
-      await _browser.evaluate('$source\n;0;');
-    }
-    final shown = await _browser.evaluate(_erudaBootScript());
-    return shown == 'ok';
   }
 
   /// Prefers the bundle shipped as an asset (fetched at CI build time), then
@@ -1798,27 +1915,32 @@ class _BrowserPageState extends State<BrowserPage>
   bool _looksLikeEruda(String source) =>
       source.length > 20000 && !source.trimLeft().startsWith('<');
 
-  String _erudaBootScript() {
-    final size = _erudaSize.toStringAsFixed(1);
-    return '''
-(function () {
-  if (!window.eruda) return 'no-bundle';
-  try {
-    if (!window.__bhEruda) {
-      eruda.init({ defaults: { displaySize: $size } });
-      try { eruda.get('entryBtn').hide(); } catch (e) {}
-      window.__bhEruda = true;
-      eruda.show('network');
-    } else {
-      eruda.show();
-    }
-    eruda.get().config.set('displaySize', $size);
-  } catch (e) {
-    return 'error:' + e;
+  /// Safety net for documents the user script cannot reach: a same-document
+  /// route change, a page that replaced the JS context, or a load that started
+  /// before the console was switched on.
+  void _scheduleErudaVerify() {
+    _erudaVerifyTimer?.cancel();
+    _erudaVerifyTimer = Timer(const Duration(milliseconds: 600), () {
+      unawaited(_verifyEruda());
+    });
   }
-  return 'ok';
-})();
-''';
+
+  Future<void> _verifyEruda() async {
+    if (!_erudaOpen || !mounted) return;
+    Object? present;
+    try {
+      present = await _browser.evaluate('!!(window.eruda && window.__bhEruda)');
+    } on Object {
+      // Mid-navigation: the next URL change retries.
+      return;
+    }
+    final source = _erudaSource;
+    if (!mounted || present == true || source == null) return;
+    await _browser.setDebugOverlay(
+      enabled: true,
+      source: source,
+      displaySize: _erudaSize,
+    );
   }
 
   void _applyErudaSize(double value) {
@@ -1829,76 +1951,21 @@ class _BrowserPageState extends State<BrowserPage>
       'try{eruda.get().config.set("displaySize", '
       '${size.toStringAsFixed(1)})}catch(e){}',
     );
+    // The registered script decides the size of the *next* document; rewrite it
+    // once the drag settles instead of on every pointer tick.
+    _debugSizeTimer?.cancel();
+    _debugSizeTimer = Timer(const Duration(milliseconds: 400), () {
+      unawaited(_browser.setDebugDisplaySize(size));
+    });
   }
 
   void _evalQuiet(String script) {
     unawaited(_browser.evaluate(script).catchError((Object _) => null));
   }
 
-  void _startErudaSync() {
-    _erudaSyncTimer?.cancel();
-    _erudaSyncTimer = Timer.periodic(
-      const Duration(milliseconds: 800),
-      (_) => unawaited(_syncErudaSize()),
-    );
-  }
-
-  void _stopErudaSync() {
-    _erudaSyncTimer?.cancel();
-    _erudaSyncTimer = null;
-  }
-
-  Future<void> _syncErudaSize() async {
-    if (!_erudaOpen || !mounted) return;
-    try {
-      final value = await _browser.evaluate(
-        '(function(){try{var d=eruda.get();'
-        'return d?d.config.get("displaySize"):null}catch(e){return null}})()',
-      );
-      if (!mounted || value is! num) return;
-      final next = value.toDouble().clamp(40.0, 100.0).toDouble();
-      if ((next - _erudaSize).abs() > 0.5) setState(() => _erudaSize = next);
-    } on Object {
-      // Mid-navigation; the restore timer handles the new document.
-    }
-  }
-
-  void _scheduleErudaRestore() {
-    _erudaRestoreTimer?.cancel();
-    _erudaRestoreTimer = Timer(const Duration(milliseconds: 700), () {
-      unawaited(_restoreEruda());
-    });
-  }
-
-  Future<void> _restoreEruda() async {
-    if (!_erudaOpen || _erudaBusy || !mounted) return;
-    setState(() => _erudaBusy = true);
-    try {
-      final ok = await _ensureEruda();
-      if (!mounted) return;
-      if (!ok) {
-        setState(() {
-          _erudaOpen = false;
-          if (_didHidePanelForEruda && !_panelVisible) _panelVisible = true;
-          _didHidePanelForEruda = false;
-        });
-        _stopErudaSync();
-        _snack('Page changed; Eruda could not be restored');
-      }
-    } on Object {
-      if (mounted) {
-        setState(() {
-          _erudaOpen = false;
-          if (_didHidePanelForEruda && !_panelVisible) _panelVisible = true;
-          _didHidePanelForEruda = false;
-        });
-        _stopErudaSync();
-      }
-    } finally {
-      if (mounted) setState(() => _erudaBusy = false);
-    }
-  }
-
+  /// Split control between the page and the console: grip on the left, the
+  /// share in the middle, close on the right. Spacers keep the three evenly
+  /// distributed instead of hugging the left edge of the bar.
   Widget _buildErudaPill(double viewHeight) {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -1907,56 +1974,58 @@ class _BrowserPageState extends State<BrowserPage>
         _applyErudaSize(_erudaSize - details.delta.dy / viewHeight * 100);
       },
       child: Container(
-        width: 104,
+        width: 168,
         height: _erudaPillHeight,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
         decoration: BoxDecoration(
-          color: Colors.white.withAlpha(245),
+          color: Colors.white.withAlpha(248),
           border: Border.all(color: AppColors.line2),
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(15),
           boxShadow: const <BoxShadow>[
             BoxShadow(
-              color: Color(0x290E0F0E),
-              blurRadius: 12,
+              color: Color(0x330E0F0E),
+              blurRadius: 14,
               offset: Offset(0, 4),
             ),
           ],
         ),
         child: Row(
-          mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            const SizedBox(width: 8),
             const Icon(
               Icons.drag_handle_rounded,
-              size: 14,
-              color: AppColors.faint,
+              size: 15,
+              color: AppColors.muted,
             ),
-            const SizedBox(width: 4),
+            const Spacer(),
             Text(
               '${_erudaSize.round()}%',
               style: const TextStyle(
                 fontFamily: 'monospace',
-                fontSize: 9.5,
-                color: AppColors.muted,
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                color: AppColors.ink2,
               ),
             ),
-            const SizedBox(width: 4),
-            GestureDetector(
-              onTap: () => unawaited(_toggleEruda()),
-              child: Container(
-                width: 16,
-                height: 16,
-                decoration: const BoxDecoration(
-                  color: AppColors.ink,
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(
-                  Icons.close_rounded,
-                  size: 10,
-                  color: Colors.white,
+            const Spacer(),
+            Tooltip(
+              message: 'Close console',
+              child: GestureDetector(
+                onTap: () => unawaited(_toggleEruda()),
+                child: Container(
+                  width: 18,
+                  height: 18,
+                  decoration: const BoxDecoration(
+                    color: AppColors.ink,
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.close_rounded,
+                    size: 11,
+                    color: Colors.white,
+                  ),
                 ),
               ),
             ),
-            const SizedBox(width: 8),
           ],
         ),
       ),

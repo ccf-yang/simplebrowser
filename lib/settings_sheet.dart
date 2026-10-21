@@ -12,29 +12,36 @@ class SettingsValues {
     required this.refererMode,
     required this.cookie,
     required this.showPanel,
+    required this.blockExternal,
   });
 
   final int uaIndex;
   final int refererMode;
   final String cookie;
   final bool showPanel;
+
+  /// Cancel jumps that would leave the app (custom schemes and Universal Links).
+  final bool blockExternal;
 }
 
 /// Bottom sheet with the request identity settings plus the info-panel switch.
 ///
-/// The panel switch is applied immediately (the page rebuilds behind the
-/// sheet); the headers are applied when the user taps "Save & reload".
+/// The panel and stay-in-app switches are applied immediately (the page
+/// rebuilds behind the sheet); the headers are applied when the user taps
+/// "Save & reload".
 class SettingsSheet extends StatefulWidget {
   const SettingsSheet({
     super.key,
     required this.initial,
     required this.uaLabels,
     required this.onShowPanelChanged,
+    required this.onBlockExternalChanged,
   });
 
   final SettingsValues initial;
   final List<String> uaLabels;
   final ValueChanged<bool> onShowPanelChanged;
+  final ValueChanged<bool> onBlockExternalChanged;
 
   @override
   State<SettingsSheet> createState() => _SettingsSheetState();
@@ -44,6 +51,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
   late int _uaIndex = widget.initial.uaIndex;
   late int _refererMode = widget.initial.refererMode;
   late bool _showPanel = widget.initial.showPanel;
+  late bool _blockExternal = widget.initial.blockExternal;
   late final TextEditingController _cookie =
       TextEditingController(text: widget.initial.cookie);
 
@@ -60,6 +68,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
         refererMode: _refererMode,
         cookie: _cookie.text,
         showPanel: _showPanel,
+        blockExternal: _blockExternal,
       ),
     );
   }
@@ -148,6 +157,8 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   _buildCookieField(),
                   const SizedBox(height: 10),
                   _buildPanelSwitch(),
+                  const SizedBox(height: 8),
+                  _buildStayInAppSwitch(),
                   const SizedBox(height: 10),
                   const _Hint(),
                   const SizedBox(height: 14),
@@ -250,7 +261,43 @@ class _SettingsSheetState extends State<SettingsSheet> {
     );
   }
 
-  Widget _buildPanelSwitch() {
+  Widget _buildPanelSwitch() => _SwitchRow(
+    title: 'Info panel',
+    subtitle: 'WebView · Engine · Page · Log',
+    value: _showPanel,
+    onChanged: (value) {
+      setState(() => _showPanel = value);
+      widget.onShowPanelChanged(value);
+    },
+  );
+
+  Widget _buildStayInAppSwitch() => _SwitchRow(
+    title: 'Stay in this app',
+    subtitle: 'Block baidu:// and other app jumps',
+    value: _blockExternal,
+    onChanged: (value) {
+      setState(() => _blockExternal = value);
+      widget.onBlockExternalChanged(value);
+    },
+  );
+}
+
+/// One labelled switch row inside the settings sheet.
+class _SwitchRow extends StatelessWidget {
+  const _SwitchRow({
+    required this.title,
+    required this.subtitle,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String title;
+  final String subtitle;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
       decoration: BoxDecoration(
@@ -260,28 +307,31 @@ class _SettingsSheetState extends State<SettingsSheet> {
       ),
       child: Row(
         children: <Widget>[
-          const Expanded(
+          Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Text(
-                  'Info panel',
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  title,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-                SizedBox(height: 2),
+                const SizedBox(height: 2),
                 Text(
-                  'WebView · Engine · Log',
-                  style: TextStyle(fontSize: 9.5, color: AppColors.muted),
+                  subtitle,
+                  style: const TextStyle(
+                    fontSize: 9.5,
+                    color: AppColors.muted,
+                  ),
                 ),
               ],
             ),
           ),
           Switch(
-            value: _showPanel,
-            onChanged: (value) {
-              setState(() => _showPanel = value);
-              widget.onShowPanelChanged(value);
-            },
+            value: value,
+            onChanged: onChanged,
             activeThumbColor: AppColors.ink,
             activeTrackColor: AppColors.signal,
             inactiveThumbColor: Colors.white,
