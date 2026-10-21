@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:browser_http/browser_http.dart';
 import 'package:flutter/material.dart';
+
+import 'dev_panel.dart';
 
 void main() => runApp(const SimpleBrApp());
 
@@ -12,11 +15,11 @@ class SimpleBrApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'SimpleBrowser',
-        debugShowCheckedModeBanner: false,
-        theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-        home: const BrowserPage(),
-      );
+    title: 'SimpleBrowser',
+    debugShowCheckedModeBanner: false,
+    theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+    home: const BrowserPage(),
+  );
 }
 
 /// One entry of the user-agent preset list.
@@ -95,8 +98,9 @@ class _BrowserPageState extends State<BrowserPage>
   static final Uri _initialUri = Uri.parse('https://example.com');
 
   final StreamLogSink _logSink = StreamLogSink(400);
-  final TextEditingController _urlController =
-      TextEditingController(text: _initialUri.toString());
+  final TextEditingController _urlController = TextEditingController(
+    text: _initialUri.toString(),
+  );
   final TextEditingController _cookieController = TextEditingController();
   final FocusNode _urlFocus = FocusNode();
   final List<RequestLogEvent> _events = <RequestLogEvent>[];
@@ -109,6 +113,15 @@ class _BrowserPageState extends State<BrowserPage>
   CapturedExchange? _capture;
   String? _captureError;
   bool _busy = false;
+
+  final List<CapturedExchange> _devCaptures = <CapturedExchange>[];
+  final Map<String, PageNetworkEvent> _pageRequests =
+      <String, PageNetworkEvent>{};
+  late final StreamSubscription<PageNetworkEvent> _pageSubscription;
+  bool _devPanelOpen = false;
+  double _devPanelFraction = 0.62;
+  String? _autoCapturedUrl;
+  String? _pendingAutoCaptureUrl;
 
   bool _showHeaders = false;
   int _uaIndex = 0;
@@ -136,7 +149,84 @@ class _BrowserPageState extends State<BrowserPage>
       if (!mounted) return;
       setState(() => _events.insert(0, event));
     });
+    _pageSubscription = _browser.networkEvents.listen(_onPageNetworkEvent);
     unawaited(_loadDefaultUserAgent());
+  }
+
+  /// Merges the injected script's request/response events into one row per
+  /// request. Headers and body come from the request event; status, timing and
+  /// response headers come from the matching response event.
+  ///
+  /// Events are buffered even while the panel is closed (bounded to 50), so
+  /// opening it shows the current document's requests instead of an empty list.
+  void _onPageNetworkEvent(PageNetworkEvent event) {
+    if (!mounted) return;
+    setState(() {
+      final existing = _pageRequests[event.key];
+      _pageRequests[event.key] = existing == null
+          ? _normalizePageEvent(event)
+          : _mergePageEvent(existing, event);
+      while (_pageRequests.length > 50) {
+        _pageRequests.remove(_pageRequests.keys.first);
+      }
+    });
+  }
+
+  static PageNetworkEvent _normalizePageEvent(PageNetworkEvent event) {
+    if (event.phase == PageNetworkPhase.request) return event;
+    return PageNetworkEvent(
+      sessionId: event.sessionId,
+      page: event.page,
+      id: event.id,
+      phase: event.phase,
+      timestamp: event.timestamp,
+      method: event.method,
+      url: event.url,
+      headers: const <String, String>{},
+      responseHeaders: event.headers,
+      body: event.body,
+      responseBody: event.responseBody,
+      statusCode: event.statusCode,
+      duration: event.duration,
+      size: event.size,
+      message: event.message,
+    );
+  }
+
+  static PageNetworkEvent _mergePageEvent(
+    PageNetworkEvent request,
+    PageNetworkEvent update,
+  ) {
+    return PageNetworkEvent(
+      sessionId: update.sessionId.isEmpty
+          ? request.sessionId
+          : update.sessionId,
+      page: request.page,
+      id: request.id,
+      phase: update.phase == PageNetworkPhase.body
+          ? request.phase
+          : update.phase,
+      timestamp: request.timestamp,
+      method: request.method ?? update.method,
+      url: request.url ?? update.url,
+      headers: request.headers,
+      responseHeaders: update.headers.isNotEmpty
+          ? update.headers
+          : request.responseHeaders,
+      body: request.body ?? update.body,
+      responseBody: update.responseBody ?? request.responseBody,
+      statusCode: update.statusCode ?? request.statusCode,
+      duration: update.duration ?? request.duration,
+      size: update.size ?? request.size,
+      message: update.message ?? request.message,
+    );
+  }
+
+  /// Page-script requests, newest first.
+  List<PageNetworkEvent> get _pageRequestList {
+    final list = _pageRequests.values.toList()
+      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    return list;
   }
 
   Future<void> _loadDefaultUserAgent() async {
@@ -152,7 +242,8 @@ class _BrowserPageState extends State<BrowserPage>
   /// platform view is not re-laid-out every tick.
   void _onBrowserChanged() {
     if (!mounted) return;
-    final changed = _seenUrl != _browser.url ||
+    final changed =
+        _seenUrl != _browser.url ||
         _seenTitle != _browser.title ||
         _seenStatus != _browser.statusCode ||
         _seenBack != _browser.canGoBack ||
@@ -172,6 +263,13 @@ class _BrowserPageState extends State<BrowserPage>
         _urlController.text = _browser.url!;
       }
     });
+
+    if (_devPanelOpen) {
+      final url = _browser.url;
+      if (url != null && url != _autoCapturedUrl) {
+        unawaited(_captureCurrent(auto: true));
+      }
+    }
   }
 
   Uri? _parseUrl(String raw) {
@@ -258,7 +356,11 @@ class _BrowserPageState extends State<BrowserPage>
       await _browser.reload(headers: _headersFor(uri), userAgent: userAgent);
     }
     if (!mounted) return;
-    _snack(uri == null ? 'Header settings saved' : 'Saved, reloaded with new headers');
+    _snack(
+      uri == null
+          ? 'Header settings saved'
+          : 'Saved, reloaded with new headers',
+    );
   }
 
   void _resetHeaders() {
@@ -272,12 +374,19 @@ class _BrowserPageState extends State<BrowserPage>
   /// Runs the current URL through the native (Rust/wreq) engine so the panel
   /// can show ordered request headers, status, response headers, body and
   /// timing.
-  Future<void> _captureCurrent() async {
-    if (_busy) return;
-    final uri = _parseUrl(_urlController.text) ??
-        (_browser.url == null ? null : Uri.tryParse(_browser.url!));
-    if (uri == null) {
-      _snack('Nothing to capture yet');
+  ///
+  /// [auto] is used by the devtools panel: it follows the WebView URL and stays
+  /// silent when there is nothing to capture yet.
+  Future<void> _captureCurrent({bool auto = false}) async {
+    if (_busy) {
+      if (auto) _pendingAutoCaptureUrl = _browser.url;
+      return;
+    }
+    final uri = auto
+        ? Uri.tryParse(_browser.url ?? '')
+        : (_parseUrl(_urlController.text) ?? Uri.tryParse(_browser.url ?? ''));
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      if (!auto) _snack('Nothing to capture yet');
       return;
     }
 
@@ -287,13 +396,69 @@ class _BrowserPageState extends State<BrowserPage>
         OrderedHeader(entry.key, entry.value),
     ];
 
+    _autoCapturedUrl = uri.toString();
     setState(() {
       _busy = true;
       _captureError = null;
     });
     try {
       final capture = await _session.capture(uri, headers: headers);
-      if (mounted) setState(() => _capture = capture);
+      if (!mounted) return;
+      setState(() {
+        _capture = capture;
+        _devCaptures.insert(0, capture);
+        while (_devCaptures.length > 30) {
+          _devCaptures.removeLast();
+        }
+      });
+    } on BrowserHttpException catch (error) {
+      if (mounted) {
+        setState(() => _captureError = '${error.code}: ${error.message}');
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() => _captureError = error.toString());
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+        final pending = _pendingAutoCaptureUrl;
+        _pendingAutoCaptureUrl = null;
+        if (pending != null && _devPanelOpen && pending != _autoCapturedUrl) {
+          unawaited(_captureCurrent(auto: true));
+        }
+      }
+    }
+  }
+
+  /// Re-sends one captured exchange with the current header settings so the
+  /// result can be compared against the original packet.
+  Future<void> _replayCapture(CapturedExchange source) async {
+    if (_busy) return;
+    final headers = <OrderedHeader>[
+      if (_uaOverride != null) OrderedHeader('User-Agent', _uaOverride!),
+      for (final entry in _headersFor(source.uri).entries)
+        OrderedHeader(entry.key, entry.value),
+    ];
+    setState(() {
+      _busy = true;
+      _captureError = null;
+    });
+    try {
+      final capture = await _session.capture(
+        source.uri,
+        method: source.method,
+        headers: headers,
+        body: source.requestBody,
+      );
+      if (!mounted) return;
+      setState(() {
+        _capture = capture;
+        _devCaptures.insert(0, capture);
+        while (_devCaptures.length > 30) {
+          _devCaptures.removeLast();
+        }
+      });
     } on BrowserHttpException catch (error) {
       if (mounted) {
         setState(() => _captureError = '${error.code}: ${error.message}');
@@ -307,9 +472,108 @@ class _BrowserPageState extends State<BrowserPage>
     }
   }
 
+  /// Replays a page-script request through the native engine, reusing its
+  /// method, caller headers and body.
+  Future<void> _replayPageEvent(PageNetworkEvent source) async {
+    if (_busy) return;
+    final uri = Uri.tryParse(source.url ?? '');
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      _snack('这条记录没有可重发的 URL');
+      return;
+    }
+    final currentHeaders = _headersFor(uri);
+    final headers = <OrderedHeader>[
+      if (_uaOverride != null) OrderedHeader('User-Agent', _uaOverride!),
+      for (final entry in currentHeaders.entries)
+        OrderedHeader(entry.key, entry.value),
+      for (final entry in source.headers.entries)
+        if (!currentHeaders.containsKey(entry.key))
+          OrderedHeader(entry.key, entry.value),
+    ];
+    final body = source.body == null
+        ? null
+        : Uint8List.fromList(utf8.encode(source.body!));
+    setState(() {
+      _busy = true;
+      _captureError = null;
+    });
+    try {
+      final capture = await _session.capture(
+        uri,
+        method: source.method ?? 'GET',
+        headers: headers,
+        body: body,
+      );
+      if (!mounted) return;
+      setState(() {
+        _capture = capture;
+        _devCaptures.insert(0, capture);
+        while (_devCaptures.length > 30) {
+          _devCaptures.removeLast();
+        }
+      });
+    } on BrowserHttpException catch (error) {
+      if (mounted) {
+        setState(() => _captureError = '${error.code}: ${error.message}');
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() => _captureError = error.toString());
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _toggleDevPanel() {
+    if (_devPanelOpen) {
+      _closeDevPanel();
+      return;
+    }
+    setState(() {
+      _devPanelOpen = true;
+      _autoCapturedUrl = null;
+    });
+    unawaited(_browser.refreshResources());
+    unawaited(_captureCurrent(auto: true));
+  }
+
+  /// Close = clean the collected packets/logs, then refresh the page so the
+  /// next open starts from a fresh document.
+  void _closeDevPanel() {
+    setState(() {
+      _devPanelOpen = false;
+      _devCaptures.clear();
+      _pageRequests.clear();
+      _events.clear();
+      _capture = null;
+      _captureError = null;
+      _autoCapturedUrl = null;
+      _pendingAutoCaptureUrl = null;
+    });
+    unawaited(_refreshAfterDevPanel());
+  }
+
+  Future<void> _refreshAfterDevPanel() async {
+    final uri = _currentUri();
+    try {
+      if (uri == null) {
+        await _browser.refreshResources();
+        return;
+      }
+      await _browser.reload(
+        headers: _headersFor(uri),
+        userAgent: _effectiveUserAgent,
+      );
+    } on Object catch (error) {
+      if (mounted) _snack('Refresh failed: $error');
+    }
+  }
+
   @override
   void dispose() {
     unawaited(_logSubscription.cancel());
+    unawaited(_pageSubscription.cancel());
     _browser.removeListener(_onBrowserChanged);
     _browser.dispose();
     unawaited(_session.close());
@@ -336,6 +600,39 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
+  Widget _buildDevButton() {
+    return Tooltip(
+      message: _devPanelOpen ? '关闭 DevTools' : '打开 DevTools',
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(26),
+          onTap: _toggleDevPanel,
+          child: Opacity(
+            opacity: 0.78,
+            child: Container(
+              width: 48,
+              height: 48,
+              decoration: BoxDecoration(
+                color: const Color(0xFF1B1F23),
+                shape: BoxShape.circle,
+                border: Border.all(color: const Color(0x664DD0B1)),
+                boxShadow: const <BoxShadow>[
+                  BoxShadow(color: Color(0x55000000), blurRadius: 10),
+                ],
+              ),
+              child: Icon(
+                _devPanelOpen ? Icons.close : Icons.terminal,
+                color: const Color(0xFF4DD0B1),
+                size: 22,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildToolbar() {
     final scheme = Theme.of(context).colorScheme;
     return Container(
@@ -351,7 +648,9 @@ class _BrowserPageState extends State<BrowserPage>
           _compactIcon(
             Icons.arrow_forward,
             'Forward',
-            _browser.canGoForward ? () => unawaited(_browser.goForward()) : null,
+            _browser.canGoForward
+                ? () => unawaited(_browser.goForward())
+                : null,
           ),
           _compactIcon(Icons.refresh, 'Reload', () => unawaited(_reload())),
           Expanded(child: _buildUrlField()),
@@ -383,8 +682,10 @@ class _BrowserPageState extends State<BrowserPage>
             filled: true,
             fillColor: scheme.surface,
             hintText: 'https://example.com',
-            contentPadding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 12,
+              vertical: 10,
+            ),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(20),
               borderSide: BorderSide.none,
@@ -429,8 +730,7 @@ class _BrowserPageState extends State<BrowserPage>
               labelText: 'User-Agent',
               isDense: true,
               border: OutlineInputBorder(),
-              contentPadding:
-                  EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 2),
             ),
             child: DropdownButtonHideUnderline(
               child: DropdownButton<int>(
@@ -460,8 +760,7 @@ class _BrowserPageState extends State<BrowserPage>
               labelText: 'Referer',
               isDense: true,
               border: OutlineInputBorder(),
-              contentPadding:
-                  EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 2),
             ),
             child: DropdownButtonHideUnderline(
               child: DropdownButton<_RefererMode>(
@@ -500,16 +799,8 @@ class _BrowserPageState extends State<BrowserPage>
           const SizedBox(height: 8),
           Row(
             children: <Widget>[
-              Expanded(
-                child: Text(
-                  '保存后会用新的请求头重新加载当前页面。',
-                  style: labelStyle,
-                ),
-              ),
-              TextButton(
-                onPressed: _resetHeaders,
-                child: const Text('重置'),
-              ),
+              Expanded(child: Text('保存后会用新的请求头重新加载当前页面。', style: labelStyle)),
+              TextButton(onPressed: _resetHeaders, child: const Text('重置')),
               const SizedBox(width: 4),
               FilledButton.icon(
                 onPressed: () => unawaited(_saveHeaders()),
@@ -523,11 +814,7 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  Widget _compactIcon(
-    IconData icon,
-    String tooltip,
-    VoidCallback? onPressed,
-  ) {
+  Widget _compactIcon(IconData icon, String tooltip, VoidCallback? onPressed) {
     return IconButton(
       tooltip: tooltip,
       onPressed: onPressed,
@@ -542,15 +829,73 @@ class _BrowserPageState extends State<BrowserPage>
     const handleHeight = 14.0;
     return LayoutBuilder(
       builder: (context, constraints) {
-        final available = math.max(0.0, constraints.maxHeight - handleHeight);
-        final panelHeight =
-            (available * _panelFraction).clamp(0.0, available).toDouble();
-        final webHeight = available - panelHeight;
+        final total = math.max(0.0, constraints.maxHeight);
+        final panelSpace = _devPanelOpen
+            ? total
+            : math.max(0.0, total - handleHeight);
+        final fraction = _devPanelOpen ? _devPanelFraction : _panelFraction;
+        final panelHeight = (panelSpace * fraction)
+            .clamp(0.0, panelSpace)
+            .toDouble();
+        final webHeight = panelSpace - panelHeight;
+
         return Column(
           children: <Widget>[
-            SizedBox(height: webHeight, child: _buildWebView()),
-            _buildDragHandle(available),
-            SizedBox(height: panelHeight, child: _buildPanel()),
+            SizedBox(
+              height: webHeight,
+              child: Stack(
+                children: <Widget>[
+                  Positioned.fill(child: _buildWebView()),
+                  Positioned(right: 14, bottom: 14, child: _buildDevButton()),
+                ],
+              ),
+            ),
+            if (_devPanelOpen)
+              SizedBox(
+                height: panelHeight,
+                child: DevPanel(
+                  captures: _devCaptures,
+                  pageRequests: _pageRequestList,
+                  events: _events,
+                  busy: _busy,
+                  captureError: _captureError,
+                  page: DevPageState(
+                    title: _browser.title,
+                    url: _browser.url,
+                    statusCode: _browser.statusCode,
+                    userAgentLabel: _uaPresets[_uaIndex].label,
+                    profileId: _browser.session.profile.id,
+                    canGoBack: _browser.canGoBack,
+                    canGoForward: _browser.canGoForward,
+                    resources: _browser.resourceTimings,
+                  ),
+                  onResize: (delta) {
+                    if (panelSpace <= 0) return;
+                    setState(() {
+                      _devPanelFraction =
+                          (_devPanelFraction + delta / panelSpace)
+                              .clamp(0.2, 0.85)
+                              .toDouble();
+                    });
+                  },
+                  onCapture: () => unawaited(_captureCurrent()),
+                  onClear: () => setState(() {
+                    _devCaptures.clear();
+                    _pageRequests.clear();
+                    _events.clear();
+                    _capture = null;
+                    _captureError = null;
+                    _autoCapturedUrl = null;
+                  }),
+                  onClose: _closeDevPanel,
+                  onReplay: (capture) => unawaited(_replayCapture(capture)),
+                  onReplayPage: (event) => unawaited(_replayPageEvent(event)),
+                ),
+              )
+            else ...<Widget>[
+              _buildDragHandle(panelSpace),
+              SizedBox(height: panelHeight, child: _buildPanel()),
+            ],
           ],
         );
       },
@@ -564,10 +909,9 @@ class _BrowserPageState extends State<BrowserPage>
       onVerticalDragUpdate: (details) {
         if (available <= 0) return;
         setState(() {
-          _panelFraction =
-              (_panelFraction - details.delta.dy / available)
-                  .clamp(0.15, 0.85)
-                  .toDouble();
+          _panelFraction = (_panelFraction - details.delta.dy / available)
+              .clamp(0.15, 0.85)
+              .toDouble();
         });
       },
       child: SizedBox(
@@ -756,7 +1100,7 @@ class _BrowserPageState extends State<BrowserPage>
           const SizedBox(height: 8),
           _section('Body preview'),
           SelectableText(
-            _bodyPreview(capture.response),
+            formatBodyPreview(capture.response),
             style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
           ),
         ],
@@ -808,52 +1152,28 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   static Widget _kv(String key, String value) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            SizedBox(
-              width: 110,
-              child: Text(
-                key,
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-            ),
-            Expanded(
-              child: SelectableText(
-                value,
-                style: const TextStyle(fontSize: 12),
-              ),
-            ),
-          ],
+    padding: const EdgeInsets.symmetric(vertical: 2),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        SizedBox(
+          width: 110,
+          child: Text(key, style: const TextStyle(fontWeight: FontWeight.w600)),
         ),
-      );
+        Expanded(
+          child: SelectableText(value, style: const TextStyle(fontSize: 12)),
+        ),
+      ],
+    ),
+  );
 
   static Widget _section(String title) => Padding(
-        padding: const EdgeInsets.only(top: 8, bottom: 4),
-        child: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-      );
+    padding: const EdgeInsets.only(top: 8, bottom: 4),
+    child: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+  );
 
   static Widget _headerLine(String line) => SelectableText(
-        line,
-        style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
-      );
-
-  static String _bodyPreview(TransportResponse response) {
-    if (response.body.isEmpty) return '(empty)';
-    final text = utf8.decode(response.body, allowMalformed: true);
-    final printable = text.runes
-        .where((rune) => rune == 9 || rune == 10 || rune == 13 || rune >= 32)
-        .length;
-    final ratio = text.isEmpty ? 0.0 : printable / text.length;
-    if (ratio < 0.9) {
-      final hex = response.body
-          .take(48)
-          .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
-          .join(' ');
-      return '${response.body.length} bytes (binary)\n$hex';
-    }
-    if (text.length > 2000) return '${text.substring(0, 2000)}\n…';
-    return text;
-  }
+    line,
+    style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+  );
 }

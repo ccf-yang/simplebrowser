@@ -19,6 +19,7 @@ export 'src/domain/logging/log_redactor.dart';
 export 'src/domain/logging/request_log.dart';
 export 'src/domain/models/browser_cookie.dart';
 export 'src/domain/models/captured_exchange.dart';
+export 'src/domain/models/page_network_event.dart';
 export 'src/domain/models/session_snapshot.dart';
 export 'src/domain/models/transport.dart';
 export 'src/ports/cookie_port.dart';

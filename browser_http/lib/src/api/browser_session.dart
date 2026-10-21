@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:typed_data';
 
 import '../domain/consistency_guard.dart';
 import '../domain/cookies/set_cookie_parser.dart';
@@ -168,6 +169,7 @@ final class BrowserSession {
     Uri uri, {
     String method = 'GET',
     List<OrderedHeader> headers = const <OrderedHeader>[],
+    Uint8List? body,
     CancelToken? cancelToken,
   }) async {
     final info = await profileInfo();
@@ -177,6 +179,7 @@ final class BrowserSession {
       uri: uri,
       profileId: profile.id,
       headers: headers,
+      body: body,
       followRedirects: true,
     );
     final outgoing = await _withCookies(request);
@@ -188,6 +191,7 @@ final class BrowserSession {
       method: outgoing.method,
       uri: outgoing.uri,
       requestHeaders: outgoing.headers,
+      requestBody: outgoing.body,
       profile: info,
       elapsed: stopwatch.elapsed,
       response: response,

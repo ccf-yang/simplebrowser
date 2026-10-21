@@ -10,6 +10,10 @@ import WebKit
 final class WebViewBridge {
     private var sessions: [String: WebViewHolder] = [:]
 
+    /// Forwards page-script network events to the Dart side. Set by the
+    /// plugin; events carry the owning session id.
+    var onNetworkEvent: (([String: Any]) -> Void)?
+
     /// Looks up an existing session so `UiKitView` can host the *same*
     /// WKWebView that will later export clearance cookies.
     func webView(for id: String) -> WKWebView? {
@@ -54,9 +58,12 @@ final class WebViewBridge {
         case "create":
             let userAgent = args["userAgent"] as? String
             let headless = args["headless"] as? Bool ?? true
-            let holder = WebViewHolder(headless: headless)
-            if let userAgent { holder.webView.customUserAgent = userAgent }
             let id = UUID().uuidString
+            let holder = WebViewHolder(id: id, headless: headless)
+            holder.onNetworkEvent = { [weak self] event in
+                self?.onNetworkEvent?(event)
+            }
+            if let userAgent { holder.webView.customUserAgent = userAgent }
             sessions[id] = holder
             result(id)
 
@@ -304,14 +311,35 @@ final class BrowserChallengePlatformView: NSObject, FlutterPlatformView {
     func view() -> UIView { container }
 }
 
+/// Breaks the WKUserContentController -> handler -> holder retain cycle so a
+/// disposed session can actually be deallocated.
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var delegate: WKScriptMessageHandler?
+
+    init(delegate: WKScriptMessageHandler) {
+        self.delegate = delegate
+    }
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        delegate?.userContentController(userContentController, didReceive: message)
+    }
+}
+
 /// Owns one WKWebView and its navigation completion.
-final class WebViewHolder: NSObject, WKNavigationDelegate {
+final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
+                          WKScriptMessageHandler {
+    let id: String
     let webView: WKWebView
     let headless: Bool
+    var onNetworkEvent: (([String: Any]) -> Void)?
     private var loadCompletion: ((Error?) -> Void)?
     fileprivate var lastStatusCode: Int?
 
-    init(headless: Bool) {
+    private static let networkHandlerName = "browserHttpNet"
+
+    init(id: String, headless: Bool) {
+        self.id = id
         self.headless = headless
         let config = WKWebViewConfiguration()
         // Persistent store is mandatory: ephemeral stores break clearance reuse.
@@ -320,9 +348,45 @@ final class WebViewHolder: NSObject, WKNavigationDelegate {
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         webView.navigationDelegate = self
+        webView.uiDelegate = self
+
+        // Inject the fetch/XHR hooks before the first document script runs.
+        // The handler is weak so the holder can be released when the session
+        // is disposed.
+        let controller = webView.configuration.userContentController
+        controller.addUserScript(WKUserScript(
+            source: WebViewHolder.networkScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false))
+        controller.add(
+            WeakScriptMessageHandler(delegate: self),
+            name: WebViewHolder.networkHandlerName)
+
         // Visible WebViews are user-driven (challenge page or browser tab);
         // swipe back/forward should behave like Safari.
         webView.allowsBackForwardNavigationGestures = !headless
+    }
+
+    /// page -> Dart bridge. WebKit calls this on the main thread.
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == WebViewHolder.networkHandlerName,
+              var body = message.body as? [String: Any] else { return }
+        body["sessionId"] = id
+        onNetworkEvent?(body)
+    }
+
+    /// Keeps `target="_blank"` / `window.open` inside this browser. Returning
+    /// nil tells WebKit not to create a new window, and nothing is handed to
+    /// Safari or another app.
+    func webView(_ webView: WKWebView,
+                 createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+        }
+        return nil
     }
 
     func load(_ url: URL, completion: @escaping (Error?) -> Void) {
@@ -364,6 +428,271 @@ final class WebViewHolder: NSObject, WKNavigationDelegate {
         loadCompletion?(error)
         loadCompletion = nil
     }
+
+    /// Hooks `fetch`, `XMLHttpRequest` and `sendBeacon` and forwards method,
+    /// URL, caller headers and body to the host. This is what makes POST
+    /// bodies visible: WebKit never exposes them to `WKNavigationDelegate`.
+    private static let networkScript = #"""
+    (function () {
+      if (window.__browserHttpNetInstalled) { return; }
+      window.__browserHttpNetInstalled = true;
+      var MAX_BODY = 65536;
+      var pageTag = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      var seq = 0;
+
+      function send(payload) {
+        try {
+          var handler = window.webkit && window.webkit.messageHandlers &&
+              window.webkit.messageHandlers.browserHttpNet;
+          if (handler) { handler.postMessage(payload); }
+        } catch (e) {}
+      }
+
+      function absolute(url) {
+        try { return new URL(String(url), document.baseURI || location.href).href; }
+        catch (e) { return String(url); }
+      }
+
+      function headerObject(headers) {
+        var out = {};
+        if (!headers) { return out; }
+        try {
+          if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+            headers.forEach(function (value, name) { out[name] = String(value); });
+            return out;
+          }
+          if (Array.isArray(headers)) {
+            headers.forEach(function (pair) {
+              if (pair && pair.length >= 2) { out[String(pair[0])] = String(pair[1]); }
+            });
+            return out;
+          }
+          if (typeof headers === 'object') {
+            Object.keys(headers).forEach(function (name) {
+              out[name] = String(headers[name]);
+            });
+          }
+        } catch (e) {}
+        return out;
+      }
+
+      function bodyText(body) {
+        if (body === null || body === undefined) { return null; }
+        try {
+          if (typeof body === 'string') { return body.slice(0, MAX_BODY); }
+          if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+            return body.toString().slice(0, MAX_BODY);
+          }
+          if (typeof FormData !== 'undefined' && body instanceof FormData) {
+            var parts = [];
+            body.forEach(function (value, name) {
+              parts.push(name + '=' + (typeof value === 'string' ? value : '[file]'));
+            });
+            return parts.join('&').slice(0, MAX_BODY);
+          }
+          if (typeof Blob !== 'undefined' && body instanceof Blob) {
+            return '[Blob ' + body.size + ' bytes]';
+          }
+          if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) {
+            return '[ArrayBuffer ' + body.byteLength + ' bytes]';
+          }
+          if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView &&
+              ArrayBuffer.isView(body)) {
+            return '[Binary ' + body.byteLength + ' bytes]';
+          }
+          return String(body).slice(0, MAX_BODY);
+        } catch (e) { return '[unreadable body]'; }
+      }
+
+      function emit(payload) {
+        payload.page = pageTag;
+        send(payload);
+      }
+
+      if (typeof window.fetch === 'function') {
+        var originalFetch = window.fetch;
+        window.fetch = function (input, init) {
+          init = init || {};
+          var id = ++seq;
+          var started = Date.now();
+          var url = '';
+          var method = 'GET';
+          var headers = {};
+          try {
+            if (typeof Request !== 'undefined' && input instanceof Request) {
+              url = input.url;
+              method = (init.method || input.method || 'GET').toUpperCase();
+              headers = headerObject(input.headers);
+            } else {
+              url = String(input);
+              method = (init.method || 'GET').toUpperCase();
+            }
+          } catch (e) { url = String(input); }
+          if (init.headers) {
+            var extra = headerObject(init.headers);
+            Object.keys(extra).forEach(function (name) { headers[name] = extra[name]; });
+          }
+          emit({
+            phase: 'request',
+            id: id,
+            ts: started,
+            method: method,
+            url: absolute(url),
+            headers: headers,
+            body: bodyText(init.body)
+          });
+          return originalFetch.apply(this, arguments).then(function (response) {
+            var responseHeaders = headerObject(response.headers);
+            var size = null;
+            try {
+              var length = responseHeaders['content-length'];
+              size = length ? parseInt(length, 10) : null;
+            } catch (e) {}
+            emit({
+              phase: 'response',
+              id: id,
+              ts: Date.now(),
+              status: response.status,
+              headers: responseHeaders,
+              size: size,
+              duration: Date.now() - started
+            });
+            // Read a small textual body from a clone so the page's own stream
+            // is untouched. Binary and large responses are skipped.
+            var canReadBody = true;
+            try {
+              var contentType = responseHeaders['content-type'] || '';
+              if (contentType &&
+                  !/(json|text|xml|javascript|html|urlencoded)/i.test(contentType)) {
+                canReadBody = false;
+              }
+              var declared = responseHeaders['content-length'];
+              if (declared && parseInt(declared, 10) > 262144) {
+                canReadBody = false;
+              }
+            } catch (e) {}
+            if (canReadBody && typeof response.clone === 'function') {
+              try {
+                response.clone().text().then(function (text) {
+                  emit({
+                    phase: 'response-body',
+                    id: id,
+                    ts: Date.now(),
+                    responseBody: String(text).slice(0, MAX_BODY)
+                  });
+                }, function () {});
+              } catch (e) {}
+            }
+            return response;
+          }, function (error) {
+            emit({
+              phase: 'error',
+              id: id,
+              ts: Date.now(),
+              message: String(error && error.message ? error.message : error),
+              duration: Date.now() - started
+            });
+            throw error;
+          });
+        };
+      }
+
+      if (typeof window.XMLHttpRequest === 'function') {
+        var XHR = window.XMLHttpRequest;
+        var originalOpen = XHR.prototype.open;
+        var originalSend = XHR.prototype.send;
+        var originalSetHeader = XHR.prototype.setRequestHeader;
+        XHR.prototype.open = function (method, url) {
+          this.__bhMeta = {
+            method: String(method || 'GET').toUpperCase(),
+            url: absolute(url),
+            headers: {},
+            started: Date.now()
+          };
+          return originalOpen.apply(this, arguments);
+        };
+        XHR.prototype.setRequestHeader = function (name, value) {
+          if (this.__bhMeta) { this.__bhMeta.headers[String(name)] = String(value); }
+          return originalSetHeader.apply(this, arguments);
+        };
+        XHR.prototype.send = function (body) {
+          var meta = this.__bhMeta || {
+            method: 'GET',
+            url: location.href,
+            headers: {},
+            started: Date.now()
+          };
+          var id = ++seq;
+          var xhr = this;
+          xhr.__bhActiveId = id;
+          emit({
+            phase: 'request',
+            id: id,
+            ts: meta.started,
+            method: meta.method,
+            url: meta.url,
+            headers: meta.headers,
+            body: bodyText(body)
+          });
+          try {
+            xhr.addEventListener('loadend', function () {
+              if (xhr.__bhActiveId !== id) { return; }
+              var responseHeaders = {};
+              try {
+                var raw = xhr.getAllResponseHeaders() || '';
+                raw.trim().split(/[\r\n]+/).forEach(function (line) {
+                  var index = line.indexOf(':');
+                  if (index > 0) {
+                    responseHeaders[line.slice(0, index).trim()] =
+                      line.slice(index + 1).trim();
+                  }
+                });
+              } catch (e) {}
+              var size = null;
+              var responseBody = null;
+              try {
+                var text = null;
+                try { text = xhr.responseText; } catch (e) { text = null; }
+                if (typeof text === 'string') {
+                  size = text.length;
+                  responseBody = text.slice(0, MAX_BODY);
+                } else if (xhr.response && typeof xhr.response.byteLength === 'number') {
+                  size = xhr.response.byteLength;
+                }
+              } catch (e) {}
+              emit({
+                phase: 'response',
+                id: id,
+                ts: Date.now(),
+                status: xhr.status,
+                headers: responseHeaders,
+                size: size,
+                responseBody: responseBody,
+                duration: Date.now() - meta.started
+              });
+            });
+          } catch (e) {}
+          return originalSend.apply(this, arguments);
+        };
+      }
+
+      if (navigator.sendBeacon) {
+        var originalBeacon = navigator.sendBeacon.bind(navigator);
+        navigator.sendBeacon = function (url, data) {
+          emit({
+            phase: 'request',
+            id: ++seq,
+            ts: Date.now(),
+            method: 'POST',
+            url: absolute(url),
+            headers: {},
+            body: bodyText(data)
+          });
+          return originalBeacon(url, data);
+        };
+      }
+    })();
+    """#
 
     /// Subresource metadata from the page's Performance API.
     ///

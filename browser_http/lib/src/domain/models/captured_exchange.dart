@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'transport.dart';
 
 /// One request/response pair observed by the native transport.
@@ -15,6 +17,7 @@ final class CapturedExchange {
     required this.profile,
     required this.elapsed,
     required this.response,
+    this.requestBody,
   });
 
   final String requestId;
@@ -26,6 +29,9 @@ final class CapturedExchange {
 
   /// Identity the native layer applied on top of [requestHeaders].
   final ProfileInfo profile;
+
+  /// Body handed to the native transport, when the caller supplied one.
+  final Uint8List? requestBody;
 
   final Duration elapsed;
   final TransportResponse response;

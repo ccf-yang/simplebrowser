@@ -9,6 +9,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
 
 import '../domain/errors.dart';
 import '../domain/models/browser_cookie.dart';
+import '../domain/models/page_network_event.dart';
 import '../domain/models/session_snapshot.dart';
 import '../domain/models/transport.dart';
 import '../ffi/api/profile.dart' as ffi_profile;
@@ -29,12 +30,12 @@ final class IosAdapters {
     MethodChannel? webViewChannel,
     MethodChannel? vaultChannel,
     MethodChannel? cookieChannel,
-  })  : _webViewChannel =
-            webViewChannel ?? const MethodChannel('browser_http/webview'),
-        _vaultChannel =
-            vaultChannel ?? const MethodChannel('browser_http/vault'),
-        _cookieChannel =
-            cookieChannel ?? const MethodChannel('browser_http/cookies');
+  }) : _webViewChannel =
+           webViewChannel ?? const MethodChannel('browser_http/webview'),
+       _vaultChannel =
+           vaultChannel ?? const MethodChannel('browser_http/vault'),
+       _cookieChannel =
+           cookieChannel ?? const MethodChannel('browser_http/cookies');
 
   final MethodChannel _webViewChannel;
   final MethodChannel _vaultChannel;
@@ -117,59 +118,59 @@ final class _RustTransportAdapter implements TransportPort {
     subscription = ffi_transport
         .openStream(req: _toFfiRequest(request))
         .listen(
-      (event) {
-        switch (event.kind) {
-          case 'head':
+          (event) {
+            switch (event.kind) {
+              case 'head':
+                if (!head.isCompleted) {
+                  head.complete(
+                    TransportStream(
+                      statusCode: event.status ?? 0,
+                      headers: <OrderedHeader>[
+                        for (final header in event.headers)
+                          OrderedHeader(header.name, header.value),
+                      ],
+                      body: body.stream,
+                    ),
+                  );
+                }
+              case 'data':
+                body.add(event.bytes);
+              case 'end':
+                unawaited(body.close());
+              default:
+                break;
+            }
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (cancelToken?.isCancelled ?? false) {
+              const cancelled = CancelledException();
+              if (!head.isCompleted) head.completeError(cancelled, stackTrace);
+              body.addError(cancelled, stackTrace);
+            } else {
+              final mapped = TransportException(
+                code: _codeOf(error),
+                message: error.toString(),
+                cause: error,
+                stackTrace: stackTrace,
+              );
+              if (!head.isCompleted) head.completeError(mapped, stackTrace);
+              body.addError(mapped, stackTrace);
+            }
+            unawaited(body.close());
+          },
+          onDone: () {
             if (!head.isCompleted) {
-              head.complete(
-                TransportStream(
-                  statusCode: event.status ?? 0,
-                  headers: <OrderedHeader>[
-                    for (final header in event.headers)
-                      OrderedHeader(header.name, header.value),
-                  ],
-                  body: body.stream,
+              head.completeError(
+                const TransportException(
+                  code: BrowserErrorCodes.transportProtocol,
+                  message: 'Connection closed before response headers.',
                 ),
               );
             }
-          case 'data':
-            body.add(event.bytes);
-          case 'end':
             unawaited(body.close());
-          default:
-            break;
-        }
-      },
-      onError: (Object error, StackTrace stackTrace) {
-        if (cancelToken?.isCancelled ?? false) {
-          const cancelled = CancelledException();
-          if (!head.isCompleted) head.completeError(cancelled, stackTrace);
-          body.addError(cancelled, stackTrace);
-        } else {
-          final mapped = TransportException(
-            code: _codeOf(error),
-            message: error.toString(),
-            cause: error,
-            stackTrace: stackTrace,
-          );
-          if (!head.isCompleted) head.completeError(mapped, stackTrace);
-          body.addError(mapped, stackTrace);
-        }
-        unawaited(body.close());
-      },
-      onDone: () {
-        if (!head.isCompleted) {
-          head.completeError(
-            const TransportException(
-              code: BrowserErrorCodes.transportProtocol,
-              message: 'Connection closed before response headers.',
-            ),
-          );
-        }
-        unawaited(body.close());
-      },
-      cancelOnError: true,
-    );
+          },
+          cancelOnError: true,
+        );
 
     // Dropping the consumer must stop the Dart side immediately. Use a
     // CancelToken to also abort the native socket.
@@ -187,8 +188,7 @@ final class _RustTransportAdapter implements TransportPort {
       family: info.family,
       userAgent: info.userAgent,
       clientHints: <String, String>{
-        for (final header in info.clientHints)
-          header.name: header.value,
+        for (final header in info.clientHints) header.name: header.value,
       },
     );
   }
@@ -222,39 +222,32 @@ final class _RustTransportAdapter implements TransportPort {
     if (requestId.isEmpty) return;
     cancelToken?.addListener(() {
       // Best effort: the request may already be finished.
-      unawaited(
-        ffi_transport.cancel(requestId: requestId).catchError((_) {}),
-      );
+      unawaited(ffi_transport.cancel(requestId: requestId).catchError((_) {}));
     });
   }
 
   static ffi_transport.TransportRequest _toFfiRequest(
     TransportRequest request,
-  ) =>
-      ffi_transport.TransportRequest(
-        id: request.id,
-        method: request.method,
-        url: request.uri.toString(),
-        profileId: request.profileId,
-        headers: <ffi_profile.HeaderPair>[
-          for (final header in request.headers)
-            ffi_profile.HeaderPair(
-              name: header.name,
-              value: header.value,
-            ),
-        ],
-        body: request.body,
-        proxyUrl: request.proxyUrl?.toString(),
-        timeoutMs: request.timeout == null
-            ? null
-            : BigInt.from(request.timeout!.inMilliseconds),
-        followRedirects: request.followRedirects,
-        maxRedirects: request.maxRedirects,
-      );
+  ) => ffi_transport.TransportRequest(
+    id: request.id,
+    method: request.method,
+    url: request.uri.toString(),
+    profileId: request.profileId,
+    headers: <ffi_profile.HeaderPair>[
+      for (final header in request.headers)
+        ffi_profile.HeaderPair(name: header.name, value: header.value),
+    ],
+    body: request.body,
+    proxyUrl: request.proxyUrl?.toString(),
+    timeoutMs: request.timeout == null
+        ? null
+        : BigInt.from(request.timeout!.inMilliseconds),
+    followRedirects: request.followRedirects,
+    maxRedirects: request.maxRedirects,
+  );
 
   static String _codeOf(Object error) {
-    final message =
-        error is AnyhowException ? error.message : error.toString();
+    final message = error is AnyhowException ? error.message : error.toString();
     if (!message.startsWith('transport.')) {
       return BrowserErrorCodes.transportConnect;
     }
@@ -270,9 +263,10 @@ final class _ChannelCookieAdapter implements CookiePort {
 
   @override
   Future<List<BrowserCookie>> get(Uri uri) async {
-    final result = await _channel.invokeMethod<List<Object?>>('get', <String, Object?>{
-      'url': uri.toString(),
-    });
+    final result = await _channel.invokeMethod<List<Object?>>(
+      'get',
+      <String, Object?>{'url': uri.toString()},
+    );
     return (result ?? const <Object?>[])
         .map((e) => BrowserCookie.fromJson((e! as Map).cast<String, Object?>()))
         .toList(growable: false);
@@ -293,10 +287,10 @@ final class _ChannelCookieAdapter implements CookiePort {
       });
 
   @override
-  Future<void> removeAll(Uri uri) =>
-      _channel.invokeMethod<void>('removeAll', <String, Object?>{
-        'url': uri.toString(),
-      });
+  Future<void> removeAll(Uri uri) => _channel.invokeMethod<void>(
+    'removeAll',
+    <String, Object?>{'url': uri.toString()},
+  );
 
   @override
   Future<void> clear() => _channel.invokeMethod<void>('clear');
@@ -342,29 +336,37 @@ final class _ChannelVaultAdapter implements VaultPort {
 }
 
 final class _ChannelWebViewAdapter implements WebViewPort {
-  _ChannelWebViewAdapter(this._channel);
+  _ChannelWebViewAdapter(this._channel) {
+    _channel.setMethodCallHandler(_handleNativeCall);
+  }
 
   final MethodChannel _channel;
+  final StreamController<PageNetworkEvent> _networkEvents =
+      StreamController<PageNetworkEvent>.broadcast();
+
+  Future<void> _handleNativeCall(MethodCall call) async {
+    if (call.method != 'pageNetworkEvent') return;
+    final raw = call.arguments;
+    if (raw is! Map) return;
+    _networkEvents.add(PageNetworkEvent.fromJson(raw.cast<String, Object?>()));
+  }
 
   @override
   Future<WebViewSession> create({
     required String userAgent,
     bool headless = true,
   }) async {
-    final id = await _channel.invokeMethod<String>(
-      'create',
-      <String, Object?>{
-        'userAgent': userAgent,
-        'headless': headless,
-      },
-    );
+    final id = await _channel.invokeMethod<String>('create', <String, Object?>{
+      'userAgent': userAgent,
+      'headless': headless,
+    });
     if (id == null) {
       throw const WebViewException(
         code: BrowserErrorCodes.webViewUnavailable,
         message: 'WKWebView could not be created.',
       );
     }
-    return _ChannelWebViewSession(_channel, id);
+    return _ChannelWebViewSession(_channel, id, _networkEvents.stream);
   }
 
   @override
@@ -372,13 +374,18 @@ final class _ChannelWebViewAdapter implements WebViewPort {
 }
 
 final class _ChannelWebViewSession implements WebViewSession {
-  _ChannelWebViewSession(this._channel, this._id);
+  _ChannelWebViewSession(this._channel, this._id, this._allNetworkEvents);
 
   final MethodChannel _channel;
   final String _id;
+  final Stream<PageNetworkEvent> _allNetworkEvents;
 
   @override
   String get id => _id;
+
+  @override
+  Stream<PageNetworkEvent> get networkEvents =>
+      _allNetworkEvents.where((event) => event.sessionId == _id);
 
   @override
   Future<WebViewLoadResult> load(
@@ -388,11 +395,7 @@ final class _ChannelWebViewSession implements WebViewSession {
   }) async {
     var call = _channel.invokeMethod<Map<Object?, Object?>>(
       'load',
-      <String, Object?>{
-        'id': _id,
-        'url': uri.toString(),
-        'headers': headers,
-      },
+      <String, Object?>{'id': _id, 'url': uri.toString(), 'headers': headers},
     );
     if (timeout != null) {
       call = call.timeout(
@@ -416,19 +419,17 @@ final class _ChannelWebViewSession implements WebViewSession {
   Future<void> navigate(
     Uri uri, {
     Map<String, String> headers = const <String, String>{},
-  }) =>
-      _channel.invokeMethod<void>('navigate', <String, Object?>{
-        'id': _id,
-        'url': uri.toString(),
-        'headers': headers,
-      });
+  }) => _channel.invokeMethod<void>('navigate', <String, Object?>{
+    'id': _id,
+    'url': uri.toString(),
+    'headers': headers,
+  });
 
   @override
-  Future<void> setUserAgent(String? userAgent) =>
-      _channel.invokeMethod<void>('setUserAgent', <String, Object?>{
-        'id': _id,
-        'userAgent': userAgent,
-      });
+  Future<void> setUserAgent(String? userAgent) => _channel.invokeMethod<void>(
+    'setUserAgent',
+    <String, Object?>{'id': _id, 'userAgent': userAgent},
+  );
 
   @override
   Future<void> setCookie(Uri uri, String cookieHeader) =>
@@ -440,18 +441,16 @@ final class _ChannelWebViewSession implements WebViewSession {
 
   @override
   Future<bool> canGoBack() async =>
-      await _channel.invokeMethod<bool>(
-        'canGoBack',
-        <String, Object?>{'id': _id},
-      ) ??
+      await _channel.invokeMethod<bool>('canGoBack', <String, Object?>{
+        'id': _id,
+      }) ??
       false;
 
   @override
   Future<bool> canGoForward() async =>
-      await _channel.invokeMethod<bool>(
-        'canGoForward',
-        <String, Object?>{'id': _id},
-      ) ??
+      await _channel.invokeMethod<bool>('canGoForward', <String, Object?>{
+        'id': _id,
+      }) ??
       false;
 
   @override
@@ -467,12 +466,16 @@ final class _ChannelWebViewSession implements WebViewSession {
       _channel.invokeMethod<void>('reload', <String, Object?>{'id': _id});
 
   @override
-  Future<String?> currentUrl() =>
-      _channel.invokeMethod<String?>('currentUrl', <String, Object?>{'id': _id});
+  Future<String?> currentUrl() => _channel.invokeMethod<String?>(
+    'currentUrl',
+    <String, Object?>{'id': _id},
+  );
 
   @override
-  Future<String?> currentTitle() => _channel
-      .invokeMethod<String?>('currentTitle', <String, Object?>{'id': _id});
+  Future<String?> currentTitle() => _channel.invokeMethod<String?>(
+    'currentTitle',
+    <String, Object?>{'id': _id},
+  );
 
   @override
   Future<int?> lastStatusCode() =>
@@ -480,31 +483,30 @@ final class _ChannelWebViewSession implements WebViewSession {
 
   @override
   Future<List<WebResourceTiming>> resourceTimings() async {
-    final result = await _channel
-        .invokeMethod<List<Object?>>('resourceTimings', <String, Object?>{
-      'id': _id,
-    });
+    final result = await _channel.invokeMethod<List<Object?>>(
+      'resourceTimings',
+      <String, Object?>{'id': _id},
+    );
     return (result ?? const <Object?>[])
-        .map((e) => WebResourceTiming.fromJson(
-              (e! as Map).cast<String, Object?>(),
-            ))
+        .map(
+          (e) =>
+              WebResourceTiming.fromJson((e! as Map).cast<String, Object?>()),
+        )
         .toList(growable: false);
   }
 
   @override
-  Future<Object?> evaluate(String script) =>
-      _channel.invokeMethod<Object?>('evaluate', <String, Object?>{
-        'id': _id,
-        'script': script,
-      });
+  Future<Object?> evaluate(String script) => _channel.invokeMethod<Object?>(
+    'evaluate',
+    <String, Object?>{'id': _id, 'script': script},
+  );
 
   @override
   Future<List<BrowserCookie>> exportCookies(Uri uri) async {
-    final result =
-        await _channel.invokeMethod<List<Object?>>('exportCookies', <String, Object?>{
-      'id': _id,
-      'url': uri.toString(),
-    });
+    final result = await _channel.invokeMethod<List<Object?>>(
+      'exportCookies',
+      <String, Object?>{'id': _id, 'url': uri.toString()},
+    );
     return (result ?? const <Object?>[])
         .map((e) => BrowserCookie.fromJson((e! as Map).cast<String, Object?>()))
         .toList(growable: false);
@@ -523,10 +525,7 @@ final class _ChannelWebViewSession implements WebViewSession {
   }
 
   @override
-  Future<void> importLocalStorage(
-    Uri origin,
-    Map<String, String> values,
-  ) =>
+  Future<void> importLocalStorage(Uri origin, Map<String, String> values) =>
       _channel.invokeMethod<void>('importLocalStorage', <String, Object?>{
         'id': _id,
         'origin': origin.origin,
@@ -535,10 +534,9 @@ final class _ChannelWebViewSession implements WebViewSession {
 
   @override
   Future<String> currentUserAgent() async =>
-      await _channel.invokeMethod<String>(
-        'currentUserAgent',
-        <String, Object?>{'id': _id},
-      ) ??
+      await _channel.invokeMethod<String>('currentUserAgent', <String, Object?>{
+        'id': _id,
+      }) ??
       '';
 
   @override

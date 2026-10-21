@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import '../domain/models/browser_cookie.dart';
+import '../domain/models/page_network_event.dart';
 
 /// One entry from the page's `PerformanceResourceTiming` list.
 ///
@@ -33,12 +36,12 @@ final class WebResourceTiming {
       );
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'url': url,
-        'initiatorType': initiatorType,
-        'duration': duration,
-        'transferSize': transferSize,
-        'encodedBodySize': encodedBodySize,
-      };
+    'url': url,
+    'initiatorType': initiatorType,
+    'duration': duration,
+    'transferSize': transferSize,
+    'encodedBodySize': encodedBodySize,
+  };
 }
 
 /// Result of loading a page in the challenge WebView.
@@ -62,6 +65,12 @@ abstract interface class WebViewSession {
   /// Native handle. Used by `UiKitView` to attach the same WKWebView that
   /// owns the user's challenge session.
   String get id;
+
+  /// fetch/XHR/beacon observations reported by the injected page script.
+  ///
+  /// Events for all sessions share one native channel; implementations filter
+  /// them by [id].
+  Stream<PageNetworkEvent> get networkEvents;
 
   Future<WebViewLoadResult> load(
     Uri uri, {
@@ -111,10 +120,7 @@ abstract interface class WebViewSession {
 
   /// Writes [values] into the page's `localStorage`. The page must already be
   /// on [origin], otherwise the write lands on the wrong origin.
-  Future<void> importLocalStorage(
-    Uri origin,
-    Map<String, String> values,
-  );
+  Future<void> importLocalStorage(Uri origin, Map<String, String> values);
 
   /// Current `navigator.userAgent`, used to verify consistency.
   Future<String> currentUserAgent();

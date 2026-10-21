@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../domain/models/page_network_event.dart';
 import '../ports/webview_port.dart';
 import 'browser_session.dart';
 
@@ -26,6 +27,9 @@ final class BrowserController extends ChangeNotifier {
   Object? _error;
   Future<void>? _startFuture;
   bool _disposed = false;
+  final StreamController<PageNetworkEvent> _networkEvents =
+      StreamController<PageNetworkEvent>.broadcast();
+  StreamSubscription<PageNetworkEvent>? _networkSubscription;
 
   String? _url;
   String? _title;
@@ -46,6 +50,12 @@ final class BrowserController extends ChangeNotifier {
   bool get canGoBack => _canGoBack;
   bool get canGoForward => _canGoForward;
   List<WebResourceTiming> get resourceTimings => _resources;
+
+  /// fetch/XHR/beacon observations from the page script.
+  ///
+  /// Available before [start]: the controller relays the session stream once
+  /// the WebView exists, so subscribing early loses nothing.
+  Stream<PageNetworkEvent> get networkEvents => _networkEvents.stream;
 
   /// Creates the WKWebView and navigates to [initialUri] when given.
   ///
@@ -71,6 +81,9 @@ final class BrowserController extends ChangeNotifier {
         return;
       }
       _webView = webView;
+      _networkSubscription ??= webView.networkEvents.listen((event) {
+        if (!_networkEvents.isClosed) _networkEvents.add(event);
+      });
       if (initialUri != null) await webView.navigate(initialUri);
       _poll = Timer.periodic(
         const Duration(milliseconds: 800),
@@ -161,7 +174,8 @@ final class BrowserController extends ChangeNotifier {
       final canGoBack = await webView.canGoBack();
       final canGoForward = await webView.canGoForward();
 
-      final changed = url != _url ||
+      final changed =
+          url != _url ||
           title != _title ||
           statusCode != _statusCode ||
           canGoBack != _canGoBack ||
@@ -206,6 +220,9 @@ final class BrowserController extends ChangeNotifier {
     final webView = _webView;
     _webView = null;
     if (webView != null) unawaited(webView.dispose());
+    unawaited(_networkSubscription?.cancel());
+    _networkSubscription = null;
+    unawaited(_networkEvents.close());
     super.dispose();
   }
 }
@@ -215,11 +232,7 @@ final class BrowserController extends ChangeNotifier {
 /// The user clicks links themselves; this widget only forwards navigation
 /// commands issued through [BrowserController].
 final class BrowserView extends StatefulWidget {
-  const BrowserView({
-    super.key,
-    required this.controller,
-    this.initialUri,
-  });
+  const BrowserView({super.key, required this.controller, this.initialUri});
 
   final BrowserController controller;
   final Uri? initialUri;

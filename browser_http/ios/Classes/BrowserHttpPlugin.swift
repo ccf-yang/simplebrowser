@@ -11,9 +11,18 @@ public final class BrowserHttpPlugin: NSObject, FlutterPlugin {
   private let cookieBridge = CookieBridge()
   private let vaultBridge = KeychainVault()
   private let webViewBridge = WebViewBridge()
+  private let webChannel: FlutterMethodChannel
 
   init(messenger: FlutterBinaryMessenger, registrar: FlutterPluginRegistrar) {
+    webChannel = FlutterMethodChannel(
+      name: "browser_http/webview", binaryMessenger: messenger)
     super.init()
+
+    // Page-script network events (fetch/XHR/beacon) are pushed upstream on the
+    // same channel the Dart side already listens to.
+    webViewBridge.onNetworkEvent = { [weak self] event in
+      self?.webChannel.invokeMethod("pageNetworkEvent", arguments: event)
+    }
 
     let cookies = FlutterMethodChannel(
       name: "browser_http/cookies", binaryMessenger: messenger)
@@ -27,9 +36,7 @@ public final class BrowserHttpPlugin: NSObject, FlutterPlugin {
       self?.vaultBridge.handle(call, result: result)
     }
 
-    let web = FlutterMethodChannel(
-      name: "browser_http/webview", binaryMessenger: messenger)
-    web.setMethodCallHandler { [weak self] call, result in
+    webChannel.setMethodCallHandler { [weak self] call, result in
       self?.webViewBridge.handle(call, result: result)
     }
 

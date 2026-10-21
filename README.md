@@ -20,6 +20,26 @@ fingerprint engine so you can inspect the actual request/response metadata.
   cookie jar's `Cookie`, profile user-agent/client hints, response status,
   ordered response headers, elapsed time, body size and preview.
 - **Log tab** — live `RequestLogEvent`s (start / redirect / response / error).
+- **Floating DevTools** — a semi-transparent circular button over the WebView
+  opens an eruda-style dark panel with **网络 / 日志 / 页面** tabs. The network
+  tab lists two kinds of rows:
+  - **页面脚本请求** — `fetch` / `XMLHttpRequest` / `navigator.sendBeacon` calls
+    observed by a `WKUserScript` injected at document start. This is how POST
+    bodies and caller headers become visible: WebKit never hands them to
+    `WKNavigationDelegate`. Tap one to inspect method, URL, request headers,
+    request body, response status, response headers, timing and a truncated
+    response body (small textual responses only), then copy it as cURL or replay
+    it through the native engine.
+  - **原生回放** — the current URL replayed through the Rust transport.
+
+  The network tab keeps a history of captured packets; tap one to inspect the
+  request line, ordered request headers (including the shared jar's `Cookie`),
+  request body, actual identity, response headers and response body separately.
+  Actions: copy as cURL, copy URL, copy request headers, copy request/response
+  body and re-send the request. It auto-captures the current URL when opened and
+  whenever the WebView navigates. Drag the panel's top handle to resize it.
+  Tapping the button again closes the panel, clears the collected packets/logs
+  and reloads the current page.
 - **Resizable panel** — drag the divider above the tabs to resize the
   WebView/Engine/Log area.
 
@@ -31,6 +51,7 @@ by browsing are reused by the native capture and vice versa.
 ```
 simplebrowser/
 ├── lib/main.dart              # the browser app
+├── lib/dev_panel.dart         # eruda-style floating DevTools panel
 ├── browser_http/              # vendored plugin (Dart + Swift + Rust)
 ├── .github/workflows/ios.yml  # unsigned IPA -> GitHub Releases
 └── pubspec.yaml
