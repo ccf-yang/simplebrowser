@@ -176,6 +176,7 @@ class _BrowserPageState extends State<BrowserPage>
   String? _erudaSource;
   Timer? _erudaVerifyTimer;
   Timer? _debugSizeTimer;
+  Timer? _erudaNudgeTimer;
 
   @override
   void initState() {
@@ -773,6 +774,7 @@ class _BrowserPageState extends State<BrowserPage>
   void dispose() {
     _erudaVerifyTimer?.cancel();
     _debugSizeTimer?.cancel();
+    _erudaNudgeTimer?.cancel();
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
     unawaited(_pageSubscription.cancel());
@@ -1879,6 +1881,7 @@ class _BrowserPageState extends State<BrowserPage>
       });
       _erudaVerifyTimer?.cancel();
       _debugSizeTimer?.cancel();
+      _erudaNudgeTimer?.cancel();
       _applyPanelCollection();
       await _browser.setDebugOverlay(enabled: false);
       return;
@@ -1898,9 +1901,13 @@ class _BrowserPageState extends State<BrowserPage>
         displaySize: _erudaSize,
       );
       if (!mounted) return;
-      // `queued` means the script is registered and the next commit (or the
-      // native one-off reload) brings the console up, so treat it as open.
-      final open = detail == 'ok' || detail.startsWith('queued');
+      // The native status is `status|stamp`. `queued` means the script is
+      // registered and the next commit (or the native one-off reload) brings
+      // the console up, so treat it as open.
+      final bar = detail.indexOf('|');
+      final status = bar < 0 ? detail : detail.substring(0, bar);
+      final native = bar < 0 ? '' : detail.substring(bar + 1);
+      final open = status == 'ok' || status.startsWith('queued');
       setState(() {
         _erudaOpen = open;
         if (open) {
@@ -1908,7 +1915,23 @@ class _BrowserPageState extends State<BrowserPage>
           _panelVisible = false;
         }
       });
-      if (open) _applyPanelCollection();
+      if (open) {
+        _applyPanelCollection();
+        // `eruda.show('console')` alone leaves the panel hidden. The native
+        // boot calls `show()`, but a framework built before that fix does not;
+        // nudging it from here makes the console visible either way.
+        _showErudaNow();
+        _erudaNudgeTimer?.cancel();
+        _erudaNudgeTimer = Timer(const Duration(milliseconds: 900), () {
+          if (mounted && _erudaOpen) _showErudaNow();
+        });
+        debugPrint('[console] native=$native status=$status');
+        _pushToConsole('调试通道 $native ($status)');
+        if (native != 'n3') {
+          _snack('Console is up, but the webview core is old ($native); '
+              'reinstall the new IPA');
+        }
+      }
       if (!open) _snack('Console failed: $detail');
     } on Object catch (error) {
       if (mounted) _snack('Eruda failed: $error');
@@ -1967,27 +1990,41 @@ class _BrowserPageState extends State<BrowserPage>
 
   Future<void> _verifyEruda() async {
     if (!_erudaOpen || !mounted) return;
-    Object? present;
+    Object? state;
     try {
-      // Presence alone is not enough: the old boot selected the console tool
-      // without showing the devtools panel, which left an invisible console.
-      present = await _browser.evaluate(
-        '!!(window.__bhEruda && window.eruda && window.eruda._isInit)'
-        ' && (function(){try{var h=document.getElementById("eruda");'
+      // Presence alone is not enough: selecting the console tool without
+      // `eruda.show()` leaves the devtools panel at `display:none`. Ask for
+      // the state and show it right there when it is loaded but hidden.
+      state = await _browser.evaluate(
+        '(function(){try{'
+        'if(!(window.eruda&&window.eruda._isInit))return "missing";'
+        'var h=document.getElementById("eruda");'
         'var d=h&&h.shadowRoot&&h.shadowRoot.querySelector(".eruda-dev-tools");'
-        'return !!d && d.getBoundingClientRect().height > 0;}'
-        'catch(e){return false}})()',
+        'if(d&&d.getBoundingClientRect().height>0)return "visible";'
+        'eruda.show();eruda.show("console");'
+        'return "showing";'
+        '}catch(e){return "missing"}})()',
       );
     } on Object {
       // Mid-navigation: the next URL change retries.
       return;
     }
+    if (state != 'missing') return;
     final source = _erudaSource;
-    if (!mounted || present == true || source == null) return;
+    if (!mounted || source == null) return;
     await _browser.setDebugOverlay(
       enabled: true,
       source: source,
       displaySize: _erudaSize,
+    );
+    _showErudaNow();
+  }
+
+  /// Shows the console in whatever document is loaded now. Harmless while the
+  /// bundle is still parsing; the retry after it settles covers that.
+  void _showErudaNow() {
+    _evalQuiet(
+      'try{if(window.eruda){eruda.show();eruda.show("console")}}catch(e){};0;',
     );
   }
 

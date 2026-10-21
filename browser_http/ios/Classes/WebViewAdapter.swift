@@ -478,25 +478,25 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
 
         guard enabled else {
             webView.evaluateJavaScript("try{eruda.hide()}catch(e){};0;") { _, _ in
-                completion("ok")
+                completion(WebViewHolder.stamped("ok"))
             }
             return
         }
         guard !debugSource.isEmpty else {
-            completion("bundle: empty")
+            completion(WebViewHolder.stamped("bundle: empty"))
             return
         }
 
         injectDebug { detail in
             switch detail {
             case "ok", "already":
-                completion("ok")
+                completion(WebViewHolder.stamped("ok"))
             case "busy":
-                completion("queued: document loading")
+                completion(WebViewHolder.stamped("queued: document loading"))
             default:
                 // A document that started while the bundle was parsed gets the
                 // console from its own commit callback.
-                completion("queued: \(detail)")
+                completion(WebViewHolder.stamped("queued: \(detail)"))
             }
         }
     }
@@ -586,6 +586,37 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// optional.
     private static func erudaSourceScript(_ source: String) -> String {
         source + "\n;0;"
+    }
+
+    /// Baidu's "open in app" gateway is a plain https page whose query carries
+    /// the real custom scheme. Treat any such wrapper as an exit.
+    private static func isAppLaunchGateway(_ url: URL) -> Bool {
+        guard let raw = url.query?.removingPercentEncoding?.lowercased(),
+              raw.contains("://") else { return false }
+        // The direct form is the one Baidu uses; the key scan covers siblings
+        // such as `?url=weixin%3A%2F%2F…` or `?redirect=itms-apps://…`.
+        if raw.contains("baiduboxapp://") { return true }
+        for pair in raw.split(separator: "&") {
+            guard let eq = pair.firstIndex(of: "=") else { continue }
+            let key = String(pair[..<eq])
+            guard ["scheme", "url", "target", "redirect", "redirecturl"].contains(key) else {
+                continue
+            }
+            let value = pair[pair.index(after: eq)...]
+            guard let sep = value.range(of: "://") else { continue }
+            let proto = value[..<sep.lowerBound]
+            if proto != "http" && proto != "https" { return true }
+        }
+        return false
+    }
+
+    /// Bumped whenever the native debug pipeline changes. Appended to every
+    /// setDebugOverlay status so the host can tell a stale embedded framework
+    /// from a real failure.
+    static let debugBuildStamp = "n3"
+
+    private static func stamped(_ detail: String) -> String {
+        "\(detail)|\(debugBuildStamp)"
     }
 
     /// Whether the current document already has a live console.
@@ -727,6 +758,18 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             return
         }
 
+        // Baidu wraps its app jump in an https gateway
+        // (`boxer.baidu.com/scheme?scheme=baiduboxapp%3A%2F%2F…`). That page is
+        // itself a Universal Link, so iOS can leave the app before the final
+        // custom-scheme hop is ever seen. Drop it here, whatever triggered it.
+        if blockExternalNavigations, Self.isAppLaunchGateway(url) {
+            decisionHandler(.cancel)
+            reportNavigation(kind: "blocked", url: url, method: method,
+                             mainFrame: targetsMainFrame, type: type,
+                             message: "app-launch gateway blocked")
+            return
+        }
+
         // A page jump must never leave the app, whatever triggered it:
         // - taps and GET form submits (Universal Link handoff),
         // - script-driven `location =` / `window.open` (`.other`): the "open in
@@ -794,7 +837,8 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
            let url = navigationAction.request.url,
            !programmaticURLs.contains(url.absoluteString) {
             let scheme = (url.scheme ?? "").lowercased()
-            if blockExternalNavigations, !Self.inAppSchemes.contains(scheme) {
+            if blockExternalNavigations,
+               !Self.inAppSchemes.contains(scheme) || Self.isAppLaunchGateway(url) {
                 reportNavigation(
                     kind: "blocked", url: url,
                     method: (navigationAction.request.httpMethod ?? "GET").uppercased(),

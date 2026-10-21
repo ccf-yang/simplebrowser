@@ -573,7 +573,10 @@ final class _ChannelWebViewSession implements WebViewSession {
     String? source,
     double displaySize = 50,
   }) async {
-    final detail = await _channel.invokeMethod<String>(
+    // Deliberately not `invokeMethod<String>`: a framework built before the
+    // status became a string answers with a bool, and that cast would throw
+    // before the host can say what happened. Normalise instead.
+    final raw = await _channel.invokeMethod<Object?>(
       'setDebugOverlay',
       <String, Object?>{
         'id': _id,
@@ -582,7 +585,9 @@ final class _ChannelWebViewSession implements WebViewSession {
         'displaySize': displaySize,
       },
     );
-    return detail ?? 'ok';
+    if (raw is String) return raw;
+    if (raw is bool) return raw ? 'ok|legacy-native' : 'failed|legacy-native';
+    return raw == null ? 'ok|legacy-native' : '$raw';
   }
 
   @override
