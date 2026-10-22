@@ -360,13 +360,10 @@ final class MediaBridge {
         let actions: [UIMenuElement] = playbackSpeeds.map { rate in
             return UIAction(title: speedTitle(rate)) { [weak button] _ in
                 guard let button else { return }
-                // Changing rate while paused would start playback, so park
-                // the choice in defaultRate for the next play().
-                if player.timeControlStatus == .playing {
-                    player.rate = rate
-                } else {
-                    player.defaultRate = rate
-                }
+                // AVPlayer.defaultRate only exists on iOS 16, so on this
+                // legacy path picking a speed also resumes playback — which
+                // is what the tap means anyway.
+                player.rate = rate
                 var config = button.configuration
                 config?.title = speedTitle(rate)
                 button.configuration = config
