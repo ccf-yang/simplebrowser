@@ -9,10 +9,17 @@ import 'theme.dart';
 
 /// What the resource picker asks the page to do after it closes.
 class ResourceSheetResult {
-  const ResourceSheetResult(this.downloads, {this.openDownloads = false});
+  const ResourceSheetResult(
+    this.downloads, {
+    this.openDownloads = false,
+    this.webdav = false,
+  });
 
   final List<SniffedResource> downloads;
   final bool openDownloads;
+
+  /// Queue the selection for WebDAV instead of the photo album.
+  final bool webdav;
 }
 
 /// Lists the images and direct video files the current document already
@@ -22,17 +29,30 @@ class ResourceSheet extends StatefulWidget {
   const ResourceSheet({
     super.key,
     required this.controller,
+    required this.history,
     this.userAgent,
     this.onLoadVariants,
+    this.webdavSummary = '未配置',
+    this.webdavReady = false,
+    this.initialToWebDav = false,
   });
 
   final BrowserController controller;
   final String? userAgent;
 
+  /// Accumulated results across rescans. Owned by the page so the list outlives
+  /// this sheet; the switch flips [SniffHistory.record].
+  final SniffHistory history;
+
   /// Reads the master playlist behind an `.m3u8` row. The host wires this to
   /// the download manager so it reuses the browser's cookies and UA.
   final Future<List<HlsVariant>> Function(SniffedResource resource)?
       onLoadVariants;
+
+  /// Where the upload would go, and whether a target is configured at all.
+  final String webdavSummary;
+  final bool webdavReady;
+  final bool initialToWebDav;
 
   @override
   State<ResourceSheet> createState() => _ResourceSheetState();
@@ -45,6 +65,8 @@ class _ResourceSheetState extends State<ResourceSheet> {
   bool _loading = true;
   String? _error;
   int _filter = 0; // all / images / videos
+  late bool _toWebDav =
+      widget.webdavReady && widget.initialToWebDav;
 
   @override
   void initState() {
@@ -58,8 +80,11 @@ class _ResourceSheetState extends State<ResourceSheet> {
       _error = null;
     });
     try {
-      final items = await SniffedResource.scan(widget.controller);
+      final scanned = await SniffedResource.scan(widget.controller);
       if (!mounted) return;
+      // Recording keeps earlier pages in the list; off means the sheet mirrors
+      // exactly what the current document has loaded.
+      final items = widget.history.merge(scanned);
       setState(() {
         _items = items;
         _loading = false;
@@ -73,6 +98,21 @@ class _ResourceSheetState extends State<ResourceSheet> {
         _error = error.toString();
       });
     }
+  }
+
+  void _setRecordHistory(bool value) {
+    setState(() => widget.history.record = value);
+    // Turning it off discards the accumulated rows, and _scan prunes the
+    // selection down to what is left on screen.
+    unawaited(_scan());
+  }
+
+  void _clearHistory() {
+    setState(() {
+      widget.history.clear();
+      _selected.clear();
+    });
+    unawaited(_scan());
   }
 
   List<SniffedResource> get _visible => switch (_filter) {
@@ -125,7 +165,9 @@ class _ResourceSheetState extends State<ResourceSheet> {
   void _submit() {
     final chosen = _choices;
     if (chosen.isEmpty) return;
-    Navigator.of(context).pop(ResourceSheetResult(chosen));
+    Navigator.of(context).pop(
+      ResourceSheetResult(chosen, webdav: _toWebDav),
+    );
   }
 
   Future<void> _pickVariant(SniffedResource resource) async {
@@ -199,7 +241,8 @@ class _ResourceSheetState extends State<ResourceSheet> {
                         Text(
                           _loading
                               ? '正在扫描当前页面…'
-                              : '${_items.length} 个资源 · $images 图片 · $videos 视频',
+                              : '${_items.length} 个资源 · $images 图片 · $videos 视频'
+                                    '${widget.history.record ? ' · 含历史' : ''}',
                           style: const TextStyle(
                             fontSize: 10,
                             color: AppColors.muted,
@@ -262,6 +305,46 @@ class _ResourceSheetState extends State<ResourceSheet> {
                     onPressed: _visible.isEmpty ? null : _toggleAll,
                     child: Text(_allVisibleSelected ? 'Clear' : 'Select all'),
                   ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 0, 18, 8),
+              child: Row(
+                children: <Widget>[
+                  _TogglePill(
+                    icon: Icons.history_rounded,
+                    label: '记录历史',
+                    on: widget.history.record,
+                    onTap: () => _setRecordHistory(!widget.history.record),
+                  ),
+                  const SizedBox(width: 6),
+                  _TogglePill(
+                    icon: Icons.cloud_upload_outlined,
+                    label: '存到 WebDAV',
+                    on: _toWebDav,
+                    enabled: widget.webdavReady,
+                    onTap: () => setState(() => _toWebDav = !_toWebDav),
+                  ),
+                  if (!widget.webdavReady) ...<Widget>[
+                    const SizedBox(width: 6),
+                    const Flexible(
+                      child: Text(
+                        '未配置，去 设置 → WebDAV 存储',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 9.5, color: AppColors.faint),
+                      ),
+                    ),
+                  ],
+                  if (widget.history.record && !widget.history.isEmpty) ...<
+                    Widget
+                  >[
+                    const Spacer(),
+                    TextButton(
+                      onPressed: _clearHistory,
+                      child: const Text('清空历史'),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -362,6 +445,11 @@ class _ResourceSheetState extends State<ResourceSheet> {
   }
 
   Widget _buildFooter(int chosen) {
+    final target = _toWebDav
+        ? '已选 $chosen 项 · 本机下载后传 ${widget.webdavSummary}，传完删本地'
+        : chosen == 0
+        ? '选择要保存的图片或视频'
+        : '已选 $chosen 项 · M3U8 会自动转成 MP4';
     return Container(
       padding: const EdgeInsets.fromLTRB(18, 9, 18, 8),
       decoration: const BoxDecoration(
@@ -372,18 +460,94 @@ class _ResourceSheetState extends State<ResourceSheet> {
         children: <Widget>[
           Expanded(
             child: Text(
-              chosen == 0
-                  ? '选择要保存的图片或视频'
-                  : '已选 $chosen 项 · M3U8 会自动转成 MP4',
+              target,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 10.5, color: AppColors.muted),
             ),
           ),
+          const SizedBox(width: 8),
           FilledButton.icon(
             onPressed: chosen == 0 ? null : _submit,
-            icon: const Icon(Icons.download_rounded, size: 16),
-            label: Text(chosen == 0 ? 'Download' : 'Download $chosen'),
+            icon: Icon(
+              _toWebDav
+                  ? Icons.cloud_upload_outlined
+                  : Icons.download_rounded,
+              size: 16,
+            ),
+            label: Text(
+              chosen == 0
+                  ? 'Download'
+                  : _toWebDav
+                  ? '上传 $chosen'
+                  : '下载 $chosen',
+            ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Small on/off chip in the resource sheet's option row.
+class _TogglePill extends StatelessWidget {
+  const _TogglePill({
+    required this.icon,
+    required this.label,
+    required this.on,
+    required this.onTap,
+    this.enabled = true,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool on;
+  final VoidCallback onTap;
+
+  /// Off rows are still tappable when disabled, so the host can explain why
+  /// with its own hint; the visual just goes grey.
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = on
+        ? AppColors.signalLine
+        : enabled
+        ? AppColors.line2
+        : AppColors.line;
+    return Material(
+      color: on ? AppColors.signalWash : AppColors.card,
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: enabled ? onTap : null,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(border: Border.all(color: color)),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(
+                icon,
+                size: 12,
+                color: on
+                    ? AppColors.ink
+                    : enabled
+                    ? AppColors.muted
+                    : AppColors.faint,
+              ),
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: on ? FontWeight.w700 : FontWeight.w500,
+                  color: enabled ? AppColors.ink2 : AppColors.faint,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

@@ -14,8 +14,11 @@ import 'downloads.dart';
 import 'downloads_sheet.dart';
 import 'request_format.dart';
 import 'resource_sheet.dart';
+import 'resources.dart';
 import 'settings_sheet.dart';
 import 'theme.dart';
+import 'webdav.dart';
+import 'webdav_sheet.dart';
 
 void main() => runApp(const SimpleBrApp());
 
@@ -203,6 +206,16 @@ class _BrowserPageState extends State<BrowserPage>
   late final DownloadManager _downloads;
   bool _downloadsSheetOpen = false;
 
+  /// Where "存到 WebDAV" sends finished files. Loaded from browser_prefs.json.
+  WebDavConfig _webdav = const WebDavConfig();
+
+  /// Sniff results kept across rescans while the sheet's history switch is on.
+  /// The page owns the store so the list survives closing the sheet.
+  late final SniffHistory _sniff = SniffHistory(onChanged: _persistSniffHistory);
+
+  /// Last choice in the sheet's "存到 WebDAV" pill, remembered between opens.
+  bool _sniffToWebDav = false;
+
   // Ad blocking. The rules are a committed EasyList China + EasyList snapshot;
   // WebKit compiles them once and caches the result by identifier.
   static const String _adBlockMetaAsset = 'assets/adblock/meta.json';
@@ -241,6 +254,64 @@ class _BrowserPageState extends State<BrowserPage>
     unawaited(_loadBookmarks());
     unawaited(_downloads.load());
     unawaited(_bootAdBlock());
+    unawaited(_bootWebDav());
+    unawaited(_bootSniffHistory());
+  }
+
+  /// Reads the stored WebDAV target so downloads can use it right away.
+  Future<void> _bootWebDav() async {
+    final prefs = await _readPrefs();
+    final config = WebDavConfig.fromPrefs(prefs);
+    _downloads.webdavConfig = config;
+    if (!mounted) return;
+    setState(() => _webdav = config);
+  }
+
+  Future<void> _bootSniffHistory() async {
+    final prefs = await _readPrefs();
+    if (!mounted) return;
+    setState(() {
+      _sniffToWebDav = prefs['sniffToWebDav'] == true;
+      _sniff.record = prefs['recordSniffHistory'] == true;
+    });
+  }
+
+  void _persistSniffHistory() {
+    unawaited(_setPrefs(<String, Object?>{
+      'recordSniffHistory': _sniff.record ? true : null,
+    }));
+  }
+
+  Future<void> _openWebDavSettings() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(88),
+      builder: (_) => WebDavSheet(
+        initial: _webdav,
+        onSave: _saveWebDavConfig,
+      ),
+    );
+  }
+
+  /// Validates by building the client base URL, then stores the flat keys.
+  /// Returns null when saved, or the message the sheet should show.
+  Future<String?> _saveWebDavConfig(WebDavConfig config) async {
+    if (config.ready) {
+      try {
+        normalizeWebDavBase(config.url);
+      } on WebDavException catch (error) {
+        return error.message;
+      }
+    }
+    final error = await _setPrefs(config.toPrefs());
+    if (error != null) return error;
+    if (!mounted) return null;
+    setState(() => _webdav = config);
+    _downloads.webdavConfig = config;
+    _snack(config.ready ? '已保存 WebDAV 配置' : '已清空 WebDAV 配置');
+    return null;
   }
 
   Future<void> _loadProfileInfo() async {
@@ -516,15 +587,15 @@ class _BrowserPageState extends State<BrowserPage>
   // Bookmarks
   // ---------------------------------------------------------------------------
 
-  /// `$HOME/Documents/bookmarks.json` in the app container.
-  File? get _bookmarkFile {
-    final home = Platform.environment['HOME'];
-    if (home == null || home.isEmpty) return null;
-    return File('$home/Documents/bookmarks.json');
+  /// `bookmarks.json` inside the app's Documents directory.
+  Future<File?> _bookmarkFile() async {
+    final dir = await _downloads.documentsDirectory();
+    if (dir == null) return null;
+    return File('$dir/bookmarks.json');
   }
 
   Future<void> _loadBookmarks() async {
-    final file = _bookmarkFile;
+    final file = await _bookmarkFile();
     try {
       if (file != null && await file.exists()) {
         final decoded = jsonDecode(await file.readAsString());
@@ -561,7 +632,7 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   Future<void> _persistBookmarks() async {
-    final file = _bookmarkFile;
+    final file = await _bookmarkFile();
     if (file == null) return;
     try {
       await file.parent.create(recursive: true);
@@ -620,14 +691,14 @@ class _BrowserPageState extends State<BrowserPage>
   // Ad blocking
   // ---------------------------------------------------------------------------
 
-  File? get _prefsFile {
-    final home = Platform.environment['HOME'];
-    if (home == null || home.isEmpty) return null;
-    return File('$home/Documents/browser_prefs.json');
+  Future<File?> _prefsFile() async {
+    final dir = await _downloads.documentsDirectory();
+    if (dir == null) return null;
+    return File('$dir/browser_prefs.json');
   }
 
   Future<Map<String, Object?>> _readPrefs() async {
-    final file = _prefsFile;
+    final file = await _prefsFile();
     if (file == null) return <String, Object?>{};
     try {
       if (!await file.exists()) return <String, Object?>{};
@@ -642,17 +713,30 @@ class _BrowserPageState extends State<BrowserPage>
     }
   }
 
-  Future<void> _persistAdBlockPref(bool enabled) async {
-    final file = _prefsFile;
-    if (file == null) return;
+  /// Writes flat keys; a null value removes that key. Returns null on success
+  /// so the WebDAV sheet can show the failure instead of pretending it stored.
+  Future<String?> _setPrefs(Map<String, Object?> values) async {
+    final file = await _prefsFile();
+    if (file == null) return '找不到 App 的 Documents 目录';
     try {
       final prefs = await _readPrefs();
-      prefs['adBlockEnabled'] = enabled;
+      values.forEach((key, value) {
+        if (value == null) {
+          prefs.remove(key);
+        } else {
+          prefs[key] = value;
+        }
+      });
       await file.parent.create(recursive: true);
       await file.writeAsString(jsonEncode(prefs));
-    } on Object {
-      // The switch still applies for this run.
+      return null;
+    } on Object catch (error) {
+      return '$error';
     }
+  }
+
+  Future<void> _persistAdBlockPref(bool enabled) async {
+    await _setPrefs(<String, Object?>{'adBlockEnabled': enabled});
   }
 
   Future<void> _bootAdBlock() async {
@@ -767,7 +851,11 @@ class _BrowserPageState extends State<BrowserPage>
       barrierColor: AppColors.ink.withAlpha(88),
       builder: (_) => ResourceSheet(
         controller: _browser,
+        history: _sniff,
         userAgent: _effectiveUserAgent,
+        webdavSummary: _webdav.summary,
+        webdavReady: _webdav.ready,
+        initialToWebDav: _sniffToWebDav,
         onLoadVariants: (resource) => _downloads.loadVariants(
           resource.url,
           userAgent: _effectiveUserAgent,
@@ -781,11 +869,20 @@ class _BrowserPageState extends State<BrowserPage>
       return;
     }
     if (result.downloads.isEmpty) return;
+    if (result.webdav != _sniffToWebDav) {
+      setState(() => _sniffToWebDav = result.webdav);
+      unawaited(_setPrefs(<String, Object?>{'sniffToWebDav': result.webdav}));
+    }
     _downloads.enqueueAll(
       result.downloads,
       userAgent: _effectiveUserAgent,
+      webdav: result.webdav && _webdav.ready,
     );
-    _snack('已加入下载队列：${result.downloads.length} 项');
+    _snack(
+      result.webdav && _webdav.ready
+          ? '已加入上传队列：${result.downloads.length} 项 · ${_webdav.summary}'
+          : '已加入下载队列：${result.downloads.length} 项',
+    );
     unawaited(_openDownloads());
   }
 
@@ -809,10 +906,14 @@ class _BrowserPageState extends State<BrowserPage>
     switch (item.status) {
       case DownloadStatus.saved:
         _snack('已存入相册：${item.displayName}');
+      case DownloadStatus.uploaded:
+        _snack('已传到服务器：${item.webdavPath ?? item.displayName}');
       case DownloadStatus.failed:
         _snack('下载失败：${item.displayName}');
       case DownloadStatus.downloaded:
-        _snack('已下载，但未存入相册：${item.displayName}');
+        _snack(item.webdavError == null
+            ? '已下载，但未存入相册：${item.displayName}'
+            : 'WebDAV 未完成：${item.webdavError}');
       default:
         break;
     }
@@ -836,6 +937,7 @@ class _BrowserPageState extends State<BrowserPage>
         uaLabels: <String>[for (final preset in _uaPresets) preset.label],
         adBlockEnabled: _adBlockEnabled,
         adBlockStatus: _adBlockStatusLabel,
+        webDavSummary: _webdav.summary,
         bookmarkCount: _bookmarks.length,
         downloadCount: _downloads.items.length,
         canSaveBookmark: _hasDocument,
@@ -884,6 +986,9 @@ class _BrowserPageState extends State<BrowserPage>
         return;
       case SettingsAction.openDownloads:
         unawaited(_openDownloads());
+        return;
+      case SettingsAction.openWebDav:
+        await _openWebDavSettings();
         return;
       case null:
         break;

@@ -160,6 +160,12 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Set :LSSupportsOpeningDocumentsInPlace true" "$PLIST" 2>/dev/null || true
+          # iOS 14+ silently blocks LAN sockets without this usage description.
+          /usr/libexec/PlistBuddy -c "Set :NSLocalNetworkUsageDescription 把嗅探到的文件上传到你局域网里的 WebDAV 服务器（例如 NAS / OpenList）。" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 把嗅探到的文件上传到你局域网里的 WebDAV 服务器（例如 NAS / OpenList）。" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSBonjourServices array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSBonjourServices:0 string _webdav._tcp" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSBonjourServices:1 string _http._tcp" "$PLIST" 2>/dev/null || true
 
       - name: CocoaPods install
         run: cd ios && pod install

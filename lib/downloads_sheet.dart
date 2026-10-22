@@ -23,7 +23,13 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
   int _tab = 0;
   List<OfflineFile>? _offline;
 
+  /// One offline file at a time: the sheet shows a bar on that row only.
+  String? _uploadingPath;
+  double? _uploadProgress;
+
   DownloadManager get _manager => widget.manager;
+
+  bool get _webDavReady => _manager.webdavConfig?.ready ?? false;
 
   @override
   void initState() {
@@ -341,7 +347,7 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
       if (files == null) return '正在读取 App 内的文件…';
       if (files.isEmpty) return 'App 内还没有文件';
       return '${files.length} 个文件 · ${formatBytes(_offlineTotal)} · '
-          '已存入相册的原件仍在这里';
+          '${_webDavReady ? '可传到 ${_manager.webdavConfig?.summary ?? ''}' : '已存相册的原件仍在这里'}';
     }
     if (_manager.items.isEmpty) return '图片和视频下载后自动存入相册';
     return '${_manager.items.length} 项 · '
@@ -379,6 +385,35 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
     );
   }
 
+  Future<void> _uploadOffline(OfflineFile file) async {
+    if (_uploadingPath != null) return;
+    setState(() {
+      _uploadingPath = file.path;
+      _uploadProgress = null;
+    });
+    final error = await _manager.uploadOffline(
+      file,
+      onProgress: (sent, total) {
+        if (!mounted || total <= 0) return;
+        setState(() => _uploadProgress = (sent / total).clamp(0.0, 1.0));
+      },
+    );
+    if (!mounted) return;
+    setState(() {
+      _uploadingPath = null;
+      _uploadProgress = null;
+    });
+    if (error != null) {
+      await _notice('上传失败', error);
+      return;
+    }
+    await _notice(
+      '已传到服务器',
+      '${file.displayName} 已上传到 ${_manager.webdavConfig?.summary ?? ''}，'
+      '本地副本保留。',
+    );
+  }
+
   Widget _buildOffline() {
     final files = _offline;
     if (files == null) {
@@ -400,6 +435,7 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
       separatorBuilder: (_, __) => const SizedBox(height: 7),
       itemBuilder: (context, index) {
         final file = files[index];
+        final uploading = _uploadingPath == file.path;
         return _OfflineTile(
           file: file,
           onOpen: file.isImage
@@ -409,6 +445,11 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                   : null,
           onShare: () => unawaited(_shareOffline(file)),
           onDelete: () => unawaited(_deleteOffline(file)),
+          onUpload: _webDavReady && !uploading
+              ? () => unawaited(_uploadOffline(file))
+              : null,
+          uploading: uploading,
+          progress: _uploadProgress,
         );
       },
     );
@@ -495,10 +536,17 @@ class _DownloadTile extends StatelessWidget {
       DownloadStatus.running => item.sizeLabel,
       DownloadStatus.saving =>
         item.hls ? '分片已下载，正在合并成 MP4…' : item.sizeLabel,
+      DownloadStatus.uploading => item.sizeLabel,
+      DownloadStatus.uploaded =>
+        '${item.webdavPath ?? '已传服务器'}'
+            '${item.webdavError == null ? '' : ' · ${item.webdavError}'}'
+            '${item.photoError == null ? '' : ' · ${item.photoError}'}',
       DownloadStatus.saved => '已存入相册${item.sizeLabel.isEmpty ? '' : ' · ${item.sizeLabel}'}',
-      DownloadStatus.downloaded => item.hls
-          ? (item.photoError ?? '视频已下载，未存入相册')
-          : (item.photoError ?? '文件已下载，未存入相册'),
+      DownloadStatus.downloaded =>
+        item.webdavError ??
+        (item.hls
+            ? (item.photoError ?? '视频已下载，未存入相册')
+            : (item.photoError ?? '文件已下载，未存入相册')),
       DownloadStatus.failed => item.error ?? '下载失败',
       DownloadStatus.cancelled => '已取消',
       DownloadStatus.queued => '等待前面的任务',
@@ -540,6 +588,7 @@ class _DownloadTile extends StatelessWidget {
                           if (item.hlsVariantLabel != null)
                             item.hlsVariantLabel!,
                           if (item.host.isNotEmpty) item.host,
+                          if (item.webdav) '传服务器',
                         ].join(' · '),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -599,8 +648,7 @@ class _DownloadTile extends StatelessWidget {
                   ),
               ],
             ),
-            if (item.status == DownloadStatus.running ||
-                item.status == DownloadStatus.saving)
+            if (item.status.active && item.status != DownloadStatus.queued)
               Padding(
                 padding: const EdgeInsets.fromLTRB(38, 7, 6, 0),
                 child: ClipRRect(
@@ -630,6 +678,16 @@ class _DownloadTile extends StatelessWidget {
       ),
       DownloadStatus.downloaded => (
         Icons.download_done_rounded,
+        AppColors.ink,
+        AppColors.wash,
+      ),
+      DownloadStatus.uploaded => (
+        Icons.cloud_done_rounded,
+        AppColors.signalInk,
+        AppColors.signal,
+      ),
+      DownloadStatus.uploading => (
+        Icons.cloud_upload_outlined,
         AppColors.ink,
         AppColors.wash,
       ),
@@ -669,12 +727,20 @@ class _OfflineTile extends StatelessWidget {
     required this.onOpen,
     required this.onShare,
     required this.onDelete,
+    this.onUpload,
+    this.uploading = false,
+    this.progress,
   });
 
   final OfflineFile file;
   final VoidCallback? onOpen;
   final VoidCallback onShare;
   final VoidCallback onDelete;
+
+  /// Null when no WebDAV target is configured.
+  final VoidCallback? onUpload;
+  final bool uploading;
+  final double? progress;
 
   @override
   Widget build(BuildContext context) {
@@ -690,65 +756,96 @@ class _OfflineTile extends StatelessWidget {
             border: Border.all(color: AppColors.line),
             borderRadius: BorderRadius.circular(13),
           ),
-          child: Row(
+          child: Column(
             children: <Widget>[
-              _thumbnail(),
-              const SizedBox(width: 9),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      file.displayName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
-                      ),
+              Row(
+                children: <Widget>[
+                  _thumbnail(),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          file.displayName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          [
+                            if (file.isVideo)
+                              '视频'
+                            else if (file.isImage)
+                              '图片'
+                            else
+                              '文件',
+                            file.sizeLabel,
+                            _dateLabel(file.modified),
+                            if (uploading) '上传中',
+                          ].join(' · '),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 9,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 4),
-                    Text(
-                      [
-                        if (file.isVideo)
-                          '视频'
-                        else if (file.isImage)
-                          '图片'
-                        else
-                          '文件',
-                        file.sizeLabel,
-                        _dateLabel(file.modified),
-                      ].join(' · '),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 9,
-                        color: AppColors.muted,
-                      ),
+                  ),
+                  if (onOpen != null)
+                    _MiniButton(
+                      icon: file.isImage
+                          ? Icons.zoom_in_rounded
+                          : Icons.play_circle_outline_rounded,
+                      tooltip: file.isImage ? '查看' : '播放',
+                      onTap: onOpen!,
                     ),
-                  ],
+                  const SizedBox(width: 4),
+                  if (onUpload != null || uploading)
+                    uploading
+                        ? const _MiniButton(
+                            icon: Icons.cloud_upload_outlined,
+                            tooltip: '正在上传',
+                            busy: true,
+                          )
+                        : _MiniButton(
+                            icon: Icons.cloud_upload_outlined,
+                            tooltip: '传到 WebDAV',
+                            onTap: onUpload!,
+                          ),
+                  if (onUpload != null || uploading) const SizedBox(width: 4),
+                  _MiniButton(
+                    icon: Icons.ios_share_rounded,
+                    tooltip: '导出到文件',
+                    onTap: onShare,
+                  ),
+                  const SizedBox(width: 4),
+                  _MiniButton(
+                    icon: Icons.delete_outline_rounded,
+                    tooltip: '删除本地文件',
+                    onTap: onDelete,
+                  ),
+                ],
+              ),
+              if (uploading)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(4, 6, 6, 0),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(2),
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 3,
+                      color: AppColors.ink,
+                      backgroundColor: AppColors.wash,
+                    ),
+                  ),
                 ),
-              ),
-              if (onOpen != null)
-                _MiniButton(
-                  icon: file.isImage
-                      ? Icons.zoom_in_rounded
-                      : Icons.play_circle_outline_rounded,
-                  tooltip: file.isImage ? '查看' : '播放',
-                  onTap: onOpen!,
-                ),
-              const SizedBox(width: 4),
-              _MiniButton(
-                icon: Icons.ios_share_rounded,
-                tooltip: '导出到文件',
-                onTap: onShare,
-              ),
-              const SizedBox(width: 4),
-              _MiniButton(
-                icon: Icons.delete_outline_rounded,
-                tooltip: '删除本地文件',
-                onTap: onDelete,
-              ),
             ],
           ),
         ),
@@ -882,12 +979,16 @@ class _MiniButton extends StatelessWidget {
   const _MiniButton({
     required this.icon,
     required this.tooltip,
-    required this.onTap,
+    this.onTap,
+    this.busy = false,
   });
 
   final IconData icon;
   final String tooltip;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
+
+  /// Greyed-out spinner slot for an action that is already running.
+  final bool busy;
 
   @override
   Widget build(BuildContext context) {
@@ -902,7 +1003,15 @@ class _MiniButton extends StatelessWidget {
           child: SizedBox(
             width: 29,
             height: 29,
-            child: Icon(icon, size: 15, color: AppColors.muted),
+            child: busy
+                ? const Padding(
+                    padding: EdgeInsets.all(7),
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: AppColors.muted,
+                    ),
+                  )
+                : Icon(icon, size: 15, color: AppColors.muted),
           ),
         ),
       ),

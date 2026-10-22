@@ -301,3 +301,66 @@ final class SniffedResource {
 })()
 ''';
 }
+
+/// Accumulates sniff results across rescans so an album that drops old images
+/// from its DOM does not drop them from the picker.
+///
+/// Off by default: without history the sheet always mirrors exactly what the
+/// current page has loaded, which is what people expect. Turning it on makes
+/// the list grow over navigations until it is cleared or turned back off.
+final class SniffHistory {
+  SniffHistory({this.onChanged});
+
+  /// Called after the record flag or the stored set changes, so the host can
+  /// persist the switch.
+  final void Function()? onChanged;
+
+  static const int _limit = 800;
+
+  bool _record = false;
+  final List<SniffedResource> _items = <SniffedResource>[];
+  final Set<String> _keys = <String>{};
+
+  bool get record => _record;
+
+  /// Turning history off discards what was accumulated, so a leftover long
+  /// list from a previous session can never be mistaken for the current page.
+  set record(bool value) {
+    if (_record == value) return;
+    _record = value;
+    if (!value) clear(notify: false);
+    onChanged?.call();
+  }
+
+  List<SniffedResource> get items => List<SniffedResource>.unmodifiable(_items);
+  int get length => _items.length;
+  bool get isEmpty => _items.isEmpty;
+
+  void clear({bool notify = true}) {
+    if (_items.isEmpty && _keys.isEmpty) return;
+    _items.clear();
+    _keys.clear();
+    if (notify) onChanged?.call();
+  }
+
+  /// The list the sheet should show: history when recording, otherwise exactly
+  /// what this scan found.
+  List<SniffedResource> merge(List<SniffedResource> scanned) {
+    if (!_record) {
+      _items.clear();
+      _keys.clear();
+      return scanned;
+    }
+    for (final item in scanned) {
+      final key = '${item.kind.name}\n${item.url}';
+      if (_keys.contains(key)) continue;
+      _keys.add(key);
+      _items.add(item);
+    }
+    while (_items.length > _limit) {
+      final oldest = _items.removeAt(0);
+      _keys.remove('${oldest.kind.name}\n${oldest.url}');
+    }
+    return List<SniffedResource>.unmodifiable(_items);
+  }
+}

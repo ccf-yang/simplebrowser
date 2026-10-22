@@ -5,7 +5,13 @@ import 'package:flutter/material.dart';
 import 'theme.dart';
 
 /// A browsing action chosen from the sheet instead of "Save & reload".
-enum SettingsAction { goHome, saveBookmark, openBookmarks, openDownloads }
+enum SettingsAction {
+  goHome,
+  saveBookmark,
+  openBookmarks,
+  openDownloads,
+  openWebDav,
+}
 
 /// Values collected by the settings sheet.
 ///
@@ -52,6 +58,7 @@ class SettingsSheet extends StatefulWidget {
     required this.onBlockExternalChanged,
     required this.adBlockEnabled,
     this.adBlockStatus = '',
+    this.webDavSummary = '未配置',
     this.bookmarkCount = 0,
     this.downloadCount = 0,
     this.canSaveBookmark = false,
@@ -66,6 +73,10 @@ class SettingsSheet extends StatefulWidget {
   /// `53283 rules ready` or `compile failed`.
   final bool adBlockEnabled;
   final String adBlockStatus;
+
+  /// Where sniffed resources go when "存到 WebDAV" is on. Tapping the row opens
+  /// the config sheet, which saves itself, so this one closes with an action.
+  final String webDavSummary;
   final int bookmarkCount;
   final int downloadCount;
   final bool canSaveBookmark;
@@ -205,6 +216,15 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   const SizedBox(height: 8),
                   _buildAdBlockSwitch(),
                   const SizedBox(height: 14),
+                  const _FieldLabel('Storage'),
+                  const SizedBox(height: 5),
+                  _IdentityTile(
+                    title: 'WebDAV 存储',
+                    icon: Icons.cloud_outlined,
+                    summary: widget.webDavSummary,
+                    onTap: () => _save(SettingsAction.openWebDav),
+                  ),
+                  const SizedBox(height: 14),
                   const _FieldLabel('Browsing'),
                   const SizedBox(height: 5),
                   Row(
@@ -315,10 +335,17 @@ class _IdentityValues {
 
 /// Settings row that opens the request-identity sheet.
 class _IdentityTile extends StatelessWidget {
-  const _IdentityTile({required this.summary, required this.onTap});
+  const _IdentityTile({
+    required this.summary,
+    required this.onTap,
+    this.title = 'User-Agent · Referer · Cookie',
+    this.icon = Icons.badge_outlined,
+  });
 
   final String summary;
   final VoidCallback onTap;
+  final String title;
+  final IconData icon;
 
   @override
   Widget build(BuildContext context) {
@@ -336,19 +363,15 @@ class _IdentityTile extends StatelessWidget {
           ),
           child: Row(
             children: <Widget>[
-              const Icon(
-                Icons.badge_outlined,
-                size: 17,
-                color: AppColors.ink2,
-              ),
+              Icon(icon, size: 17, color: AppColors.ink2),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                    const Text(
-                      'User-Agent · Referer · Cookie',
-                      style: TextStyle(
+                    Text(
+                      title,
+                      style: const TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
                       ),

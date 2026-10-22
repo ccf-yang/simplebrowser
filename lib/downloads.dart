@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 
 import 'hls.dart';
 import 'resources.dart';
+import 'webdav.dart';
 
 enum DownloadStatus {
   queued,
@@ -17,6 +18,8 @@ enum DownloadStatus {
   saving,
   saved,
   downloaded,
+  uploading,
+  uploaded,
   failed,
   cancelled,
 }
@@ -28,6 +31,8 @@ extension DownloadStatusLabel on DownloadStatus {
     DownloadStatus.saving => '正在处理视频',
     DownloadStatus.saved => '已存相册',
     DownloadStatus.downloaded => '已下载',
+    DownloadStatus.uploading => '上传中',
+    DownloadStatus.uploaded => '已传服务器',
     DownloadStatus.failed => '失败',
     DownloadStatus.cancelled => '已取消',
   };
@@ -35,13 +40,15 @@ extension DownloadStatusLabel on DownloadStatus {
   bool get terminal =>
       this == DownloadStatus.saved ||
       this == DownloadStatus.downloaded ||
+      this == DownloadStatus.uploaded ||
       this == DownloadStatus.failed ||
       this == DownloadStatus.cancelled;
 
   bool get active =>
       this == DownloadStatus.queued ||
       this == DownloadStatus.running ||
-      this == DownloadStatus.saving;
+      this == DownloadStatus.saving ||
+      this == DownloadStatus.uploading;
 }
 
 /// One queued item. Download bytes land in the app container first and are
@@ -66,6 +73,9 @@ final class DownloadItem {
     this.error,
     this.photoError,
     this.savedToPhotos = false,
+    this.webdav = false,
+    this.webdavPath,
+    this.webdavError,
   });
 
   final String id;
@@ -94,11 +104,28 @@ final class DownloadItem {
   String? error;
   String? photoError;
   bool savedToPhotos;
+
+  /// Send this to WebDAV once it is on local disk, then delete the local copy.
+  final bool webdav;
+  String? webdavPath;
+  String? webdavError;
+
+  /// Upload progress, kept apart from the download counters so a row can show
+  /// "downloading 4/9 MB" and later "uploading 2/9 MB" without lying.
+  int uploadSent = 0;
+  int? uploadTotal;
+
   CancelToken? cancelToken;
 
   String get host => Uri.tryParse(url)?.host ?? '';
 
   double? get progress {
+    if (webdav && uploadTotal != null) {
+      final value = uploadTotal!;
+      if (value > 0) {
+        return (uploadSent / value).clamp(0.0, 1.0).toDouble();
+      }
+    }
     final segments = segmentsTotal;
     if (segments != null && segments > 0) {
       return ((segmentsDone ?? 0) / segments).clamp(0.0, 1.0).toDouble();
@@ -109,6 +136,12 @@ final class DownloadItem {
   }
 
   String get sizeLabel {
+    if (webdav) {
+      final value = uploadTotal;
+      if (value != null && value > 0) {
+        return '上传 ${formatBytes(uploadSent)} / ${formatBytes(value)}';
+      }
+    }
     final segments = segmentsTotal;
     if (segments != null) {
       return '${formatBytes(received)} · ${segmentsDone ?? 0}/$segments 段';
@@ -151,6 +184,9 @@ final class DownloadItem {
     'error': error,
     'photoError': photoError,
     'savedToPhotos': savedToPhotos,
+    'webdav': webdav,
+    'webdavPath': webdavPath,
+    'webdavError': webdavError,
     'hls': hls,
     'hlsVariant': hlsVariant,
     'hlsVariantLabel': hlsVariantLabel,
@@ -187,6 +223,9 @@ final class DownloadItem {
       error: json['error']?.toString(),
       photoError: json['photoError']?.toString(),
       savedToPhotos: json['savedToPhotos'] == true,
+      webdav: json['webdav'] == true,
+      webdavPath: json['webdavPath']?.toString(),
+      webdavError: json['webdavError']?.toString(),
     );
   }
 
@@ -267,6 +306,10 @@ final class DownloadManager extends ChangeNotifier {
   /// Called once per item when it reaches a terminal state, on the UI isolate.
   final void Function(DownloadItem item)? onFinished;
 
+  /// Target for items flagged `webdav`. Null or unconfigured means those items
+  /// fail with a hint instead of silently staying local.
+  WebDavConfig? webdavConfig;
+
   static const MethodChannel _media =
       MethodChannel('browser_http/media');
 
@@ -298,6 +341,10 @@ final class DownloadManager extends ChangeNotifier {
     if (path == null) _documentsDirPending = null;
     return path;
   }
+
+  /// The app's Documents directory. iOS gives no usable `$HOME`, so anything
+  /// the page stores as JSON resolves its path through here instead.
+  Future<String?> documentsDirectory() => _documentsPath();
 
   Future<String?> _resolveDocumentsPath() async {
     String? path;
@@ -346,7 +393,11 @@ final class DownloadManager extends ChangeNotifier {
         final item = DownloadItem.fromJson(entry);
         if (item == null) continue;
         final path = item.path;
-        if (path == null || !await File(path).exists()) continue;
+        final missing = path == null || !await File(path).exists();
+        // An uploaded row deliberately has no local file any more: the record
+        // is the remote path, so it survives the restart.
+        if (missing && item.status != DownloadStatus.uploaded) continue;
+        if (missing) item.path = null;
         if (item.status.active) item.status = DownloadStatus.downloaded;
         restored.add(item);
         if (restored.length >= 120) break;
@@ -361,7 +412,11 @@ final class DownloadManager extends ChangeNotifier {
     }
   }
 
-  void enqueueAll(Iterable<SniffedResource> resources, {String? userAgent}) {
+  void enqueueAll(
+    Iterable<SniffedResource> resources, {
+    String? userAgent,
+    bool webdav = false,
+  }) {
     var added = 0;
     for (final resource in resources) {
       final item = DownloadItem(
@@ -375,6 +430,7 @@ final class DownloadManager extends ChangeNotifier {
         hls: resource.hls,
         hlsVariant: resource.hlsVariantUrl,
         hlsVariantLabel: resource.hlsVariantLabel,
+        webdav: webdav,
       );
       items.insert(0, item);
       _queue.add(item);
@@ -408,6 +464,9 @@ final class DownloadManager extends ChangeNotifier {
       ..error = null
       ..photoError = null
       ..savedToPhotos = false
+      ..webdavError = null
+      ..uploadSent = 0
+      ..uploadTotal = null
       ..cancelToken = null;
     _queue.add(item);
     _notify(force: true);
@@ -628,6 +687,9 @@ final class DownloadManager extends ChangeNotifier {
       ..error = null
       ..photoError = null
       ..savedToPhotos = false
+      ..webdavError = null
+      ..uploadSent = 0
+      ..uploadTotal = null
       ..cancelToken = token;
     _notify(force: true);
 
@@ -653,25 +715,10 @@ final class DownloadManager extends ChangeNotifier {
 
       if (token.isCancelled) throw const _DownloadCancelled();
 
-      item.status = DownloadStatus.saving;
-      _notify(force: true);
-      if (hlsResult != null && !hlsResult.saveable) {
-        item
-          ..status = DownloadStatus.downloaded
-          ..photoError = hlsResult.note;
+      if (item.webdav) {
+        await _uploadStage(item, file);
       } else {
-        final saved = await _saveToPhotos(file, item);
-        if (saved == 'ok') {
-          item
-            ..status = DownloadStatus.saved
-            ..savedToPhotos = true;
-        } else {
-          item
-            ..status = DownloadStatus.downloaded
-            ..photoError = saved == 'denied'
-                ? '相册权限未开启，文件留在 App 内'
-                : '存相册失败：$saved';
-        }
+        await _saveLocally(item, file, hlsResult);
       }
     } on Object catch (error) {
       final cancelled = token.isCancelled || error is _DownloadCancelled;
@@ -694,6 +741,173 @@ final class DownloadManager extends ChangeNotifier {
       _notify(force: true);
       onFinished?.call(item);
     }
+  }
+
+  /// Photos is the default landing spot; HLS results that the native remuxer
+  /// refused to write stay in the app directory with the reason on the row.
+  Future<void> _saveLocally(
+    DownloadItem item,
+    File file,
+    _MediaFile? hlsResult,
+  ) async {
+    item.status = DownloadStatus.saving;
+    _notify(force: true);
+    if (hlsResult != null && !hlsResult.saveable) {
+      item
+        ..status = DownloadStatus.downloaded
+        ..photoError = hlsResult.note;
+      return;
+    }
+    final saved = await _saveToPhotos(file, item);
+    if (saved == 'ok') {
+      item
+        ..status = DownloadStatus.saved
+        ..savedToPhotos = true;
+    } else {
+      item
+        ..status = DownloadStatus.downloaded
+        ..photoError = saved == 'denied'
+            ? '相册权限未开启，文件留在 App 内'
+            : '存相册失败：$saved';
+    }
+  }
+
+  /// Download finished locally, now push it to the server and drop the local
+  /// copy. Failures keep the file in the app so nothing is lost on a bad token
+  /// or an asleep NAS; the row says why.
+  Future<void> _uploadStage(DownloadItem item, File file) async {
+    final config = webdavConfig;
+    if (config == null || !config.ready) {
+      item
+        ..status = DownloadStatus.downloaded
+        ..webdavError = '未配置 WebDAV 地址，文件留在 App 内';
+      return;
+    }
+    item.status = DownloadStatus.uploading;
+    _notify(force: true);
+    final failure = await _push(
+      config,
+      file.path,
+      _remoteNameFor(item, file),
+      onProgress: (sent, total) {
+        if (item.cancelToken?.isCancelled ?? false) {
+          throw const _DownloadCancelled();
+        }
+        item
+          ..uploadSent = sent
+          ..uploadTotal = total;
+        _notify();
+      },
+      onDone: (remote, skipped) {
+        item
+          ..webdavPath = remote
+          ..webdavError = skipped ? '服务器已有同名同大小文件，未重复上传' : null;
+      },
+    );
+    if (failure != null) {
+      item
+        ..status = DownloadStatus.downloaded
+        ..webdavError = failure;
+      return;
+    }
+    await _finishUpload(item, file, config);
+  }
+
+  /// Optional Photos copy first, then remove the local file. `path` goes null
+  /// so the offline library and the player stop pointing at a deleted file.
+  Future<void> _finishUpload(
+    DownloadItem item,
+    File file,
+    WebDavConfig config,
+  ) async {
+    if (config.alsoPhotos && await file.exists()) {
+      final saved = await _saveToPhotos(file, item);
+      if (saved != 'ok') {
+        item.photoError = saved == 'denied'
+            ? '相册权限未开启'
+            : '存相册失败：$saved';
+      } else {
+        item.savedToPhotos = true;
+      }
+    }
+    if (await file.exists()) {
+      try {
+        await file.delete();
+      } on Object {
+        // The upload succeeded; a stuck temp file is not worth failing the row.
+      }
+    }
+    item
+      ..path = null
+      ..uploadSent = item.uploadTotal ?? item.uploadSent
+      ..status = DownloadStatus.uploaded;
+    _notify(force: true);
+  }
+
+  String _remoteNameFor(DownloadItem item, File file) {
+    final segments = file.uri.pathSegments;
+    final raw = segments.isEmpty ? item.fileName : segments.last;
+    final match = RegExp(r'^\d{13}_').firstMatch(raw);
+    return match == null ? raw : raw.substring(match.end);
+  }
+
+  /// Shared upload path: build the target directory, skip an identical file,
+  /// otherwise pick a non-colliding name and stream it up. Null means stored.
+  Future<String?> _push(
+    WebDavConfig config,
+    String localPath,
+    String name, {
+    void Function(int sent, int total)? onProgress,
+    void Function(String remote, bool skipped)? onDone,
+  }) async {
+    WebDavClient? client;
+    try {
+      client = WebDavClient(config);
+      final dir = normalizeRemotePath(config.savePath);
+      await client.ensureDir(dir);
+      final size = await File(localPath).length();
+      final target = joinRemote(dir, name);
+      final existing = await client.stat(target);
+      var remote = target;
+      var skipped = false;
+      if (existing != null) {
+        if (existing == size) {
+          skipped = true;
+        } else {
+          remote = await client.uniquePath(dir, name);
+        }
+      }
+      if (!skipped) {
+        await client.uploadFile(localPath, remote, onProgress: onProgress);
+      }
+      onDone?.call(remote, skipped);
+      return null;
+    } on _DownloadCancelled {
+      // Let the queue's own cleanup delete the local file and mark cancelled.
+      rethrow;
+    } on WebDavException catch (error) {
+      return error.message;
+    } on Object catch (error) {
+      return _friendlyError(error);
+    } finally {
+      client?.close();
+    }
+  }
+
+  /// Upload a file the offline library already has on disk. Returns null on
+  /// success, or the reason it did not land. The local copy is kept.
+  Future<String?> uploadOffline(
+    OfflineFile file, {
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    final config = webdavConfig;
+    if (config == null || !config.ready) return '未配置 WebDAV 地址';
+    return _push(
+      config,
+      file.path,
+      file.displayName,
+      onProgress: onProgress,
+    );
   }
 
   /// Direct file download with as much parallelism as the server allows.
