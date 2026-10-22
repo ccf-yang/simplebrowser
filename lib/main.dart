@@ -388,11 +388,6 @@ class _BrowserPageState extends State<BrowserPage>
           url != 'about:blank') {
         _urlController.text = url;
       }
-      // A link tap must clear the start page even when its load fails, or the
-      // mask keeps covering a WebView that has its own error to show.
-      if (!_started && _browser.url != null && _browser.url != 'about:blank') {
-        _started = true;
-      }
     });
 
     // A refresh keeps the URL, so this alone would miss it; the navigation
