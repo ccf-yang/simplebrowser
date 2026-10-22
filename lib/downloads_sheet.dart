@@ -1,16 +1,165 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'downloads.dart';
 import 'resources.dart';
 import 'theme.dart';
 
-/// Download queue and history. Completed image/video files are already in
-/// Photos; this list is the record of what happened and what still needs a
-/// retry.
-class DownloadsSheet extends StatelessWidget {
+/// Download queue plus the files that actually live in the app container.
+///
+/// Saving to Photos leaves the original behind; the offline tab is where the
+/// user can replay, export or delete those originals and see what they cost.
+class DownloadsSheet extends StatefulWidget {
   const DownloadsSheet({super.key, required this.manager});
 
   final DownloadManager manager;
+
+  @override
+  State<DownloadsSheet> createState() => _DownloadsSheetState();
+}
+
+class _DownloadsSheetState extends State<DownloadsSheet> {
+  int _tab = 0;
+  List<OfflineFile>? _offline;
+
+  DownloadManager get _manager => widget.manager;
+
+  @override
+  void initState() {
+    super.initState();
+    // Read once up front so the tab can show its count without a spinner.
+    unawaited(_loadOffline());
+  }
+
+  int get _offlineTotal => (_offline ?? const <OfflineFile>[])
+      .fold<int>(0, (sum, file) => sum + file.size);
+
+  Future<void> _loadOffline() async {
+    final files = await _manager.listOffline();
+    if (!mounted) return;
+    setState(() => _offline = files);
+  }
+
+  void _selectTab(int tab) {
+    if (_tab == tab) return;
+    setState(() => _tab = tab);
+    if (tab == 1) unawaited(_loadOffline());
+  }
+
+  Future<void> _notice(String title, String message) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text(
+          title,
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+        ),
+        content: Text(
+          message,
+          style: const TextStyle(fontSize: 12, height: 1.5),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('好'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _playOffline(OfflineFile file) async {
+    final error = await _manager.playPath(file.path);
+    if (error != null) await _notice('播放失败', error);
+  }
+
+  Future<void> _shareOffline(OfflineFile file) async {
+    final error = await _manager.sharePath(file.path);
+    if (error != null) await _notice('导出失败', error);
+  }
+
+  Future<void> _deleteOffline(OfflineFile file) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text(
+          '删除本地文件？',
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+        ),
+        content: Text(
+          '${file.displayName}\n'
+          '${file.sizeLabel} · 删除后无法恢复，已存入相册的副本不受影响。',
+          style: const TextStyle(fontSize: 12, height: 1.5),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: AppColors.danger),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    final error = await _manager.deleteOffline(file);
+    if (error != null) {
+      await _notice('删除失败', error);
+      return;
+    }
+    await _loadOffline();
+  }
+
+  void _openImage(OfflineFile file) {
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withAlpha(230),
+      builder: (context) {
+        return Stack(
+          children: <Widget>[
+            Positioned.fill(
+              child: GestureDetector(
+                onTap: () => Navigator.of(context).pop(),
+                child: InteractiveViewer(
+                  maxScale: 4,
+                  child: Center(
+                    child: Image.file(file.file, fit: BoxFit.contain),
+                  ),
+                ),
+              ),
+            ),
+            SafeArea(
+              child: Align(
+                alignment: Alignment.topRight,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Material(
+                    color: Colors.white.withAlpha(30),
+                    shape: const CircleBorder(),
+                    child: IconButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        size: 20,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -23,7 +172,7 @@ class DownloadsSheet extends StatelessWidget {
       child: SafeArea(
         top: false,
         child: ListenableBuilder(
-          listenable: manager,
+          listenable: _manager,
           builder: (context, _) {
             return Column(
               children: <Widget>[
@@ -39,7 +188,7 @@ class DownloadsSheet extends StatelessWidget {
                   ),
                 ),
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 12, 12, 8),
+                  padding: const EdgeInsets.fromLTRB(18, 12, 12, 6),
                   child: Row(
                     children: <Widget>[
                       Expanded(
@@ -56,11 +205,7 @@ class DownloadsSheet extends StatelessWidget {
                             ),
                             const SizedBox(height: 3),
                             Text(
-                              manager.items.isEmpty
-                                  ? '图片和视频下载后自动存入相册'
-                                  : '${manager.items.length} 项 · '
-                                      '${manager.activeCount} 进行中 · '
-                                      '${manager.finishedCount} 已完成',
+                              _subtitle(),
                               style: const TextStyle(
                                 fontSize: 10,
                                 color: AppColors.muted,
@@ -69,12 +214,19 @@ class DownloadsSheet extends StatelessWidget {
                           ],
                         ),
                       ),
-                      TextButton(
-                        onPressed: manager.finishedCount == 0
-                            ? null
-                            : manager.clearFinished,
-                        child: const Text('Clear'),
-                      ),
+                      if (_tab == 0)
+                        TextButton(
+                          onPressed: _manager.finishedCount == 0
+                              ? null
+                              : _manager.clearFinished,
+                          child: const Text('Clear'),
+                        )
+                      else
+                        _MiniButton(
+                          icon: Icons.refresh_rounded,
+                          tooltip: '重新扫描',
+                          onTap: () => unawaited(_loadOffline()),
+                        ),
                       const SizedBox(width: 4),
                       _CloseButton(
                         onTap: () => Navigator.of(context).pop(),
@@ -82,56 +234,166 @@ class DownloadsSheet extends StatelessWidget {
                     ],
                   ),
                 ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 0, 14, 10),
+                  child: Row(
+                    children: <Widget>[
+                      _TabChip(
+                        label: '任务',
+                        count: _manager.items.length,
+                        active: _tab == 0,
+                        onTap: () => _selectTab(0),
+                      ),
+                      const SizedBox(width: 7),
+                      _TabChip(
+                        label: '离线库',
+                        count: _offline?.length,
+                        active: _tab == 1,
+                        onTap: () => _selectTab(1),
+                      ),
+                    ],
+                  ),
+                ),
                 const Divider(height: 1),
                 Expanded(
-                  child: manager.items.isEmpty
-                      ? const _EmptyDownloads()
-                      : ListView.separated(
-                          padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
-                          itemCount: manager.items.length,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(height: 7),
-                          itemBuilder: (context, index) {
-                            final item = manager.items[index];
-                            return _DownloadTile(
-                              item: item,
-                              onCancel: () => manager.cancel(item),
-                              onRetry: () => manager.retry(item),
-                              onRemove: () => manager.remove(item),
-                              onPlay: !item.playable
-                                  ? null
-                                  : () async {
-                                      final error = await manager.play(item);
-                                      if (error != null && context.mounted) {
-                                        ScaffoldMessenger.of(context)
-                                            .showSnackBar(
-                                          SnackBar(
-                                            content: Text('播放失败：$error'),
-                                          ),
-                                        );
-                                      }
-                                    },
-                              onShare:
-                                  item.path == null || !item.status.terminal
-                                  ? null
-                                  : () async {
-                                      final error = await manager.share(item);
-                                      if (error != null && context.mounted) {
-                                        ScaffoldMessenger.of(context)
-                                            .showSnackBar(
-                                          SnackBar(
-                                            content: Text('导出失败：$error'),
-                                          ),
-                                        );
-                                      }
-                                    },
-                            );
-                          },
-                        ),
+                  child: _tab == 0 ? _buildQueue() : _buildOffline(),
                 ),
               ],
             );
           },
+        ),
+      ),
+    );
+  }
+
+  String _subtitle() {
+    if (_tab == 1) {
+      final files = _offline;
+      if (files == null) return '正在读取 App 内的文件…';
+      if (files.isEmpty) return 'App 内还没有文件';
+      return '${files.length} 个文件 · ${formatBytes(_offlineTotal)} · '
+          '已存入相册的原件仍在这里';
+    }
+    if (_manager.items.isEmpty) return '图片和视频下载后自动存入相册';
+    return '${_manager.items.length} 项 · '
+        '${_manager.activeCount} 进行中 · '
+        '${_manager.finishedCount} 已完成';
+  }
+
+  Widget _buildQueue() {
+    if (_manager.items.isEmpty) return const _EmptyDownloads();
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      itemCount: _manager.items.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 7),
+      itemBuilder: (context, index) {
+        final item = _manager.items[index];
+        return _DownloadTile(
+          item: item,
+          onCancel: () => _manager.cancel(item),
+          onRetry: () => _manager.retry(item),
+          onRemove: () => _manager.remove(item),
+          onPlay: !item.playable
+              ? null
+              : () async {
+                  final error = await _manager.play(item);
+                  if (error != null) await _notice('播放失败', error);
+                },
+          onShare: item.path == null || !item.status.terminal
+              ? null
+              : () async {
+                  final error = await _manager.share(item);
+                  if (error != null) await _notice('导出失败', error);
+                },
+        );
+      },
+    );
+  }
+
+  Widget _buildOffline() {
+    final files = _offline;
+    if (files == null) {
+      return const Center(
+        child: SizedBox(
+          width: 22,
+          height: 22,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: AppColors.ink,
+          ),
+        ),
+      );
+    }
+    if (files.isEmpty) return const _EmptyOffline();
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      itemCount: files.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 7),
+      itemBuilder: (context, index) {
+        final file = files[index];
+        return _OfflineTile(
+          file: file,
+          onOpen: file.isImage
+              ? () => _openImage(file)
+              : file.playable
+                  ? () => unawaited(_playOffline(file))
+                  : null,
+          onShare: () => unawaited(_shareOffline(file)),
+          onDelete: () => unawaited(_deleteOffline(file)),
+        );
+      },
+    );
+  }
+}
+
+class _TabChip extends StatelessWidget {
+  const _TabChip({
+    required this.label,
+    required this.count,
+    required this.active,
+    required this.onTap,
+  });
+
+  final String label;
+  final int? count;
+  final bool active;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final foreground = active ? AppColors.onInk : AppColors.muted;
+    return Material(
+      color: active ? AppColors.ink : AppColors.wash,
+      borderRadius: BorderRadius.circular(9),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(9),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w600,
+                  color: foreground,
+                ),
+              ),
+              if (count != null) ...<Widget>[
+                const SizedBox(width: 5),
+                Text(
+                  '$count',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    color: active ? AppColors.signal : AppColors.faint,
+                  ),
+                ),
+              ],
+            ],
+          ),
         ),
       ),
     );
@@ -332,6 +594,144 @@ class _DownloadTile extends StatelessWidget {
   }
 }
 
+class _OfflineTile extends StatelessWidget {
+  const _OfflineTile({
+    required this.file,
+    required this.onOpen,
+    required this.onShare,
+    required this.onDelete,
+  });
+
+  final OfflineFile file;
+  final VoidCallback? onOpen;
+  final VoidCallback onShare;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.card,
+      borderRadius: BorderRadius.circular(13),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(13),
+        onTap: onOpen,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(10, 9, 6, 9),
+          decoration: BoxDecoration(
+            border: Border.all(color: AppColors.line),
+            borderRadius: BorderRadius.circular(13),
+          ),
+          child: Row(
+            children: <Widget>[
+              _thumbnail(),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      file.displayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      [
+                        if (file.isVideo)
+                          '视频'
+                        else if (file.isImage)
+                          '图片'
+                        else
+                          '文件',
+                        file.sizeLabel,
+                        _dateLabel(file.modified),
+                      ].join(' · '),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 9,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (onOpen != null)
+                _MiniButton(
+                  icon: file.isImage
+                      ? Icons.zoom_in_rounded
+                      : Icons.play_circle_outline_rounded,
+                  tooltip: file.isImage ? '查看' : '播放',
+                  onTap: onOpen!,
+                ),
+              const SizedBox(width: 4),
+              _MiniButton(
+                icon: Icons.ios_share_rounded,
+                tooltip: '导出到文件',
+                onTap: onShare,
+              ),
+              const SizedBox(width: 4),
+              _MiniButton(
+                icon: Icons.delete_outline_rounded,
+                tooltip: '删除本地文件',
+                onTap: onDelete,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _thumbnail() {
+    final fallback = Container(
+      width: 38,
+      height: 38,
+      decoration: BoxDecoration(
+        color: AppColors.wash,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Icon(
+        file.isVideo
+            ? Icons.movie_outlined
+            : Icons.insert_drive_file_outlined,
+        size: 17,
+        color: AppColors.muted,
+      ),
+    );
+    if (!file.isImage) return fallback;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: Image.file(
+        file.file,
+        width: 38,
+        height: 38,
+        fit: BoxFit.cover,
+        cacheWidth: 152,
+        errorBuilder: (_, __, ___) => fallback,
+      ),
+    );
+  }
+
+  String _dateLabel(DateTime time) {
+    final local = time.toLocal();
+    final now = DateTime.now();
+    if (local.year == now.year &&
+        local.month == now.month &&
+        local.day == now.day) {
+      final hour = local.hour.toString().padLeft(2, '0');
+      final minute = local.minute.toString().padLeft(2, '0');
+      return '$hour:$minute';
+    }
+    if (local.year == now.year) return '${local.month}月${local.day}日';
+    return '${local.year}/${local.month}/${local.day}';
+  }
+}
+
 class _EmptyDownloads extends StatelessWidget {
   const _EmptyDownloads();
 
@@ -356,6 +756,45 @@ class _EmptyDownloads extends StatelessWidget {
             SizedBox(height: 5),
             Text(
               '打开网页后点右上角的资源按钮，勾选图片或视频。',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 10,
+                height: 1.5,
+                color: AppColors.muted,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptyOffline extends StatelessWidget {
+  const _EmptyOffline();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Padding(
+        padding: EdgeInsets.all(28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(
+              Icons.folder_open_rounded,
+              size: 36,
+              color: AppColors.faint,
+            ),
+            SizedBox(height: 10),
+            Text(
+              '离线库是空的',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+            SizedBox(height: 5),
+            Text(
+              '下载完成的图片和视频会留在 App 内。即使已经存进相册，'
+              '也能在这里播放、导出或删除。',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 10,

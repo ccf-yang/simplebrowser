@@ -110,13 +110,13 @@ final class DownloadItem {
   String get sizeLabel {
     final segments = segmentsTotal;
     if (segments != null) {
-      return '${_bytes(received)} · ${segmentsDone ?? 0}/$segments 段';
+      return '${formatBytes(received)} · ${segmentsDone ?? 0}/$segments 段';
     }
     final value = total;
     if (value == null || value <= 0) {
-      return received > 0 ? _bytes(received) : '';
+      return received > 0 ? formatBytes(received) : '';
     }
-    return '${_bytes(received)} / ${_bytes(value)}';
+    return '${formatBytes(received)} / ${formatBytes(value)}';
   }
 
   bool get playable {
@@ -129,14 +129,6 @@ final class DownloadItem {
         lower.endsWith('.m4v') ||
         lower.endsWith('.mov') ||
         lower.endsWith('.ts');
-  }
-
-  static String _bytes(int bytes) {
-    if (bytes >= 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    if (bytes >= 1024) return '${(bytes / 1024).round()} KB';
-    return '$bytes B';
   }
 
   String get displayName {
@@ -204,6 +196,63 @@ final class DownloadItem {
   }
 }
 
+/// Human readable byte count shared by the queue and the offline library.
+String formatBytes(int bytes) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+  if (bytes >= 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+  if (bytes >= 1024) return '${(bytes / 1024).round()} KB';
+  return '$bytes B';
+}
+
+/// One finished file sitting in `Documents/Downloads`.
+///
+/// The download list is history; this is the actual storage. Files stay here
+/// after being saved to Photos so they can be replayed, exported or deleted.
+final class OfflineFile {
+  const OfflineFile({
+    required this.file,
+    required this.name,
+    required this.size,
+    required this.modified,
+  });
+
+  final File file;
+  final String name;
+  final int size;
+  final DateTime modified;
+
+  String get path => file.path;
+
+  String get extension {
+    final dot = name.lastIndexOf('.');
+    return dot <= 0 ? '' : name.substring(dot + 1).toLowerCase();
+  }
+
+  bool get isVideo => const <String>{
+    'mp4', 'm4v', 'mov', 'ts', 'webm', 'mkv',
+  }.contains(extension);
+
+  bool get isImage => const <String>{
+    'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'heic', 'heif',
+  }.contains(extension);
+
+  /// AVPlayer covers these; webm/mkv need a codec iOS does not ship.
+  bool get playable =>
+      const <String>{'mp4', 'm4v', 'mov', 'ts'}.contains(extension);
+
+  /// The downloader prefixes files with an epoch stamp; hide it in the UI.
+  String get displayName {
+    final match = RegExp(r'^\d{13}_').firstMatch(name);
+    return match == null ? name : name.substring(match.end);
+  }
+
+  String get sizeLabel => formatBytes(size);
+}
+
 /// Sequential download queue with retry, cancellation and auto-save to Photos.
 ///
 /// Plain files stream straight to disk. HLS playlists go through a second
@@ -230,22 +279,55 @@ final class DownloadManager extends ChangeNotifier {
   int get activeCount => items.where((item) => item.status.active).length;
   int get finishedCount => items.where((item) => item.status.terminal).length;
 
-  File? get _indexFile {
-    final home = Platform.environment['HOME'];
-    if (home == null || home.isEmpty) return null;
-    return File('$home/Documents/downloads.json');
+  String? _documentsDir;
+  Future<String?>? _documentsDirPending;
+
+  /// iOS app processes have no usable HOME, so the Documents path can only be
+  /// resolved natively (and is cached for the life of the manager).
+  Future<String?> _documentsPath() async {
+    final cached = _documentsDir;
+    if (cached != null) return cached;
+    final path = await (_documentsDirPending ??= _resolveDocumentsPath());
+    if (path == null) _documentsDirPending = null;
+    return path;
   }
 
-  Directory? get _downloadDir {
-    final home = Platform.environment['HOME'];
-    if (home == null || home.isEmpty) return null;
-    return Directory('$home/Documents/Downloads');
+  Future<String?> _resolveDocumentsPath() async {
+    String? path;
+    try {
+      path = await _media.invokeMethod<String>('documentsPath');
+    } on MissingPluginException {
+      // Test host or another platform; fall through to HOME below.
+    } on PlatformException {
+      // Fall through.
+    } on Object {
+      // Fall through.
+    }
+    if (path == null || path.isEmpty) {
+      final home = Platform.environment['HOME'];
+      if (home != null && home.isNotEmpty) path = '$home/Documents';
+    }
+    if (path == null || path.isEmpty) return null;
+    _documentsDir = path;
+    return path;
+  }
+
+  Future<File?> _indexFile() async {
+    final dir = await _documentsPath();
+    if (dir == null) return null;
+    return File('$dir/downloads.json');
+  }
+
+  Future<Directory?> _downloadDir() async {
+    final dir = await _documentsPath();
+    if (dir == null) return null;
+    return Directory('$dir/Downloads');
   }
 
   /// Restores the list of finished downloads. A file that disappeared is
   /// dropped rather than shown as a broken row.
   Future<void> load() async {
-    final file = _indexFile;
+    final file = await _indexFile();
     if (file == null) return;
     try {
       if (!await file.exists()) return;
@@ -371,9 +453,12 @@ final class DownloadManager extends ChangeNotifier {
   }
 
   /// Opens the system player on a completed file.
-  Future<String?> play(DownloadItem item) async {
-    final path = item.path;
-    if (path == null || !await File(path).exists()) return '文件不存在';
+  Future<String?> play(DownloadItem item) => playPath(item.path);
+
+  Future<String?> playPath(String? path) async {
+    if (path == null || path.isEmpty || !await File(path).exists()) {
+      return '文件不存在';
+    }
     try {
       final status = await _media.invokeMethod<String>(
         'playFile',
@@ -390,9 +475,12 @@ final class DownloadManager extends ChangeNotifier {
   }
 
   /// Opens the system share sheet so the file can go to Files, AirDrop, etc.
-  Future<String?> share(DownloadItem item) async {
-    final path = item.path;
-    if (path == null || !await File(path).exists()) return '文件不存在';
+  Future<String?> share(DownloadItem item) => sharePath(item.path);
+
+  Future<String?> sharePath(String? path) async {
+    if (path == null || path.isEmpty || !await File(path).exists()) {
+      return '文件不存在';
+    }
     try {
       final status = await _media.invokeMethod<String>(
         'shareFile',
@@ -406,6 +494,58 @@ final class DownloadManager extends ChangeNotifier {
     } on Object catch (error) {
       return error.toString();
     }
+  }
+
+  /// Files actually stored in `Documents/Downloads`, newest first.
+  /// Hidden names are in-flight HLS temporaries and are skipped.
+  Future<List<OfflineFile>> listOffline() async {
+    final dir = await _downloadDir();
+    if (dir == null || !await dir.exists()) return const <OfflineFile>[];
+    final files = <OfflineFile>[];
+    try {
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is! File) continue;
+        final segments = entity.uri.pathSegments;
+        final name = segments.isEmpty ? '' : segments.last;
+        if (name.isEmpty || name.startsWith('.')) continue;
+        try {
+          final stat = await entity.stat();
+          if (stat.type != FileSystemEntityType.file || stat.size <= 0) {
+            continue;
+          }
+          files.add(
+            OfflineFile(
+              file: entity,
+              name: name,
+              size: stat.size,
+              modified: stat.modified,
+            ),
+          );
+        } on Object {
+          // The file vanished mid-scan; just leave it out.
+        }
+      }
+    } on FileSystemException {
+      return const <OfflineFile>[];
+    }
+    files.sort((a, b) => b.modified.compareTo(a.modified));
+    return files;
+  }
+
+  /// Deletes the bytes and any history rows that point at them.
+  Future<String?> deleteOffline(OfflineFile file) async {
+    try {
+      if (await file.file.exists()) await file.file.delete();
+    } on Object catch (error) {
+      return error is FileSystemException
+          ? (error.message)
+          : error.toString();
+    }
+    final before = items.length;
+    items.removeWhere((item) => item.path == file.path);
+    _notify(force: true);
+    if (items.length != before) await _persist();
+    return null;
   }
 
   Future<void> _pump() async {
@@ -487,7 +627,7 @@ final class DownloadManager extends ChangeNotifier {
         );
         item.total = length != null && length > 0 ? length : null;
 
-        final dir = _downloadDir;
+        final dir = await _downloadDir();
         if (dir == null) throw const FileSystemException('找不到应用目录');
         await dir.create(recursive: true);
 
@@ -600,7 +740,7 @@ final class DownloadManager extends ChangeNotifier {
       throw const FormatException('播放列表里没有可下载的分片');
     }
 
-    final dir = _downloadDir;
+    final dir = await _downloadDir();
     if (dir == null) throw const FileSystemException('找不到应用目录');
     await dir.create(recursive: true);
 
@@ -732,12 +872,19 @@ final class DownloadManager extends ChangeNotifier {
       note = '$error';
     }
 
-    item.path = temp.path;
+    // Keep the TS, but drop the leading dot so the offline library lists it.
+    var fallback = temp;
+    try {
+      fallback = await temp.rename('${dir.path}/${stamp}_$base.ts');
+    } on Object {
+      // Renaming is cosmetic; the hidden temp name still plays.
+    }
+    item.path = fallback.path;
     final message = note.startsWith('error: ')
         ? note.substring('error: '.length)
         : note;
     return _MediaFile(
-      temp,
+      fallback,
       saveable: false,
       note: '已保留 TS 文件，转 MP4 失败：$message',
     );
@@ -970,7 +1117,7 @@ final class DownloadManager extends ChangeNotifier {
   }
 
   Future<void> _persist() async {
-    final file = _indexFile;
+    final file = await _indexFile();
     if (file == null) return;
     try {
       await file.parent.create(recursive: true);

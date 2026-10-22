@@ -152,6 +152,14 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoads true" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Set :NSPhotoLibraryAddUsageDescription 把下载的图片和视频保存到相册。" "$PLIST" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryAddUsageDescription string 把下载的图片和视频保存到相册。" "$PLIST"
+          # Background audio keeps playback/PiP alive after leaving the app.
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" 2>/dev/null || true
+          # Expose Documents in Files so offline downloads can be pulled out.
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :LSSupportsOpeningDocumentsInPlace true" "$PLIST" 2>/dev/null || true
 
       - name: CocoaPods install
         run: cd ios && pod install

@@ -19,6 +19,10 @@ final class MediaBridge {
     func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         let args = call.arguments as? [String: Any] ?? [:]
         switch call.method {
+        case "documentsPath":
+            // The app process has no usable HOME, so Dart cannot build the
+            // sandbox path itself. This is the one hook it needs.
+            result(Self.documentsDirectory()?.path)
         case "saveToPhotos":
             saveToPhotos(args, result: result)
         case "aesDecrypt":
@@ -240,6 +244,8 @@ final class MediaBridge {
                 result("error: no window to present from")
                 return
             }
+            // .playback keeps audio alive when the app is backgrounded (the
+            // Info.plist audio background mode has to be present as well).
             try? AVAudioSession.sharedInstance().setCategory(
                 .playback,
                 mode: .moviePlayback
@@ -249,6 +255,20 @@ final class MediaBridge {
             let controller = AVPlayerViewController()
             controller.player = player
             controller.modalPresentationStyle = .fullScreen
+            controller.allowsPictureInPicturePlayback = true
+            if #available(iOS 14.2, *) {
+                controller.canStartPictureInPictureAutomaticallyFromInline = true
+            }
+            if #available(iOS 16.0, *) {
+                // Adds the native speed menu to the transport controls.
+                controller.speeds = Self.playbackSpeeds.map {
+                    AVPlaybackSpeed(rate: $0, localizedName: Self.speedTitle($0))
+                }
+            } else {
+                // iOS 15 has no speed menu; a small overlay button stands in.
+                controller.loadViewIfNeeded()
+                Self.attachSpeedButton(to: controller, player: player)
+            }
             presenter.present(controller, animated: true) {
                 player.play()
                 result("ok")
@@ -287,6 +307,73 @@ final class MediaBridge {
                 result("ok")
             }
         }
+    }
+
+    // MARK: - Sandbox + playback helpers
+
+    private static func documentsDirectory() -> URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+            .first
+    }
+
+    private static let playbackSpeeds: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 2]
+
+    private static func speedTitle(_ rate: Float) -> String {
+        rate == rate.rounded() ? "\(Int(rate))×" : "\(rate)×"
+    }
+
+    /// iOS 15 fallback: AVPlayerViewController only grew a speed menu in 16.
+    private static func attachSpeedButton(to controller: AVPlayerViewController,
+                                          player: AVPlayer) {
+        guard let overlay = controller.contentOverlayView else { return }
+        var config = UIButton.Configuration.filled()
+        config.title = speedTitle(1)
+        config.baseBackgroundColor = UIColor.black.withAlphaComponent(0.55)
+        config.baseForegroundColor = .white
+        config.cornerStyle = .capsule
+        config.contentInsets = NSDirectionalEdgeInsets(
+            top: 5,
+            leading: 12,
+            bottom: 5,
+            trailing: 12
+        )
+        let button = UIButton(configuration: config)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.showsMenuAsPrimaryAction = true
+        button.menu = makeSpeedMenu(player: player, button: button)
+        overlay.addSubview(button)
+        let safe = overlay.safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            button.trailingAnchor.constraint(
+                equalTo: safe.trailingAnchor,
+                constant: -16
+            ),
+            button.topAnchor.constraint(
+                equalTo: safe.topAnchor,
+                constant: 14
+            ),
+        ])
+    }
+
+    private static func makeSpeedMenu(player: AVPlayer,
+                                      button: UIButton) -> UIMenu {
+        let actions: [UIMenuElement] = playbackSpeeds.map { rate in
+            return UIAction(title: speedTitle(rate)) { [weak button] _ in
+                guard let button else { return }
+                // Changing rate while paused would start playback, so park
+                // the choice in defaultRate for the next play().
+                if player.timeControlStatus == .playing {
+                    player.rate = rate
+                } else {
+                    player.defaultRate = rate
+                }
+                var config = button.configuration
+                config?.title = speedTitle(rate)
+                button.configuration = config
+                button.menu = makeSpeedMenu(player: player, button: button)
+            }
+        }
+        return UIMenu(title: "播放速度", children: actions)
     }
 
     private static func topViewController() -> UIViewController? {
