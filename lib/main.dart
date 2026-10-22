@@ -319,12 +319,9 @@ class _BrowserPageState extends State<BrowserPage>
     if (!mounted) return;
     if (!event.isMainFrame) return;
 
-    // A blocked jump is always worth a toast: it is the moment the app would
-    // have disappeared.
-    if (event.isBlocked && mounted) {
-      final host = Uri.tryParse(event.url)?.host;
-      _snack('已阻止跳转到外部应用${host == null ? '' : '：$host'}');
-    }
+    // Blocking is silent by design: pages try to open other apps constantly,
+    // and a toast on every one of them is noise. The console line below keeps
+    // the decision visible for anyone who wants it.
 
     // Mirror it into the in-app console; the host sees the decision, which the
     // page cannot. The console keeps working while the info panel is closed

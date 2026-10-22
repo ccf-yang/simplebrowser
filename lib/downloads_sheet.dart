@@ -71,6 +71,67 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
     );
   }
 
+  Future<bool> _confirm(
+    String title,
+    String message, {
+    String confirmLabel = '清空',
+  }) async {
+    if (!mounted) return false;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text(
+          title,
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+        ),
+        content: Text(
+          message,
+          style: const TextStyle(fontSize: 12, height: 1.5),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: AppColors.danger),
+            child: Text(confirmLabel),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
+  }
+
+  Future<void> _clearRecords() async {
+    final count = _manager.finishedCount;
+    if (count == 0) return;
+    if (!await _confirm(
+      '清空下载记录？',
+      '$count 条已结束的记录会从列表里移除。\nApp 内的文件和相册里的内容都不会被删除。',
+    )) {
+      return;
+    }
+    _manager.clearFinished();
+  }
+
+  Future<void> _clearOffline() async {
+    final files = _offline ?? const <OfflineFile>[];
+    if (files.isEmpty) return;
+    if (!await _confirm(
+      '清空离线库？',
+      '${files.length} 个文件 · ${formatBytes(_offlineTotal)} 会从 App 里删除，'
+          '同时清空下载记录。\n相册里已保存的副本不受影响，正在下载的任务会跳过。',
+    )) {
+      return;
+    }
+    final error = await _manager.clearOffline();
+    await _loadOffline();
+    if (error != null) await _notice('部分文件未能删除', error);
+  }
+
   Future<void> _playOffline(OfflineFile file) async {
     final error = await _manager.playPath(file.path);
     if (error != null) await _notice('播放失败', error);
@@ -218,15 +279,23 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                         TextButton(
                           onPressed: _manager.finishedCount == 0
                               ? null
-                              : _manager.clearFinished,
-                          child: const Text('Clear'),
+                              : () => unawaited(_clearRecords()),
+                          child: const Text('清空记录'),
                         )
-                      else
+                      else ...<Widget>[
+                        TextButton(
+                          onPressed: (_offline ?? const <OfflineFile>[]).isEmpty
+                              ? null
+                              : () => unawaited(_clearOffline()),
+                          child: const Text('清空文件'),
+                        ),
+                        const SizedBox(width: 2),
                         _MiniButton(
                           icon: Icons.refresh_rounded,
                           tooltip: '重新扫描',
                           onTap: () => unawaited(_loadOffline()),
                         ),
+                      ],
                       const SizedBox(width: 4),
                       _CloseButton(
                         onTap: () => Navigator.of(context).pop(),

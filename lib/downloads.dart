@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:browser_http/browser_http.dart';
@@ -268,6 +269,12 @@ final class DownloadManager extends ChangeNotifier {
 
   static const MethodChannel _media =
       MethodChannel('browser_http/media');
+
+  /// Below this a file is not worth slicing: the probe alone would cost more
+  /// than the parallel windows save. Images almost always take this path out.
+  static const int _parallelMinimumBytes = 2 * 1024 * 1024;
+  static const int _minimumWindowBytes = 1024 * 1024;
+  static const int _maximumWindowBytes = 4 * 1024 * 1024;
 
   final List<DownloadItem> items = <DownloadItem>[];
   final List<DownloadItem> _queue = <DownloadItem>[];
@@ -548,6 +555,46 @@ final class DownloadManager extends ChangeNotifier {
     return null;
   }
 
+  /// Empties the offline library: every stored file goes, together with the
+  /// history rows that pointed at it. Already-saved Photos copies are not
+  /// touched, and files belonging to a running task are left alone.
+  /// Returns the first error hit, or null when nothing failed.
+  Future<String?> clearOffline() async {
+    final dir = await _downloadDir();
+    if (dir == null) return '找不到应用目录';
+
+    final busy = <String>{
+      for (final item in items)
+        if (item.status.active && item.path != null) item.path!,
+    };
+    String? error;
+    try {
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is! File) continue;
+        final segments = entity.uri.pathSegments;
+        final name = segments.isEmpty ? '' : segments.last;
+        // Dot-prefixed names are in-flight HLS temporaries; not the user's.
+        if (name.isEmpty || name.startsWith('.')) continue;
+        if (busy.contains(entity.path)) continue;
+        try {
+          await entity.delete();
+        } on Object catch (failure) {
+          error ??= failure is FileSystemException
+              ? failure.message
+              : failure.toString();
+        }
+      }
+    } on FileSystemException catch (failure) {
+      error ??= failure.message;
+    }
+
+    final before = items.length;
+    items.removeWhere((item) => item.status.terminal);
+    _notify(force: true);
+    if (items.length != before) await _persist();
+    return error;
+  }
+
   Future<void> _pump() async {
     if (_pumping || _disposed) return;
     _pumping = true;
@@ -585,7 +632,6 @@ final class DownloadManager extends ChangeNotifier {
     _notify(force: true);
 
     File? file;
-    IOSink? sink;
     _MediaFile? hlsResult;
     try {
       final uri = Uri.tryParse(item.url);
@@ -600,52 +646,9 @@ final class DownloadManager extends ChangeNotifier {
         hlsResult = await _downloadHls(item, uri, headers, token);
         file = hlsResult.file;
       } else {
-        final response = await session.openStream(
-          TransportRequest(
-            method: 'GET',
-            uri: uri,
-            profileId: session.profile.id,
-            headers: headers,
-          ),
-          cancelToken: token,
-        );
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          throw HttpException('HTTP ${response.statusCode}', uri: uri);
-        }
-
-        final contentType =
-            (response.header('content-type') ?? '').toLowerCase().trim();
-        if (contentType.startsWith('text/html') ||
-            contentType.startsWith('application/json') ||
-            contentType.startsWith('text/plain')) {
-          throw const FormatException('服务器返回了网页而不是媒体文件');
-        }
-
-        final rawLength = response.header('content-length');
-        final length = rawLength == null ? null : int.tryParse(
-          rawLength.split(';').first.trim(),
-        );
-        item.total = length != null && length > 0 ? length : null;
-
-        final dir = await _downloadDir();
-        if (dir == null) throw const FileSystemException('找不到应用目录');
-        await dir.create(recursive: true);
-
-        final name = _fileNameFor(item, contentType);
-        file = File('${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name');
-        item.path = file.path;
-        sink = file.openWrite();
-
-        await for (final chunk in response.body) {
-          if (token.isCancelled) break;
-          sink.add(chunk);
-          item.received += chunk.length;
-          _notify();
-        }
-        if (token.isCancelled) throw const _DownloadCancelled();
-        await sink.flush();
-        await sink.close();
-        sink = null;
+        // Direct file: parallel Range slices when the server supports them,
+        // one streamed connection otherwise (and as the retry path).
+        file = await _downloadFile(item, uri, headers, token);
       }
 
       if (token.isCancelled) throw const _DownloadCancelled();
@@ -671,14 +674,9 @@ final class DownloadManager extends ChangeNotifier {
         }
       }
     } on Object catch (error) {
-      try {
-        await sink?.flush();
-        await sink?.close();
-      } on Object {
-        // The sink may already be broken by the aborted socket.
-      }
-      sink = null;
       final cancelled = token.isCancelled || error is _DownloadCancelled;
+      // The file helpers delete their own partial output, so what is left here
+      // is the HLS concatenation file.
       if (file != null) {
         try {
           if (await file.exists()) await file.delete();
@@ -696,6 +694,308 @@ final class DownloadManager extends ChangeNotifier {
       _notify(force: true);
       onFinished?.call(item);
     }
+  }
+
+  /// Direct file download with as much parallelism as the server allows.
+  ///
+  /// A `Range: bytes=0-0` probe decides: 206 with a real total means the file
+  /// can be sliced, so several connections pull fixed windows into one
+  /// pre-sized file. Anything else (Range ignored, size unknown, tiny files,
+  /// image downloads) streams on a single connection instead, which is also
+  /// what a failed slice falls back to so a dropped worker never loses the
+  /// whole transfer.
+  Future<File> _downloadFile(
+    DownloadItem item,
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token,
+  ) async {
+    // Images arrive in one round trip already, so paying a probe request for
+    // them would only make them slower.
+    if (item.kind == ResourceKind.image) {
+      return _downloadStreamed(item, uri, headers, token);
+    }
+    try {
+      final ranged = await _downloadRanged(item, uri, headers, token);
+      if (ranged != null) return ranged;
+      await _discardPartial(item);
+    } on Object {
+      // Cancellation is final; every other failure just retries in one piece.
+      if (token.isCancelled) throw const _DownloadCancelled();
+      await _discardPartial(item);
+    }
+    return _downloadStreamed(item, uri, headers, token);
+  }
+
+  Future<File?> _downloadRanged(
+    DownloadItem item,
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token,
+  ) async {
+    final probe = await _probeFile(uri, headers, token);
+    final total = probe.total;
+    if (!probe.sliceable ||
+        total == null ||
+        total < _parallelMinimumBytes ||
+        token.isCancelled) {
+      return null;
+    }
+    final contentType = probe.contentType;
+    if (_isPageType(contentType)) {
+      throw const FormatException('服务器返回了网页而不是媒体文件');
+    }
+
+    final dir = await _downloadDir();
+    if (dir == null) throw const FileSystemException('找不到应用目录');
+    await dir.create(recursive: true);
+
+    final name = _fileNameFor(item, contentType);
+    final file = File(
+      '${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name',
+    );
+    item
+      ..path = file.path
+      ..total = total
+      ..received = 0;
+    _notify(force: true);
+
+    // One handle for the whole transfer: FileMode.write truncates, so this is
+    // also where the file takes its final length. APFS keeps the holes free
+    // until the bytes actually arrive.
+    final handle = await file.open(mode: FileMode.write);
+    await handle.truncate(total);
+
+    final window = _windowBytes(total);
+    final pieces = (total + window - 1) ~/ window;
+    var nextPiece = 0;
+    Object? failure;
+
+    // A RandomAccessFile writes at its own position, so the workers take turns
+    // on the shared handle. Only the network runs in parallel; a local
+    // positioned write is over in microseconds.
+    var writeTail = Future<void>.value();
+    Future<void> writeAt(int position, Uint8List bytes) async {
+      final previous = writeTail;
+      final done = Completer<void>();
+      // Queue behind whoever holds the handle. The chain itself never carries
+      // an error, so one broken write cannot stall the rest.
+      writeTail = done.future;
+      await previous;
+      try {
+        await handle.setPosition(position);
+        await handle.writeFrom(bytes);
+      } finally {
+        done.complete();
+      }
+    }
+
+    Future<void> runWorker() async {
+      while (failure == null) {
+        if (token.isCancelled) return;
+        final piece = nextPiece++;
+        if (piece >= pieces) return;
+        final start = piece * window;
+        final length = math.min(window, total - start);
+        try {
+          final bytes = await _fetchBytesRetry(
+            uri,
+            headers,
+            token,
+            range: HlsByteRange(start, length),
+          );
+          if (bytes.length != length) {
+            throw const FormatException('分片长度与 Range 不符');
+          }
+          await writeAt(start, bytes);
+          item.received += length;
+          _notify();
+        } on Object catch (error) {
+          if (token.isCancelled) return;
+          failure ??= error;
+          return;
+        }
+      }
+    }
+
+    try {
+      final workerCount = math.min(_parallelWorkers(total), pieces);
+      await Future.wait(<Future<void>>[
+        for (var i = 0; i < workerCount; i++) runWorker(),
+      ]);
+
+      if (token.isCancelled) throw const _DownloadCancelled();
+      // A window that still failed after its retries: give up on slicing and
+      // let the caller pull the whole file in one pass.
+      if (failure != null) return null;
+      await handle.flush();
+      return file;
+    } finally {
+      try {
+        await handle.close();
+      } on Object {
+        // The handle may already be broken; the length is on disk either way.
+      }
+    }
+  }
+
+  Future<File> _downloadStreamed(
+    DownloadItem item,
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token,
+  ) async {
+    final response = await session.openStream(
+      TransportRequest(
+        method: 'GET',
+        uri: uri,
+        profileId: session.profile.id,
+        headers: headers,
+      ),
+      cancelToken: token,
+    );
+    IOSink? sink;
+    try {
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException('HTTP ${response.statusCode}', uri: uri);
+      }
+      final contentType =
+          (response.header('content-type') ?? '').toLowerCase().trim();
+      if (_isPageType(contentType)) {
+        throw const FormatException('服务器返回了网页而不是媒体文件');
+      }
+
+      final rawLength = response.header('content-length');
+      final length = rawLength == null
+          ? null
+          : int.tryParse(rawLength.split(';').first.trim());
+      item.total = length != null && length > 0 ? length : null;
+
+      final dir = await _downloadDir();
+      if (dir == null) throw const FileSystemException('找不到应用目录');
+      await dir.create(recursive: true);
+
+      final name = _fileNameFor(item, contentType);
+      final file = File(
+        '${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name',
+      );
+      item.path = file.path;
+      sink = file.openWrite();
+
+      await for (final chunk in response.body) {
+        if (token.isCancelled) break;
+        sink.add(chunk);
+        item.received += chunk.length;
+        _notify();
+      }
+      if (token.isCancelled) throw const _DownloadCancelled();
+      await sink.flush();
+      await sink.close();
+      sink = null;
+      return file;
+    } on Object {
+      try {
+        await sink?.flush();
+        await sink?.close();
+      } on Object {
+        // The sink may already be broken by the aborted socket.
+      }
+      await _discardPartial(item);
+      rethrow;
+    }
+  }
+
+  /// Forgets a half-written file so a retry starts from nothing.
+  Future<void> _discardPartial(DownloadItem item) async {
+    final path = item.path;
+    item
+      ..path = null
+      ..received = 0;
+    if (path == null) return;
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } on Object {
+      // Best effort; an orphaned partial file is unreachable anyway.
+    }
+  }
+
+  static bool _isPageType(String contentType) {
+    return contentType.startsWith('text/html') ||
+        contentType.startsWith('application/json') ||
+        contentType.startsWith('text/plain');
+  }
+
+  static int _parallelWorkers(int total) {
+    if (total >= 64 * 1024 * 1024) return 8;
+    if (total >= 8 * 1024 * 1024) return 6;
+    if (total >= 3 * 1024 * 1024) return 4;
+    return 2;
+  }
+
+  /// Size of one Range window: enough pieces to keep every worker busy,
+  /// small enough that four or eight of them in memory at once is nothing.
+  static int _windowBytes(int total) {
+    final perWorker = total / (_parallelWorkers(total) * 3);
+    if (perWorker <= _minimumWindowBytes) return _minimumWindowBytes;
+    return math.min(perWorker.ceil(), _maximumWindowBytes);
+  }
+
+  /// Asks the server for one byte. The answer decides whether the file can be
+  /// sliced and how long it is, so the body is dropped as soon as the headers
+  /// and the first chunk have been seen.
+  Future<_FileProbe> _probeFile(
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token,
+  ) async {
+    final response = await session.openStream(
+      TransportRequest(
+        method: 'GET',
+        uri: uri,
+        profileId: session.profile.id,
+        headers: <OrderedHeader>[
+          ...headers,
+          const OrderedHeader('Range', 'bytes=0-0'),
+        ],
+      ),
+      cancelToken: token,
+    );
+    final contentType =
+        (response.header('content-type') ?? '').toLowerCase().trim();
+    int? total;
+    var sliceable = false;
+    if (response.statusCode == 206) {
+      final range = (response.header('content-range') ?? '').trim();
+      final match = RegExp(r'/(\d+)\s*$').firstMatch(range);
+      final parsed = int.tryParse(match?.group(1) ?? '');
+      if (parsed != null && parsed > 0) {
+        total = parsed;
+        sliceable = true;
+      }
+    }
+
+    var seen = 0;
+    await for (final chunk in response.body) {
+      if (token.isCancelled) throw const _DownloadCancelled();
+      seen += chunk.length;
+      // A server that ignores Range would otherwise hand over the whole file
+      // just for it to be thrown away.
+      if (sliceable || seen >= 64 * 1024) break;
+    }
+
+    if (!sliceable) {
+      final rawLength = response.header('content-length');
+      final length = rawLength == null
+          ? null
+          : int.tryParse(rawLength.split(';').first.trim());
+      total = length != null && length > 0 ? length : null;
+    }
+    return _FileProbe(
+      total: total,
+      contentType: contentType,
+      sliceable: sliceable,
+    );
   }
 
   Future<_MediaFile> _downloadHls(
@@ -783,7 +1083,9 @@ final class DownloadManager extends ChangeNotifier {
         item.received += bytes.length;
       }
 
-      const window = 4;
+      // Segments are small, so a wider batch hides per-request latency better
+      // than a bigger buffer; the sink still writes them in playlist order.
+      const window = 6;
       for (var start = 0; start < playlist.segments.length; start += window) {
         if (token.isCancelled) throw const _DownloadCancelled();
         final end = (start + window) < playlist.segments.length
@@ -1159,6 +1461,20 @@ final class _MediaFile {
   final File file;
   final bool saveable;
   final String? note;
+}
+
+/// What a `Range: bytes=0-0` probe answered: the real length of the file and
+/// whether the server honours Range at all.
+final class _FileProbe {
+  const _FileProbe({
+    required this.total,
+    required this.contentType,
+    required this.sliceable,
+  });
+
+  final int? total;
+  final String contentType;
+  final bool sliceable;
 }
 
 final class _DownloadCancelled implements Exception {
