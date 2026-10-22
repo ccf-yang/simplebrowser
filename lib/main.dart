@@ -1,12 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:browser_http/browser_http.dart';
+import 'package:flutter/cupertino.dart' show CupertinoPageRoute;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'
-    show Clipboard, ClipboardData, rootBundle;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 
 import 'request_format.dart';
 import 'settings_sheet.dart';
@@ -108,11 +109,7 @@ class BrowserPage extends StatefulWidget {
 
 class _BrowserPageState extends State<BrowserPage>
     with SingleTickerProviderStateMixin {
-  static const double _erudaPillHeight = 30;
-  static const List<String> _erudaUrls = <String>[
-    'https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js',
-    'https://unpkg.com/eruda@3.4.3/eruda.js',
-  ];
+  static const double _consolePillHeight = 30;
 
   final StreamLogSink _logSink = StreamLogSink(400);
   final TextEditingController _urlController = TextEditingController();
@@ -151,7 +148,6 @@ class _BrowserPageState extends State<BrowserPage>
   /// the debug console temporarily hides the panel, so collection keeps
   /// following the switch the user actually set.
   bool _panelPreference = true;
-  bool _didHidePanelForEruda = false;
 
   /// Cancel navigations that would open another app. On by default: a test
   /// browser that leaves the app cannot be debugged.
@@ -169,15 +165,14 @@ class _BrowserPageState extends State<BrowserPage>
   bool _seenForward = false;
   int _seenResources = 0;
 
-  // Eruda overlay state.
-  bool _erudaOpen = false;
-  bool _erudaBusy = false;
-  double _erudaSize = 50;
-  String? _erudaSource;
-  Timer? _erudaVerifyTimer;
-  Timer? _debugSizeTimer;
-  /// Bumped to abandon a running show/repair loop.
-  int _erudaWatchId = 0;
+  // Console overlay state. The console is Flutter UI: it lives outside the
+  // WebView, so it cannot be torn down by a navigation or hidden by page CSS.
+  bool _consoleOpen = false;
+  double _consoleSize = 50;
+  final List<_ConsoleLine> _consoleLines = <_ConsoleLine>[];
+
+  // Bookmarks live in the app container, not in the WebView profile.
+  final List<_Bookmark> _bookmarks = <_Bookmark>[];
 
   @override
   void initState() {
@@ -198,6 +193,7 @@ class _BrowserPageState extends State<BrowserPage>
     _navigationSubscription =
         _browser.navigationEvents.listen(_onNavigationEvent);
     unawaited(_loadProfileInfo());
+    unawaited(_loadBookmarks());
   }
 
   Future<void> _loadProfileInfo() async {
@@ -244,6 +240,7 @@ class _BrowserPageState extends State<BrowserPage>
     _seenForward = _browser.canGoForward;
     _seenResources = _browser.resourceTimings.length;
 
+    final previous = previousUrl ?? '';
     setState(() {
       final url = _browser.url;
       if (!_urlFocus.hasFocus &&
@@ -254,10 +251,15 @@ class _BrowserPageState extends State<BrowserPage>
       }
     });
 
-    // The console is registered as a native user script, so a new document
-    // restores itself. Only check when the URL changed, and never close the
-    // panel because a probe came back too early.
-    if (_erudaOpen && previousUrl != _browser.url) _scheduleErudaVerify();
+    // A refresh keeps the URL, so this alone would miss it; the navigation
+    // stream prints reloads. This line catches the first page and history
+    // moves the delegate does not report.
+    if (_consoleOpen &&
+        previous.isNotEmpty &&
+        previous != _browser.url &&
+        _browser.url != null) {
+      _pushToConsole('地址变化 → ${_browser.url}');
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -277,10 +279,10 @@ class _BrowserPageState extends State<BrowserPage>
       _snack('已阻止跳转到外部应用${host == null ? '' : '：$host'}');
     }
 
-    // Mirror it into the eruda console; the page's own context prints the
-    // landing line, the host prints what the page cannot see. The console
-    // keeps working while the info panel is closed (it even hides it).
-    if (_erudaOpen) {
+    // Mirror it into the in-app console; the host sees the decision, which the
+    // page cannot. The console keeps working while the info panel is closed
+    // (it even hides it).
+    if (_consoleOpen) {
       _pushToConsole(
         switch (event.kind) {
           'blocked' =>
@@ -343,22 +345,18 @@ class _BrowserPageState extends State<BrowserPage>
     });
   }
 
-  /// Prints one line into the eruda console of the current document.
+  /// Appends one line to the in-app console.
+  ///
+  /// The console is pure Flutter state, so it cannot disappear with the page,
+  /// and it keeps collecting while the info panel is closed.
   void _pushToConsole(String? text, {String level = 'info'}) {
-    if (text == null || text.isEmpty) return;
-    final safe = _jsString(text);
-    _evalQuiet(
-      'window.__bhDebugLog && window.__bhDebugLog($safe, "$level");',
-    );
-  }
-
-  static String _jsString(String value) {
-    final escaped = value
-        .replaceAll(r'\', r'\\')
-        .replaceAll("'", r"\'")
-        .replaceAll('\n', r'\n')
-        .replaceAll('\r', '');
-    return "'$escaped'";
+    if (text == null || text.isEmpty || !mounted) return;
+    setState(() {
+      _consoleLines.insert(0, _ConsoleLine(DateTime.now(), text, level));
+      while (_consoleLines.length > 300) {
+        _consoleLines.removeLast();
+      }
+    });
   }
 
   Uri? _parseUrl(String raw) {
@@ -377,7 +375,7 @@ class _BrowserPageState extends State<BrowserPage>
   Uri? _currentUri() => _parseUrl(_browser.url ?? _urlController.text);
 
   /// A fresh WKWebView may report an empty string or `about:blank`; neither is
-  /// a real document for the start page / Eruda.
+  /// a real document for the start page or the console.
   bool get _hasDocument {
     final url = _browser.url;
     return url != null && url.isNotEmpty && url != 'about:blank';
@@ -450,6 +448,124 @@ class _BrowserPageState extends State<BrowserPage>
     }
   }
 
+  /// Drops the document and shows the start page again. The console (if open)
+  /// stays open; it is the user's switch, not page state.
+  Future<void> _goHome() async {
+    _urlFocus.unfocus();
+    _urlController.clear();
+    setState(() => _started = false);
+    try {
+      await _browser.load(Uri.parse('about:blank'));
+    } on Object {
+      // The start page is already covering the WebView.
+    }
+    if (_consoleOpen) _pushToConsole('回到首页');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Bookmarks
+  // ---------------------------------------------------------------------------
+
+  /// `$HOME/Documents/bookmarks.json` in the app container.
+  File? get _bookmarkFile {
+    final home = Platform.environment['HOME'];
+    if (home == null || home.isEmpty) return null;
+    return File('$home/Documents/bookmarks.json');
+  }
+
+  Future<void> _loadBookmarks() async {
+    final file = _bookmarkFile;
+    try {
+      if (file != null && await file.exists()) {
+        final decoded = jsonDecode(await file.readAsString());
+        final loaded = <_Bookmark>[];
+        if (decoded is List) {
+          for (final item in decoded) {
+            if (item is! Map) continue;
+            final url = item['url'];
+            if (url is! String || url.isEmpty) continue;
+            final title = item['title'];
+            loaded.add(
+              _Bookmark(
+                url: url,
+                title: title is String && title.trim().isNotEmpty
+                    ? title.trim()
+                    : url,
+                at: DateTime.tryParse(item['at']?.toString() ?? '') ??
+                    DateTime.now(),
+              ),
+            );
+          }
+        }
+        if (!mounted) return;
+        setState(() {
+          _bookmarks
+            ..clear()
+            ..addAll(loaded);
+        });
+        return;
+      }
+    } on Object {
+      // A corrupt file must not keep the browser from starting.
+    }
+  }
+
+  Future<void> _persistBookmarks() async {
+    final file = _bookmarkFile;
+    if (file == null) return;
+    try {
+      await file.parent.create(recursive: true);
+      await file.writeAsString(
+        jsonEncode(<Object>[for (final item in _bookmarks) item.toJson()]),
+      );
+    } on Object catch (error) {
+      if (mounted) _snack('Could not save bookmarks: $error');
+    }
+  }
+
+  Future<void> _saveBookmark() async {
+    final url = _browser.url;
+    if (url == null || url.isEmpty || url == 'about:blank') {
+      _snack('Open a page first');
+      return;
+    }
+    final title = (_browser.title ?? '').trim();
+    final label = title.isEmpty ? url : title;
+    setState(() {
+      _bookmarks.removeWhere((item) => item.url == url);
+      _bookmarks.insert(0, _Bookmark(url: url, title: label, at: DateTime.now()));
+      while (_bookmarks.length > 200) {
+        _bookmarks.removeLast();
+      }
+    });
+    if (_consoleOpen) _pushToConsole('已保存书签 $label');
+    await _persistBookmarks();
+    if (mounted) _snack('Bookmarked: $label');
+  }
+
+  void _deleteBookmark(String url) {
+    setState(() => _bookmarks.removeWhere((item) => item.url == url));
+    unawaited(_persistBookmarks());
+  }
+
+  /// Pushed above the browser so the iOS left-edge swipe returns to the page.
+  void _openBookmarks() {
+    final items = List<_Bookmark>.of(_bookmarks);
+    Navigator.of(context)
+        .push<void>(
+      CupertinoPageRoute<void>(
+        builder: (context) => _BookmarksPage(
+          bookmarks: items,
+          onOpen: (bookmark) {
+            Navigator.of(context).pop();
+            _openShortcut(bookmark.url);
+          },
+          onDelete: _deleteBookmark,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openSettings() async {
     final result = await showModalBottomSheet<SettingsValues>(
       context: context,
@@ -465,6 +581,8 @@ class _BrowserPageState extends State<BrowserPage>
           blockExternal: _blockExternal,
         ),
         uaLabels: <String>[for (final preset in _uaPresets) preset.label],
+        bookmarkCount: _bookmarks.length,
+        canSaveBookmark: _hasDocument,
         onShowPanelChanged: _setPanelVisible,
         onBlockExternalChanged: _setBlockExternal,
       ),
@@ -491,6 +609,21 @@ class _BrowserPageState extends State<BrowserPage>
     await _browser.setUserAgent(userAgent);
     if (!mounted) return;
 
+    // Browsing actions close the sheet without touching the current page.
+    switch (result.action) {
+      case SettingsAction.goHome:
+        await _goHome();
+        return;
+      case SettingsAction.saveBookmark:
+        await _saveBookmark();
+        return;
+      case SettingsAction.openBookmarks:
+        _openBookmarks();
+        return;
+      case null:
+        break;
+    }
+
     final uri = _currentUri();
     if (uri != null) {
       await _browser.reload(
@@ -508,7 +641,9 @@ class _BrowserPageState extends State<BrowserPage>
     if (_panelVisible == value && _panelPreference == value) return;
     setState(() {
       _panelPreference = value;
-      _panelVisible = value;
+      // While the console is up it owns the lower half; remember the switch
+      // and let it take over again when the console closes.
+      if (!_consoleOpen) _panelVisible = value;
     });
     _applyPanelCollection(clear: !value);
   }
@@ -520,7 +655,9 @@ class _BrowserPageState extends State<BrowserPage>
   /// The console hides the panel without changing the user's switch, so this
   /// follows [_panelVisible], not [_panelPreference].
   void _applyPanelCollection({bool clear = false}) {
-    unawaited(_browser.setPageNetworkEnabled(_panelVisible));
+    unawaited(
+      _browser.setPageNetworkEnabled(_panelVisible || _consoleOpen),
+    );
     if (clear) {
       _pageRequests.clear();
       _events.clear();
@@ -584,9 +721,29 @@ class _BrowserPageState extends State<BrowserPage>
   /// request: headers and body come from the request, status/timing/response
   /// body from the matching response.
   void _onPageNetworkEvent(PageNetworkEvent event) {
-    // The Page tab is the only consumer; while the panel is closed the native
-    // hooks are off and anything still in flight is dropped.
-    if (!mounted || !_panelVisible) return;
+    // The Page tab and the console consume this stream. While both are closed
+    // the native hooks are off and anything still in flight is dropped.
+    if (!mounted || (!_panelVisible && !_consoleOpen)) return;
+
+    if (_consoleOpen) {
+      final method = event.method ?? 'GET';
+      final url = event.url ?? '';
+      switch (event.phase) {
+        case PageNetworkPhase.request:
+          _pushToConsole('→ $method $url');
+        case PageNetworkPhase.response:
+          final ms = event.duration == null ? '' : ' · ${event.duration} ms';
+          _pushToConsole('← ${event.statusCode ?? '?'} $url$ms');
+        case PageNetworkPhase.error:
+          _pushToConsole(
+            '✕ $method $url ${event.message ?? ''}'.trim(),
+            level: 'error',
+          );
+        case PageNetworkPhase.body:
+          break;
+      }
+    }
+    if (!_panelVisible) return;
     setState(() {
       final existing = _pageRequests[event.key];
       _pageRequests[event.key] = existing == null
@@ -773,9 +930,6 @@ class _BrowserPageState extends State<BrowserPage>
 
   @override
   void dispose() {
-    _erudaVerifyTimer?.cancel();
-    _debugSizeTimer?.cancel();
-    _erudaWatchId++;
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
     unawaited(_pageSubscription.cancel());
@@ -834,7 +988,7 @@ class _BrowserPageState extends State<BrowserPage>
             'Settings',
             () => unawaited(_openSettings()),
           ),
-          _buildErudaButton(),
+          _buildConsoleButton(),
         ],
       ),
     );
@@ -873,28 +1027,12 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  Widget _buildErudaButton() {
-    if (_erudaBusy) {
-      return const SizedBox(
-        width: 34,
-        height: 34,
-        child: Center(
-          child: SizedBox(
-            width: 16,
-            height: 16,
-            child: CircularProgressIndicator(
-              strokeWidth: 2,
-              color: AppColors.ink,
-            ),
-          ),
-        ),
-      );
-    }
+  Widget _buildConsoleButton() {
     return _toolButton(
       Icons.terminal_rounded,
-      _erudaOpen ? 'Close console' : 'Debug console, stays open across pages',
-      () => unawaited(_toggleEruda()),
-      active: _erudaOpen,
+      _consoleOpen ? 'Close console' : 'Debug console, stays open across pages',
+      _toggleConsole,
+      active: _consoleOpen,
       size: 19,
     );
   }
@@ -1096,8 +1234,8 @@ class _BrowserPageState extends State<BrowserPage>
     return LayoutBuilder(
       builder: (context, constraints) {
         final height = constraints.maxHeight;
-        final top = (height * (1 - _erudaSize / 100) - _erudaPillHeight / 2)
-            .clamp(0.0, math.max(0.0, height - _erudaPillHeight))
+        final top = (height * (1 - _consoleSize / 100) - _consolePillHeight / 2)
+            .clamp(0.0, math.max(0.0, height - _consolePillHeight))
             .toDouble();
         return Stack(
           fit: StackFit.expand,
@@ -1105,14 +1243,25 @@ class _BrowserPageState extends State<BrowserPage>
             BrowserView(controller: _browser),
             if (!_started && !_hasDocument)
               _StartPage(onOpen: _openShortcut),
-            if (_erudaOpen)
+            if (_consoleOpen) ...<Widget>[
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                height: (height * _consoleSize / 100)
+                    .clamp(0.0, height)
+                    .toDouble(),
+                child: _buildConsolePanel(),
+              ),
+              // The pill straddles the panel's top edge and must stay above it.
               Positioned(
                 left: 0,
                 right: 0,
                 top: top,
-                height: _erudaPillHeight,
-                child: Center(child: _buildErudaPill(height)),
+                height: _consolePillHeight,
+                child: Center(child: _buildConsolePill(height)),
               ),
+            ],
           ],
         );
       },
@@ -1868,23 +2017,17 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   // ---------------------------------------------------------------------------
-  // Eruda overlay
+  // Console overlay
   // ---------------------------------------------------------------------------
 
-  Future<void> _toggleEruda() async {
-    if (_erudaBusy) return;
-
-    if (_erudaOpen) {
+  void _toggleConsole() {
+    if (_consoleOpen) {
       setState(() {
-        _erudaOpen = false;
-        if (_didHidePanelForEruda && !_panelVisible) _panelVisible = true;
-        _didHidePanelForEruda = false;
+        _consoleOpen = false;
+        // The console only borrowed the space; the switch the user set wins.
+        _panelVisible = _panelPreference;
       });
-      _erudaVerifyTimer?.cancel();
-      _debugSizeTimer?.cancel();
-      _erudaWatchId++;
       _applyPanelCollection();
-      await _browser.setDebugOverlay(enabled: false);
       return;
     }
 
@@ -1893,226 +2036,116 @@ class _BrowserPageState extends State<BrowserPage>
       return;
     }
 
-    setState(() => _erudaBusy = true);
-    try {
-      final source = await _loadErudaSource();
-      final detail = await _browser.setDebugOverlay(
-        enabled: true,
-        source: source,
-        displaySize: _erudaSize,
-      );
-      if (!mounted) return;
-      // The native status is `status|stamp`. `queued` means the script is
-      // registered and the next commit (or the native one-off reload) brings
-      // the console up, so treat it as open.
-      final bar = detail.indexOf('|');
-      final status = bar < 0 ? detail : detail.substring(0, bar);
-      final native = bar < 0 ? '' : detail.substring(bar + 1);
-      final open = status == 'ok' || status.startsWith('queued');
-      setState(() {
-        _erudaOpen = open;
-        if (open) {
-          _didHidePanelForEruda = _panelVisible;
-          _panelVisible = false;
-        }
-      });
-      if (open) {
-        _applyPanelCollection();
-        // The native boot already calls `show()`; doing it here as well covers
-        // a framework built before that fix. The loop keeps trying because the
-        // bundle may still be parsing and the panel can need a forced repaint.
-        _showErudaNow();
-        _watchEruda();
-        debugPrint('[console] native=$native status=$status');
-        _pushToConsole('调试通道 $native ($status)');
-        if (native != 'n4') {
-          _snack('Console is up, but the webview core is old ($native); '
-              'reinstall the new IPA');
-        }
-      }
-      if (!open) _snack('Console failed: $detail');
-    } on Object catch (error) {
-      if (mounted) _snack('Eruda failed: $error');
-    } finally {
-      if (mounted) setState(() => _erudaBusy = false);
-    }
-  }
-
-  /// Prefers the bundle shipped as an asset (fetched at CI build time), then
-  /// falls back to the CDN through the native transport. Cached in memory.
-  Future<String> _loadErudaSource() async {
-    final cached = _erudaSource;
-    if (cached != null) return cached;
-
-    try {
-      final bundled = await rootBundle.loadString('assets/eruda/eruda.js');
-      if (_looksLikeEruda(bundled)) {
-        _erudaSource = bundled;
-        return bundled;
-      }
-    } on Object {
-      // Asset absent in local builds; fall through to the network.
-    }
-
-    Object? lastError;
-    for (final url in _erudaUrls) {
-      try {
-        final response = await _session
-            .get(Uri.parse(url))
-            .timeout(const Duration(seconds: 25));
-        final source = utf8.decode(response.body, allowMalformed: true);
-        if (response.statusCode == 200 && _looksLikeEruda(source)) {
-          _erudaSource = source;
-          return source;
-        }
-        lastError = 'HTTP ${response.statusCode} from $url';
-      } on Object catch (error) {
-        lastError = error;
-      }
-    }
-    throw StateError('could not load eruda.js ($lastError)');
-  }
-
-  bool _looksLikeEruda(String source) =>
-      source.length > 20000 && !source.trimLeft().startsWith('<');
-
-  /// Safety net for documents the user script cannot reach: a same-document
-  /// route change, a page that replaced the JS context, or a load that started
-  /// before the console was switched on.
-  void _scheduleErudaVerify() {
-    _erudaVerifyTimer?.cancel();
-    _erudaVerifyTimer = Timer(const Duration(milliseconds: 600), () {
-      unawaited(_verifyEruda());
+    setState(() {
+      _consoleOpen = true;
+      _panelVisible = false;
     });
+    _applyPanelCollection();
+    _pushToConsole('Console opened · ${_browser.url ?? ''}');
   }
 
-  /// Brings the console up in the current document and returns what was found:
-  /// `missing`, `nopanel`, `err:…` or `visible:<height>/<viewport>`.
-  ///
-  /// `eruda.show()` alone is not enough. The panel is revealed through
-  /// `transition: opacity .3s`, and that transition can stay at 0: the panel
-  /// gets its 50% height and position but paints fully transparent, which is
-  /// why only the Flutter handle was visible. Writing the end state inline
-  /// with no transition makes it paint no matter what the compositor did.
-  static const String _erudaSyncScript =
-      '(function(){try{'
-      'if(!(window.eruda&&window.eruda._isInit))return "missing";'
-      'window.eruda.show();'
-      'try{window.eruda.show("console")}catch(e){}'
-      'var h=document.getElementById("eruda");'
-      'var s=h&&h.shadowRoot;'
-      'var p=s&&s.querySelector(".eruda-dev-tools");'
-      'if(!p)return "nopanel";'
-      'p.style.transition="none";'
-      'p.style.display="block";'
-      'p.style.opacity="1";'
-      'var r=p.getBoundingClientRect();'
-      'return "visible:"+Math.round(r.height)+"/"+window.innerHeight;'
-      '}catch(e){return "err:"+e}})()';
-
-  Future<String> _erudaState() async {
-    try {
-      final value = await _browser.evaluate(_erudaSyncScript);
-      return value?.toString() ?? 'null';
-    } on Object catch (error) {
-      // Mid-navigation: the next URL change retries.
-      return 'eval:$error';
-    }
-  }
-
-  Future<void> _verifyEruda() async {
-    if (!_erudaOpen || !mounted) return;
-    final state = await _erudaState();
-    if (!mounted || !_erudaOpen || state.startsWith('visible')) return;
-    if (!state.startsWith('missing') && state != 'nopanel') return;
-    final source = _erudaSource;
-    if (source == null) return;
-    await _browser.setDebugOverlay(
-      enabled: true,
-      source: source,
-      displaySize: _erudaSize,
-    );
-    _showErudaNow();
-  }
-
-  /// Shows the console in whatever document is loaded now. Harmless while the
-  /// bundle is still parsing; the watch loop covers that.
-  void _showErudaNow() {
-    unawaited(_erudaState().then((state) {
-      debugPrint('[console] show: $state');
-    }));
-  }
-
-  /// Bounded repair loop after opening: the bundle may still be parsing, the
-  /// page may be mid-navigation, or the native commit injection may have been
-  /// skipped. Polls until the panel is actually visible; never runs twice.
-  void _watchEruda() {
-    final id = ++_erudaWatchId;
-    unawaited(_runErudaWatch(id));
-  }
-
-  Future<void> _runErudaWatch(int id) async {
-    var reinjected = false;
-    for (var tick = 1; tick <= 20; tick++) {
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-      if (!mounted || !_erudaOpen || id != _erudaWatchId) return;
-      final state = await _erudaState();
-      if (!mounted || !_erudaOpen || id != _erudaWatchId) return;
-      debugPrint('[console] watch#$tick $state');
-      if (state.startsWith('visible')) {
-        if (tick > 1) _pushToConsole('Console panel ready ($state)');
-        return;
-      }
-      if (!reinjected &&
-          tick >= 2 &&
-          (state.startsWith('missing') || state == 'nopanel')) {
-        reinjected = true;
-        final source = _erudaSource;
-        if (source != null) {
-          await _browser.setDebugOverlay(
-            enabled: true,
-            source: source,
-            displaySize: _erudaSize,
-          );
-          _showErudaNow();
-        }
-      }
-    }
-  }
-
-  void _applyErudaSize(double value) {
+  void _applyConsoleSize(double value) {
     final size = value.clamp(40.0, 100.0).toDouble();
-    if ((size - _erudaSize).abs() < 0.01) return;
-    setState(() => _erudaSize = size);
-    _evalQuiet(
-      'try{eruda.get().config.set("displaySize", '
-      '${size.toStringAsFixed(1)})}catch(e){}',
-    );
-    // The registered script decides the size of the *next* document; rewrite it
-    // once the drag settles instead of on every pointer tick.
-    _debugSizeTimer?.cancel();
-    _debugSizeTimer = Timer(const Duration(milliseconds: 400), () {
-      unawaited(_browser.setDebugDisplaySize(size));
-    });
+    if ((size - _consoleSize).abs() < 0.01) return;
+    setState(() => _consoleSize = size);
   }
 
-  void _evalQuiet(String script) {
-    unawaited(_browser.evaluate(script).catchError((Object _) => null));
+  Widget _buildConsolePanel() {
+    return Container(
+      color: AppColors.dark,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          // The white handle sits on the panel's top edge; leave room for it.
+          const SizedBox(height: 18),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 6, 4),
+            child: Row(
+              children: <Widget>[
+                const Text(
+                  'CONSOLE',
+                  style: TextStyle(
+                    fontSize: 8.5,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2,
+                    color: AppColors.darkMuted,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '${_consoleLines.length}',
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 9,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.signal,
+                  ),
+                ),
+                const Spacer(),
+                if (_consoleLines.isNotEmpty)
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(_consoleLines.clear),
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      child: Text(
+                        'Clear',
+                        style: TextStyle(
+                          fontSize: 9.5,
+                          color: AppColors.darkMuted,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Container(height: 1, color: const Color(0xFF30323A)),
+          Expanded(
+            child: _consoleLines.isEmpty
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.fromLTRB(24, 8, 24, 24),
+                      child: Text(
+                        'No jumps yet.\nEvery in-app navigation and every '
+                        'blocked app jump is printed here.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 10,
+                          height: 1.6,
+                          color: AppColors.darkMuted,
+                        ),
+                      ),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.fromLTRB(10, 6, 10, 14),
+                    itemCount: _consoleLines.length,
+                    itemBuilder: (context, index) =>
+                        _ConsoleRow(line: _consoleLines[index]),
+                  ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Split control between the page and the console: grip on the left, the
   /// share in the middle, close on the right. Spacers keep the three evenly
   /// distributed instead of hugging the left edge of the bar.
-  Widget _buildErudaPill(double viewHeight) {
+  Widget _buildConsolePill(double viewHeight) {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onVerticalDragUpdate: (details) {
         if (viewHeight <= 0) return;
-        _applyErudaSize(_erudaSize - details.delta.dy / viewHeight * 100);
+        _applyConsoleSize(_consoleSize - details.delta.dy / viewHeight * 100);
       },
       child: Container(
         width: 168,
-        height: _erudaPillHeight,
+        height: _consolePillHeight,
         padding: const EdgeInsets.symmetric(horizontal: 12),
         decoration: BoxDecoration(
           color: Colors.white.withAlpha(248),
@@ -2135,7 +2168,7 @@ class _BrowserPageState extends State<BrowserPage>
             ),
             const Spacer(),
             Text(
-              '${_erudaSize.round()}%',
+              '${_consoleSize.round()}%',
               style: const TextStyle(
                 fontFamily: 'monospace',
                 fontSize: 10,
@@ -2147,7 +2180,7 @@ class _BrowserPageState extends State<BrowserPage>
             Tooltip(
               message: 'Close console',
               child: GestureDetector(
-                onTap: () => unawaited(_toggleEruda()),
+                onTap: _toggleConsole,
                 child: Container(
                   width: 18,
                   height: 18,
@@ -2217,6 +2250,80 @@ class _BrowserPageState extends State<BrowserPage>
 // -----------------------------------------------------------------------------
 // Widgets
 // -----------------------------------------------------------------------------
+
+/// One row kept by the in-app console.
+class _ConsoleLine {
+  const _ConsoleLine(this.at, this.text, this.level);
+
+  final DateTime at;
+  final String text;
+  final String level;
+
+  String get stamp =>
+      '${at.hour.toString().padLeft(2, '0')}:'
+      '${at.minute.toString().padLeft(2, '0')}:'
+      '${at.second.toString().padLeft(2, '0')}';
+}
+
+/// One saved page. Stored as JSON in the app container, not in the WebView
+/// profile, so clearing site data does not lose the list.
+class _Bookmark {
+  const _Bookmark({required this.url, required this.title, required this.at});
+
+  final String url;
+  final String title;
+  final DateTime at;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'url': url,
+        'title': title,
+        'at': at.toIso8601String(),
+      };
+}
+
+class _ConsoleRow extends StatelessWidget {
+  const _ConsoleRow({required this.line});
+
+  final _ConsoleLine line;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = switch (line.level) {
+      'warn' => const Color(0xFFE5B85C),
+      'error' => const Color(0xFFFF7B72),
+      _ => AppColors.darkText,
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            line.stamp,
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 8.5,
+              height: 1.5,
+              color: AppColors.darkMuted,
+            ),
+          ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(
+              line.text,
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 10,
+                height: 1.5,
+                color: color,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class _Notice extends StatelessWidget {
   const _Notice(this.text);
@@ -3245,6 +3352,226 @@ class _PageRequestRow extends StatelessWidget {
 }
 
 // -----------------------------------------------------------------------------
+// Bookmarks
+// -----------------------------------------------------------------------------
+
+/// Pushed from Settings with [CupertinoPageRoute], so the iOS left-edge swipe
+/// returns to the browser as well as the back arrow.
+class _BookmarksPage extends StatefulWidget {
+  const _BookmarksPage({
+    required this.bookmarks,
+    required this.onOpen,
+    required this.onDelete,
+  });
+
+  final List<_Bookmark> bookmarks;
+  final ValueChanged<_Bookmark> onOpen;
+  final ValueChanged<String> onDelete;
+
+  @override
+  State<_BookmarksPage> createState() => _BookmarksPageState();
+}
+
+class _BookmarksPageState extends State<_BookmarksPage> {
+  late final List<_Bookmark> _items = List<_Bookmark>.of(widget.bookmarks);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: AppColors.paper,
+      appBar: AppBar(
+        backgroundColor: AppColors.surface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        leading: IconButton(
+          tooltip: 'Back',
+          icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 17),
+          onPressed: () => Navigator.of(context).maybePop(),
+        ),
+        title: const Text(
+          'Bookmarks',
+          style: TextStyle(
+            fontSize: 17,
+            fontWeight: FontWeight.w700,
+            letterSpacing: -0.2,
+          ),
+        ),
+        actions: <Widget>[
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Text(
+                '${_items.length}',
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 11,
+                  color: AppColors.muted,
+                ),
+              ),
+            ),
+          ),
+        ],
+        bottom: const PreferredSize(
+          preferredSize: Size.fromHeight(1),
+          child: Divider(height: 1),
+        ),
+      ),
+      body: _items.isEmpty
+          ? const Center(
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: 40),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(
+                      Icons.bookmarks_outlined,
+                      size: 30,
+                      color: AppColors.faint,
+                    ),
+                    SizedBox(height: 12),
+                    Text(
+                      'No bookmarks yet',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    SizedBox(height: 5),
+                    Text(
+                      'Open a page, then Settings → Save to keep it here.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 10,
+                        height: 1.5,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          : ListView.builder(
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 28),
+              itemCount: _items.length,
+              itemBuilder: (context, index) {
+                final item = _items[index];
+                return Dismissible(
+                  key: ValueKey<String>(item.url),
+                  direction: DismissDirection.endToStart,
+                  background: Container(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.only(right: 18),
+                    alignment: Alignment.centerRight,
+                    decoration: BoxDecoration(
+                      color: AppColors.danger,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Icon(
+                      Icons.delete_outline_rounded,
+                      size: 19,
+                      color: Colors.white,
+                    ),
+                  ),
+                  onDismissed: (_) {
+                    setState(() {
+                      _items.removeWhere((entry) => entry.url == item.url);
+                    });
+                    widget.onDelete(item.url);
+                  },
+                  child: _BookmarkRow(
+                    bookmark: item,
+                    onTap: () => widget.onOpen(item),
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
+
+class _BookmarkRow extends StatelessWidget {
+  const _BookmarkRow({required this.bookmark, required this.onTap});
+
+  final _Bookmark bookmark;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: AppColors.card,
+        borderRadius: BorderRadius.circular(12),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: onTap,
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(11, 10, 8, 10),
+            decoration: BoxDecoration(
+              border: Border.all(color: AppColors.line),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              children: <Widget>[
+                Container(
+                  width: 26,
+                  height: 26,
+                  decoration: BoxDecoration(
+                    color: AppColors.wash,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Icon(
+                    Icons.bookmark_outline_rounded,
+                    size: 14,
+                    color: AppColors.ink2,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Text(
+                        bookmark.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.ink,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        bookmark.url,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 9,
+                          color: AppColors.muted,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 6),
+                const Icon(
+                  Icons.chevron_right_rounded,
+                  size: 16,
+                  color: AppColors.faint,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Start page + app mark
 // -----------------------------------------------------------------------------
 
@@ -3286,18 +3613,18 @@ class _StartPage extends StatelessWidget {
               ),
               const SizedBox(height: 20),
               _QuickLink(
-                letter: 'E',
-                title: 'example.com',
-                subtitle: 'https://example.com',
+                letter: 'B',
+                title: '百度',
+                subtitle: 'https://www.baidu.com',
                 filled: true,
-                onTap: () => onOpen('https://example.com'),
+                onTap: () => onOpen('https://www.baidu.com'),
               ),
               const SizedBox(height: 8),
               _QuickLink(
-                letter: 'W',
-                title: 'Wikipedia',
-                subtitle: 'https://en.wikipedia.org',
-                onTap: () => onOpen('https://en.wikipedia.org'),
+                letter: 'G',
+                title: 'Google',
+                subtitle: 'https://www.google.com',
+                onTap: () => onOpen('https://www.google.com'),
               ),
               const SizedBox(height: 8),
               _QuickLink(

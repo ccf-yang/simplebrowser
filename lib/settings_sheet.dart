@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 
 import 'theme.dart';
 
+/// A browsing action chosen from the sheet instead of "Save & reload".
+enum SettingsAction { goHome, saveBookmark, openBookmarks }
+
 /// Values collected by the settings sheet.
 ///
 /// [refererMode] is 0 for none and 1 for the current domain, so the sheet does
@@ -13,6 +16,7 @@ class SettingsValues {
     required this.cookie,
     required this.showPanel,
     required this.blockExternal,
+    this.action,
   });
 
   final int uaIndex;
@@ -22,6 +26,10 @@ class SettingsValues {
 
   /// Cancel jumps that would leave the app (custom schemes and Universal Links).
   final bool blockExternal;
+
+  /// Set when the sheet was closed by tapping Home / Save bookmark /
+  /// Bookmarks; the page runs the action instead of reloading.
+  final SettingsAction? action;
 }
 
 /// Bottom sheet with the request identity settings plus the info-panel switch.
@@ -36,12 +44,16 @@ class SettingsSheet extends StatefulWidget {
     required this.uaLabels,
     required this.onShowPanelChanged,
     required this.onBlockExternalChanged,
+    this.bookmarkCount = 0,
+    this.canSaveBookmark = false,
   });
 
   final SettingsValues initial;
   final List<String> uaLabels;
   final ValueChanged<bool> onShowPanelChanged;
   final ValueChanged<bool> onBlockExternalChanged;
+  final int bookmarkCount;
+  final bool canSaveBookmark;
 
   @override
   State<SettingsSheet> createState() => _SettingsSheetState();
@@ -61,7 +73,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
     super.dispose();
   }
 
-  void _save() {
+  void _save([SettingsAction? action]) {
     Navigator.of(context).pop(
       SettingsValues(
         uaIndex: _uaIndex,
@@ -69,6 +81,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
         cookie: _cookie.text,
         showPanel: _showPanel,
         blockExternal: _blockExternal,
+        action: action,
       ),
     );
   }
@@ -159,6 +172,41 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   _buildPanelSwitch(),
                   const SizedBox(height: 8),
                   _buildStayInAppSwitch(),
+                  const SizedBox(height: 14),
+                  const _FieldLabel('Browsing'),
+                  const SizedBox(height: 5),
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: _ActionTile(
+                          icon: Icons.home_rounded,
+                          label: 'Home',
+                          onTap: () => _save(SettingsAction.goHome),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: _ActionTile(
+                          icon: Icons.bookmark_add_outlined,
+                          label: 'Save',
+                          onTap: widget.canSaveBookmark
+                              ? () => _save(SettingsAction.saveBookmark)
+                              : null,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: _ActionTile(
+                          icon: Icons.bookmarks_outlined,
+                          label: widget.bookmarkCount == 0
+                              ? 'Bookmarks'
+                              : 'Bookmarks ${widget.bookmarkCount}',
+                          onTap: () =>
+                              _save(SettingsAction.openBookmarks),
+                        ),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 10),
                   const _Hint(),
                   const SizedBox(height: 14),
@@ -280,6 +328,63 @@ class _SettingsSheetState extends State<SettingsSheet> {
       widget.onBlockExternalChanged(value);
     },
   );
+}
+
+/// One tap target in the Browsing row: Home, Save bookmark or Bookmarks.
+class _ActionTile extends StatelessWidget {
+  const _ActionTile({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onTap != null;
+    return Material(
+      color: enabled ? AppColors.card : AppColors.wash,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Container(
+          height: 44,
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: enabled ? AppColors.line2 : AppColors.line,
+            ),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: <Widget>[
+              Icon(
+                icon,
+                size: 15,
+                color: enabled ? AppColors.ink : AppColors.faint,
+              ),
+              const SizedBox(height: 3),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600,
+                  color: enabled ? AppColors.ink2 : AppColors.faint,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// One labelled switch row inside the settings sheet.

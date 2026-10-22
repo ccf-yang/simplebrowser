@@ -3,7 +3,7 @@ description: >-
   So~ — small iOS test browser built on browser_http: real WKWebView browsing,
   no exits to other apps, and a debug console that survives every page.
 publish_to: none
-version: 0.2.2+3
+version: 0.2.3+4
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -23,8 +23,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    # The iOS workflow downloads eruda@3.4.3 here before building. Keeping the
-    # directory (with placeholder.txt) makes local builds work too; at runtime
-    # the app falls back to the CDN when eruda.js is absent.
-    - assets/eruda/
