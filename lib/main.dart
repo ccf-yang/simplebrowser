@@ -7,9 +7,13 @@ import 'dart:typed_data';
 import 'package:browser_http/browser_http.dart';
 import 'package:flutter/cupertino.dart' show CupertinoPageRoute;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, rootBundle;
 
+import 'downloads.dart';
+import 'downloads_sheet.dart';
 import 'request_format.dart';
+import 'resource_sheet.dart';
 import 'settings_sheet.dart';
 import 'theme.dart';
 
@@ -193,12 +197,34 @@ class _BrowserPageState extends State<BrowserPage>
   // Bookmarks live in the app container, not in the WebView profile.
   final List<_Bookmark> _bookmarks = <_Bookmark>[];
 
+  // Downloads run through the same BrowserSession as browsing, so the Rust
+  // engine carries the WKWebView cookies and the chosen UA. Completed media
+  // is handed to Photos.
+  late final DownloadManager _downloads;
+  bool _downloadsSheetOpen = false;
+
+  // Ad blocking. The rules are a committed EasyList China + EasyList snapshot;
+  // WebKit compiles them once and caches the result by identifier.
+  static const String _adBlockMetaAsset = 'assets/adblock/meta.json';
+  static const String _adBlockRulesAsset = 'assets/adblock/rules.json.gz';
+  static const String _adBlockLiteMetaAsset = 'assets/adblock/meta-lite.json';
+  static const String _adBlockLiteRulesAsset =
+      'assets/adblock/rules-lite.json.gz';
+  bool _adBlockEnabled = true;
+  bool _adBlockReady = false;
+  int _adBlockRuleCount = 0;
+  String? _adBlockError;
+
   @override
   void initState() {
     super.initState();
     _session = BrowserHttp.session(logSink: _logSink);
     _browser = BrowserController(session: _session)
       ..addListener(_onBrowserChanged);
+    _downloads = DownloadManager(
+      session: _session,
+      onFinished: _onDownloadFinished,
+    );
     _tabs = TabController(length: 4, vsync: this);
     _urlFocus.addListener(_onUrlFocusChanged);
     _logSubscription = _logSink.stream.listen((event) {
@@ -213,6 +239,8 @@ class _BrowserPageState extends State<BrowserPage>
         _browser.navigationEvents.listen(_onNavigationEvent);
     unawaited(_loadProfileInfo());
     unawaited(_loadBookmarks());
+    unawaited(_downloads.load());
+    unawaited(_bootAdBlock());
   }
 
   Future<void> _loadProfileInfo() async {
@@ -591,6 +619,203 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // Ad blocking
+  // ---------------------------------------------------------------------------
+
+  File? get _prefsFile {
+    final home = Platform.environment['HOME'];
+    if (home == null || home.isEmpty) return null;
+    return File('$home/Documents/browser_prefs.json');
+  }
+
+  Future<Map<String, Object?>> _readPrefs() async {
+    final file = _prefsFile;
+    if (file == null) return <String, Object?>{};
+    try {
+      if (!await file.exists()) return <String, Object?>{};
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is! Map) return <String, Object?>{};
+      return <String, Object?>{
+        for (final entry in decoded.entries)
+          entry.key.toString(): entry.value,
+      };
+    } on Object {
+      return <String, Object?>{};
+    }
+  }
+
+  Future<void> _persistAdBlockPref(bool enabled) async {
+    final file = _prefsFile;
+    if (file == null) return;
+    try {
+      final prefs = await _readPrefs();
+      prefs['adBlockEnabled'] = enabled;
+      await file.parent.create(recursive: true);
+      await file.writeAsString(jsonEncode(prefs));
+    } on Object {
+      // The switch still applies for this run.
+    }
+  }
+
+  Future<void> _bootAdBlock() async {
+    final prefs = await _readPrefs();
+    final enabled = prefs['adBlockEnabled'] is bool
+        ? prefs['adBlockEnabled']! as bool
+        : true;
+    if (!mounted) return;
+    setState(() => _adBlockEnabled = enabled);
+    if (enabled) await _installAdBlockRules();
+  }
+
+  Future<(String, Map<String, Object?>)> _loadAdBlockAssets({
+    required bool lite,
+  }) async {
+    final metaRaw = await rootBundle.loadString(
+      lite ? _adBlockLiteMetaAsset : _adBlockMetaAsset,
+    );
+    final decoded = jsonDecode(metaRaw);
+    final meta = decoded is Map
+        ? <String, Object?>{
+            for (final entry in decoded.entries)
+              entry.key.toString(): entry.value,
+          }
+        : <String, Object?>{};
+    final data = await rootBundle.load(
+      lite ? _adBlockLiteRulesAsset : _adBlockRulesAsset,
+    );
+    final bytes = gzip.decode(
+      data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+    );
+    return (utf8.decode(bytes), meta);
+  }
+
+  /// Compiles and attaches the rule list. A full-list rejection falls back to
+  /// the network-only snapshot, so one unusable cosmetic selector cannot cost
+  /// the whole feature.
+  Future<void> _installAdBlockRules({bool lite = false}) async {
+    if (mounted) setState(() => _adBlockError = null);
+    try {
+      final (rules, meta) = await _loadAdBlockAssets(lite: lite);
+      final identifier =
+          meta['identifier']?.toString() ?? 'so-adblock';
+      final count = meta['rules'] is num
+          ? (meta['rules']! as num).toInt()
+          : 0;
+      final status = await _browser.applyContentRuleList(
+        identifier: identifier,
+        encodedRules: rules,
+      );
+      if (status != 'ready') {
+        if (!lite) {
+          await _installAdBlockRules(lite: true);
+          return;
+        }
+        throw StateError(status);
+      }
+      await _browser.setContentBlockingEnabled(true);
+      if (!mounted) return;
+      setState(() {
+        _adBlockReady = true;
+        _adBlockRuleCount = count;
+        _adBlockError = null;
+      });
+      if (_consoleOpen) {
+        _pushToConsole('广告拦截已启用 · $_adBlockRuleCount 条规则');
+      }
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _adBlockReady = false;
+        _adBlockError = '$error';
+      });
+      if (_consoleOpen) _pushToConsole('广告拦截失败：$error', level: 'error');
+    }
+  }
+
+  Future<void> _setAdBlockEnabled(bool enabled) async {
+    setState(() => _adBlockEnabled = enabled);
+    await _persistAdBlockPref(enabled);
+    if (!enabled) {
+      await _browser.setContentBlockingEnabled(false);
+      return;
+    }
+    if (_adBlockReady) {
+      await _browser.setContentBlockingEnabled(true);
+    } else {
+      await _installAdBlockRules();
+    }
+  }
+
+  String get _adBlockStatusLabel {
+    if (!_adBlockEnabled) return '关闭 · 开启并保存后重新加载页面生效';
+    if (_adBlockError != null) return '规则编译失败 · 保存设置可重试';
+    if (!_adBlockReady) return '正在编译规则…';
+    return '$_adBlockRuleCount 条规则 · 已启用';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Resource sniffing + downloads
+  // ---------------------------------------------------------------------------
+
+  Future<void> _openResources() async {
+    if (!_hasDocument) {
+      _snack('先打开一个网页再扫描资源');
+      return;
+    }
+    final result = await showModalBottomSheet<ResourceSheetResult>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(88),
+      builder: (_) => ResourceSheet(
+        controller: _browser,
+        userAgent: _effectiveUserAgent,
+      ),
+    );
+    if (!mounted || result == null) return;
+    if (result.openDownloads) {
+      unawaited(_openDownloads());
+      return;
+    }
+    if (result.downloads.isEmpty) return;
+    _downloads.enqueueAll(
+      result.downloads,
+      userAgent: _effectiveUserAgent,
+    );
+    _snack('已加入下载队列：${result.downloads.length} 项');
+    unawaited(_openDownloads());
+  }
+
+  Future<void> _openDownloads() async {
+    _downloadsSheetOpen = true;
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        barrierColor: AppColors.ink.withAlpha(88),
+        builder: (_) => DownloadsSheet(manager: _downloads),
+      );
+    } finally {
+      if (mounted) _downloadsSheetOpen = false;
+    }
+  }
+
+  void _onDownloadFinished(DownloadItem item) {
+    if (!mounted || _downloadsSheetOpen) return;
+    switch (item.status) {
+      case DownloadStatus.saved:
+        _snack('已存入相册：${item.displayName}');
+      case DownloadStatus.failed:
+        _snack('下载失败：${item.displayName}');
+      case DownloadStatus.downloaded:
+        _snack('已下载，但未存入相册：${item.displayName}');
+      default:
+        break;
+    }
+  }
+
   Future<void> _openSettings() async {
     final result = await showModalBottomSheet<SettingsValues>(
       context: context,
@@ -604,9 +829,13 @@ class _BrowserPageState extends State<BrowserPage>
           cookie: _cookieController.text,
           showPanel: _panelPreference,
           blockExternal: _blockExternal,
+          adBlock: _adBlockEnabled,
         ),
         uaLabels: <String>[for (final preset in _uaPresets) preset.label],
+        adBlockEnabled: _adBlockEnabled,
+        adBlockStatus: _adBlockStatusLabel,
         bookmarkCount: _bookmarks.length,
+        downloadCount: _downloads.items.length,
         canSaveBookmark: _hasDocument,
         onShowPanelChanged: _setPanelVisible,
         onBlockExternalChanged: _setBlockExternal,
@@ -614,6 +843,7 @@ class _BrowserPageState extends State<BrowserPage>
     );
     if (result == null || !mounted) return;
 
+    final adBlockChanged = result.adBlock != _adBlockEnabled;
     setState(() {
       _uaIndex = result.uaIndex;
       _refererMode = result.refererMode == 1
@@ -621,6 +851,11 @@ class _BrowserPageState extends State<BrowserPage>
           : _RefererMode.none;
       _blockExternal = result.blockExternal;
     });
+    if (adBlockChanged) {
+      _snack(result.adBlock ? '正在启用广告拦截…' : '已关闭广告拦截');
+      await _setAdBlockEnabled(result.adBlock);
+      if (!mounted) return;
+    }
     // The live switch already applied this; calling again keeps the saved
     // value authoritative if the sheet is dismissed in a weird state.
     _setPanelVisible(result.showPanel);
@@ -644,6 +879,9 @@ class _BrowserPageState extends State<BrowserPage>
         return;
       case SettingsAction.openBookmarks:
         _openBookmarks();
+        return;
+      case SettingsAction.openDownloads:
+        unawaited(_openDownloads());
         return;
       case null:
         break;
@@ -962,6 +1200,7 @@ class _BrowserPageState extends State<BrowserPage>
     unawaited(_navigationSubscription.cancel());
     _browser.removeListener(_onBrowserChanged);
     _browser.dispose();
+    _downloads.dispose();
     unawaited(_session.close());
     _tabs.dispose();
     _urlController.dispose();
@@ -1009,6 +1248,12 @@ class _BrowserPageState extends State<BrowserPage>
             size: 24,
           ),
           Expanded(child: _buildAddressField()),
+          _toolButton(
+            Icons.travel_explore_rounded,
+            'Resources on this page',
+            _hasDocument ? () => unawaited(_openResources()) : null,
+            size: 19,
+          ),
           _toolButton(
             Icons.tune_rounded,
             'Settings',

@@ -598,6 +598,29 @@ final class _ChannelWebViewSession implements WebViewSession {
       });
 
   @override
+  Future<String> applyContentRuleList({
+    required String identifier,
+    String? encodedRules,
+  }) async {
+    final raw = await _channel.invokeMethod<String>(
+      'applyContentRuleList',
+      <String, Object?>{
+        'id': _id,
+        'identifier': identifier,
+        'encodedRules': encodedRules,
+      },
+    );
+    return raw ?? 'missing';
+  }
+
+  @override
+  Future<void> setContentBlockingEnabled(bool enabled) =>
+      _channel.invokeMethod<void>('setContentBlockingEnabled', <String, Object?>{
+        'id': _id,
+        'enabled': enabled,
+      });
+
+  @override
   Future<void> setDebugDisplaySize(double displaySize) =>
       _channel.invokeMethod<void>('setDebugDisplaySize', <String, Object?>{
         'id': _id,

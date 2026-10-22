@@ -97,6 +97,7 @@ final class BrowserController extends ChangeNotifier {
         if (!_navigationEvents.isClosed) _navigationEvents.add(event);
       });
       if (!_pageNetwork) await webView.setPageNetworkEnabled(false);
+      if (_contentBlocking) await webView.setContentBlockingEnabled(true);
       if (initialUri != null) await webView.navigate(initialUri);
       _poll = Timer.periodic(
         const Duration(milliseconds: 800),
@@ -256,6 +257,33 @@ final class BrowserController extends ChangeNotifier {
     final webView = _webView;
     if (webView != null) await webView.setPageNetworkEnabled(enabled);
   }
+
+  /// Compiles (first run) and installs the content-blocker list. The compiled
+  /// list is cached natively by WebKit and shared by later sessions.
+  Future<String> applyContentRuleList({
+    required String identifier,
+    String? encodedRules,
+  }) async {
+    await start();
+    final webView = _webView;
+    if (webView == null) return 'no-webview';
+    return webView.applyContentRuleList(
+      identifier: identifier,
+      encodedRules: encodedRules,
+    );
+  }
+
+  /// Attaches or detaches the installed content-blocker list. Buffered until
+  /// the WebView exists, like [setPageNetworkEnabled].
+  bool _contentBlocking = false;
+
+  Future<void> setContentBlockingEnabled(bool enabled) async {
+    _contentBlocking = enabled;
+    final webView = _webView;
+    if (webView != null) await webView.setContentBlockingEnabled(enabled);
+  }
+
+  bool get contentBlockingEnabled => _contentBlocking;
 
   /// Updates the panel size used by the next documents. Cheap: the injected
   /// bundle is rebuilt natively, nothing is re-evaluated.

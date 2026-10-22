@@ -146,6 +146,26 @@ final class WebViewBridge {
             holder.setPageNetwork(args["enabled"] as? Bool ?? true)
             result(nil)
 
+        case "applyContentRuleList":
+            guard let holder = session(args, result) else { return }
+            guard let identifier = args["identifier"] as? String,
+                  !identifier.isEmpty else {
+                result(FlutterError(code: "webview.contentRules",
+                                    message: "missing identifier",
+                                    details: nil))
+                return
+            }
+            holder.applyContentRuleList(
+                identifier: identifier,
+                encodedRules: args["encodedRules"] as? String
+            ) { status in result(status) }
+
+        case "setContentBlockingEnabled":
+            guard let holder = session(args, result) else { return }
+            holder.setContentBlockingEnabled(
+                args["enabled"] as? Bool ?? true)
+            result(nil)
+
         case "setCookie":
             guard let id = args["id"] as? String,
                   let holder = sessions[id],
@@ -463,6 +483,96 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         guard pageNetworkEnabled != enabled else { return }
         pageNetworkEnabled = enabled
         applyUserScripts()
+    }
+
+    // MARK: - Content blocking
+
+    /// Compiled WebKit content-blocker list, if the host has supplied one.
+    private var contentRuleList: WKContentRuleList?
+    private var contentRuleListAttached = false
+    /// Off until the host explicitly enables it, so a WebView never blocks
+    /// resources without its UI knowing.
+    private(set) var contentBlockingEnabled = false
+
+    /// Looks the list up in the shared store first (it survives launches), and
+    /// compiles it only when [encodedRules] is supplied and no cache exists.
+    ///
+    /// Completion runs on the main thread with `ready`, `missing` or
+    /// `error: …`; the host uses that to show whether blocking is live.
+    func applyContentRuleList(
+        identifier: String,
+        encodedRules: String?,
+        completion: @escaping (String) -> Void
+    ) {
+        let done: (String) -> Void = { status in
+            DispatchQueue.main.async { completion(status) }
+        }
+        let install: (WKContentRuleList) -> Void = { [weak self] list in
+            DispatchQueue.main.async {
+                guard let self else {
+                    done("missing-session")
+                    return
+                }
+                self.installContentRuleList(list)
+                done("ready")
+            }
+        }
+
+        guard let store = WKContentRuleListStore.default() else {
+            done("error: no rule store")
+            return
+        }
+        store.lookUpContentRuleList(forIdentifier: identifier) { list, _ in
+            if let list {
+                install(list)
+                return
+            }
+            guard let encodedRules, !encodedRules.isEmpty else {
+                done("missing")
+                return
+            }
+            store.compileContentRuleList(
+                forIdentifier: identifier,
+                encodedContentRuleList: encodedRules
+            ) { list, error in
+                if let list {
+                    install(list)
+                } else {
+                    done("error: \(error?.localizedDescription ?? "compile failed")")
+                }
+            }
+        }
+    }
+
+    private func installContentRuleList(_ list: WKContentRuleList) {
+        let controller = webView.configuration.userContentController
+        if contentRuleListAttached, let old = contentRuleList {
+            controller.remove(old)
+        }
+        contentRuleList = list
+        contentRuleListAttached = false
+        if contentBlockingEnabled {
+            controller.add(list)
+            contentRuleListAttached = true
+        }
+    }
+
+    /// Adds or removes the compiled list. Safe to call before compilation: the
+    /// flag is remembered and applied when the list arrives.
+    func setContentBlockingEnabled(_ enabled: Bool) {
+        contentBlockingEnabled = enabled
+        let controller = webView.configuration.userContentController
+        guard let list = contentRuleList else {
+            contentRuleListAttached = false
+            return
+        }
+        if enabled && !contentRuleListAttached {
+            controller.add(list)
+            contentRuleListAttached = true
+        } else if !enabled && contentRuleListAttached {
+            controller.remove(list)
+            contentRuleListAttached = false
+        }
     }
 
     /// Turns the debug console on or off. Once on, every document gets one:

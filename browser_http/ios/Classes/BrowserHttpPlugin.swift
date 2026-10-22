@@ -1,16 +1,18 @@
 import Flutter
 import UIKit
 
-/// Registers the three platform channels:
+/// Registers the platform channels:
 /// - `browser_http/cookies`  -> WKHTTPCookieStore
 /// - `browser_http/vault`    -> Keychain
 /// - `browser_http/webview`  -> WKWebView challenge surface
+/// - `browser_http/media`    -> save downloaded images/videos to Photos
 public final class BrowserHttpPlugin: NSObject, FlutterPlugin {
   private static var instance: BrowserHttpPlugin?
 
   private let cookieBridge = CookieBridge()
   private let vaultBridge = KeychainVault()
   private let webViewBridge = WebViewBridge()
+  private let mediaBridge = MediaBridge()
   private let webChannel: FlutterMethodChannel
 
   init(messenger: FlutterBinaryMessenger, registrar: FlutterPluginRegistrar) {
@@ -40,6 +42,14 @@ public final class BrowserHttpPlugin: NSObject, FlutterPlugin {
       name: "browser_http/vault", binaryMessenger: messenger)
     vault.setMethodCallHandler { [weak self] call, result in
       self?.vaultBridge.handle(call, result: result)
+    }
+
+    // Downloaded images/videos are saved through Photos, never through a
+    // second in-memory copy of the body.
+    let media = FlutterMethodChannel(
+      name: "browser_http/media", binaryMessenger: messenger)
+    media.setMethodCallHandler { [weak self] call, result in
+      self?.mediaBridge.handle(call, result: result)
     }
 
     webChannel.setMethodCallHandler { [weak self] call, result in

@@ -1,0 +1,14 @@
+{
+  "name": "EasyList China + EasyList",
+  "identifier": "so-adblock-f00bc1df57",
+  "rules": 53177,
+  "blocks": 46000,
+  "cosmetic": 6000,
+  "exceptions": 1177,
+  "sources": [
+    "easylistchina.txt",
+    "easylist.txt"
+  ],
+  "generatedAt": "2026-10-22T02:19:51.060Z",
+  "bytes": 5862027
+}

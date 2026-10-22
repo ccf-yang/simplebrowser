@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'theme.dart';
 
 /// A browsing action chosen from the sheet instead of "Save & reload".
-enum SettingsAction { goHome, saveBookmark, openBookmarks }
+enum SettingsAction { goHome, saveBookmark, openBookmarks, openDownloads }
 
 /// Values collected by the settings sheet.
 ///
@@ -16,6 +16,7 @@ class SettingsValues {
     required this.cookie,
     required this.showPanel,
     required this.blockExternal,
+    required this.adBlock,
     this.action,
   });
 
@@ -26,6 +27,9 @@ class SettingsValues {
 
   /// Cancel jumps that would leave the app (custom schemes and Universal Links).
   final bool blockExternal;
+
+  /// Install the WebKit content-blocker list for every page.
+  final bool adBlock;
 
   /// Set when the sheet was closed by tapping Home / Save bookmark /
   /// Bookmarks; the page runs the action instead of reloading.
@@ -44,7 +48,10 @@ class SettingsSheet extends StatefulWidget {
     required this.uaLabels,
     required this.onShowPanelChanged,
     required this.onBlockExternalChanged,
+    required this.adBlockEnabled,
+    this.adBlockStatus = '',
     this.bookmarkCount = 0,
+    this.downloadCount = 0,
     this.canSaveBookmark = false,
   });
 
@@ -52,7 +59,13 @@ class SettingsSheet extends StatefulWidget {
   final List<String> uaLabels;
   final ValueChanged<bool> onShowPanelChanged;
   final ValueChanged<bool> onBlockExternalChanged;
+
+  /// Current state plus a short line about the compiled rule set, e.g.
+  /// `53283 rules ready` or `compile failed`.
+  final bool adBlockEnabled;
+  final String adBlockStatus;
   final int bookmarkCount;
+  final int downloadCount;
   final bool canSaveBookmark;
 
   @override
@@ -64,6 +77,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
   late int _refererMode = widget.initial.refererMode;
   late bool _showPanel = widget.initial.showPanel;
   late bool _blockExternal = widget.initial.blockExternal;
+  late bool _adBlock = widget.initial.adBlock;
   late final TextEditingController _cookie =
       TextEditingController(text: widget.initial.cookie);
 
@@ -81,6 +95,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
         cookie: _cookie.text,
         showPanel: _showPanel,
         blockExternal: _blockExternal,
+        adBlock: _adBlock,
         action: action,
       ),
     );
@@ -172,6 +187,8 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   _buildPanelSwitch(),
                   const SizedBox(height: 8),
                   _buildStayInAppSwitch(),
+                  const SizedBox(height: 8),
+                  _buildAdBlockSwitch(),
                   const SizedBox(height: 14),
                   const _FieldLabel('Browsing'),
                   const SizedBox(height: 5),
@@ -203,6 +220,17 @@ class _SettingsSheetState extends State<SettingsSheet> {
                               : 'Bookmarks ${widget.bookmarkCount}',
                           onTap: () =>
                               _save(SettingsAction.openBookmarks),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: _ActionTile(
+                          icon: Icons.download_rounded,
+                          label: widget.downloadCount == 0
+                              ? 'Files'
+                              : 'Files ${widget.downloadCount}',
+                          onTap: () =>
+                              _save(SettingsAction.openDownloads),
                         ),
                       ),
                     ],
@@ -327,6 +355,15 @@ class _SettingsSheetState extends State<SettingsSheet> {
       setState(() => _blockExternal = value);
       widget.onBlockExternalChanged(value);
     },
+  );
+
+  Widget _buildAdBlockSwitch() => _SwitchRow(
+    title: 'Block ads',
+    subtitle: widget.adBlockStatus.isEmpty
+        ? 'WebKit content rules · reload to apply'
+        : widget.adBlockStatus,
+    value: _adBlock,
+    onChanged: (value) => setState(() => _adBlock = value),
   );
 }
 

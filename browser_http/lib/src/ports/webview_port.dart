@@ -152,6 +152,19 @@ abstract interface class WebViewSession {
   /// host collects nothing from the page.
   Future<void> setPageNetworkEnabled(bool enabled);
 
+  /// Installs a WebKit content-blocker list for this WebView.
+  ///
+  /// [encodedRules] is the JSON document Safari expects. It is compiled and
+  /// cached under [identifier]; later calls may omit it and reuse the cache.
+  /// Returns `ready`, `missing` or `error: …`.
+  Future<String> applyContentRuleList({
+    required String identifier,
+    String? encodedRules,
+  });
+
+  /// Attaches or detaches the last applied content-blocker list.
+  Future<void> setContentBlockingEnabled(bool enabled);
+
   /// Whether non-http(s) navigations are cancelled instead of opening another
   /// app, and whether Universal-Link taps are re-issued in-app.
   Future<void> setNavigationPolicy({
