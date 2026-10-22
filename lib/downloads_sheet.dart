@@ -91,15 +91,42 @@ class DownloadsSheet extends StatelessWidget {
                           itemCount: manager.items.length,
                           separatorBuilder: (_, __) =>
                               const SizedBox(height: 7),
-                          itemBuilder: (context, index) => _DownloadTile(
-                            item: manager.items[index],
-                            onCancel: () =>
-                                manager.cancel(manager.items[index]),
-                            onRetry: () =>
-                                manager.retry(manager.items[index]),
-                            onRemove: () =>
-                                manager.remove(manager.items[index]),
-                          ),
+                          itemBuilder: (context, index) {
+                            final item = manager.items[index];
+                            return _DownloadTile(
+                              item: item,
+                              onCancel: () => manager.cancel(item),
+                              onRetry: () => manager.retry(item),
+                              onRemove: () => manager.remove(item),
+                              onPlay: !item.playable
+                                  ? null
+                                  : () async {
+                                      final error = await manager.play(item);
+                                      if (error != null && context.mounted) {
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(
+                                          SnackBar(
+                                            content: Text('播放失败：$error'),
+                                          ),
+                                        );
+                                      }
+                                    },
+                              onShare:
+                                  item.path == null || !item.status.terminal
+                                  ? null
+                                  : () async {
+                                      final error = await manager.share(item);
+                                      if (error != null && context.mounted) {
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(
+                                          SnackBar(
+                                            content: Text('导出失败：$error'),
+                                          ),
+                                        );
+                                      }
+                                    },
+                            );
+                          },
                         ),
                 ),
               ],
@@ -117,12 +144,16 @@ class _DownloadTile extends StatelessWidget {
     required this.onCancel,
     required this.onRetry,
     required this.onRemove,
+    this.onPlay,
+    this.onShare,
   });
 
   final DownloadItem item;
   final VoidCallback onCancel;
   final VoidCallback onRetry;
   final VoidCallback onRemove;
+  final VoidCallback? onPlay;
+  final VoidCallback? onShare;
 
   @override
   Widget build(BuildContext context) {
@@ -130,10 +161,13 @@ class _DownloadTile extends StatelessWidget {
     final canRetry = item.status == DownloadStatus.failed ||
         item.status == DownloadStatus.cancelled;
     final subtitle = switch (item.status) {
-      DownloadStatus.running || DownloadStatus.saving => item.sizeLabel,
+      DownloadStatus.running => item.sizeLabel,
+      DownloadStatus.saving =>
+        item.hls ? '分片已下载，正在合并成 MP4…' : item.sizeLabel,
       DownloadStatus.saved => '已存入相册${item.sizeLabel.isEmpty ? '' : ' · ${item.sizeLabel}'}',
-      DownloadStatus.downloaded =>
-        item.photoError ?? '文件已下载，未存入相册',
+      DownloadStatus.downloaded => item.hls
+          ? (item.photoError ?? '视频已下载，未存入相册')
+          : (item.photoError ?? '文件已下载，未存入相册'),
       DownloadStatus.failed => item.error ?? '下载失败',
       DownloadStatus.cancelled => '已取消',
       DownloadStatus.queued => '等待前面的任务',
@@ -171,6 +205,9 @@ class _DownloadTile extends StatelessWidget {
                       Text(
                         [
                           item.kind == ResourceKind.image ? '图片' : '视频',
+                          if (item.hls) 'M3U8',
+                          if (item.hlsVariantLabel != null)
+                            item.hlsVariantLabel!,
                           if (item.host.isNotEmpty) item.host,
                         ].join(' · '),
                         maxLines: 1,
@@ -196,6 +233,21 @@ class _DownloadTile extends StatelessWidget {
                     ],
                   ),
                 ),
+                if (onPlay != null)
+                  _MiniButton(
+                    icon: Icons.play_circle_outline_rounded,
+                    tooltip: '播放',
+                    onTap: onPlay!,
+                  ),
+                if (onShare != null) ...<Widget>[
+                  const SizedBox(width: 4),
+                  _MiniButton(
+                    icon: Icons.ios_share_rounded,
+                    tooltip: '导出到文件',
+                    onTap: onShare!,
+                  ),
+                ],
+                const SizedBox(width: 4),
                 if (isActive)
                   _MiniButton(
                     icon: Icons.close_rounded,

@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:browser_http/browser_http.dart';
 import 'package:flutter/material.dart';
 
+import 'hls.dart';
 import 'resources.dart';
 import 'theme.dart';
 
@@ -20,10 +23,16 @@ class ResourceSheet extends StatefulWidget {
     super.key,
     required this.controller,
     this.userAgent,
+    this.onLoadVariants,
   });
 
   final BrowserController controller;
   final String? userAgent;
+
+  /// Reads the master playlist behind an `.m3u8` row. The host wires this to
+  /// the download manager so it reuses the browser's cookies and UA.
+  final Future<List<HlsVariant>> Function(SniffedResource resource)?
+      onLoadVariants;
 
   @override
   State<ResourceSheet> createState() => _ResourceSheetState();
@@ -31,6 +40,7 @@ class ResourceSheet extends StatefulWidget {
 
 class _ResourceSheetState extends State<ResourceSheet> {
   final Set<String> _selected = <String>{};
+  final Map<String, HlsVariant> _variants = <String, HlsVariant>{};
   List<SniffedResource> _items = const <SniffedResource>[];
   bool _loading = true;
   String? _error;
@@ -72,7 +82,17 @@ class _ResourceSheetState extends State<ResourceSheet> {
   };
 
   List<SniffedResource> get _chosen => _items
-      .where((item) => item.downloadable && _selected.contains(item.url))
+      .where((item) => _selected.contains(item.url))
+      .toList();
+
+  List<SniffedResource> get _choices => _items
+      .where((item) => _selected.contains(item.url))
+      .map((item) {
+        final variant = _variants[item.url];
+        return variant == null
+            ? item
+            : item.withHlsVariant(variant.uri.toString(), variant.label);
+      })
       .toList();
 
   bool get _allVisibleSelected {
@@ -82,14 +102,6 @@ class _ResourceSheetState extends State<ResourceSheet> {
   }
 
   void _toggle(SniffedResource resource) {
-    if (!resource.downloadable) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('M3U8 是流式播放列表，这一版还不支持下载'),
-        ),
-      );
-      return;
-    }
     setState(() {
       if (!_selected.remove(resource.url)) _selected.add(resource.url);
     });
@@ -111,9 +123,33 @@ class _ResourceSheetState extends State<ResourceSheet> {
   }
 
   void _submit() {
-    final chosen = _chosen;
+    final chosen = _choices;
     if (chosen.isEmpty) return;
     Navigator.of(context).pop(ResourceSheetResult(chosen));
+  }
+
+  Future<void> _pickVariant(SniffedResource resource) async {
+    final loader = widget.onLoadVariants;
+    if (loader == null) return;
+    final chosen = await showModalBottomSheet<_VariantChoice>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(88),
+      builder: (_) => _VariantSheet(
+        resource: resource,
+        variants: loader(resource),
+        current: _variants[resource.url],
+      ),
+    );
+    if (!mounted || chosen == null) return;
+    setState(() {
+      if (chosen.variant == null) {
+        _variants.remove(resource.url);
+      } else {
+        _variants[resource.url] = chosen.variant!;
+      }
+      _selected.add(resource.url);
+    });
   }
 
   @override
@@ -305,6 +341,12 @@ class _ResourceSheetState extends State<ResourceSheet> {
           resource: resource,
           selected: _selected.contains(resource.url),
           headers: _headersFor(resource),
+          variantLabel: resource.hls
+              ? (_variants[resource.url]?.label ?? '自动')
+              : null,
+          onVariantTap: resource.hls && widget.onLoadVariants != null
+              ? () => unawaited(_pickVariant(resource))
+              : null,
           onTap: () => _toggle(resource),
         );
       },
@@ -330,7 +372,9 @@ class _ResourceSheetState extends State<ResourceSheet> {
         children: <Widget>[
           Expanded(
             child: Text(
-              chosen == 0 ? '选择要保存的图片或视频' : '已选 $chosen 项 · 默认存入相册',
+              chosen == 0
+                  ? '选择要保存的图片或视频'
+                  : '已选 $chosen 项 · M3U8 会自动转成 MP4',
               style: const TextStyle(fontSize: 10.5, color: AppColors.muted),
             ),
           ),
@@ -351,6 +395,8 @@ class _ResourceTile extends StatelessWidget {
     required this.selected,
     required this.headers,
     required this.onTap,
+    this.variantLabel,
+    this.onVariantTap,
   });
 
   final SniffedResource resource;
@@ -358,71 +404,105 @@ class _ResourceTile extends StatelessWidget {
   final Map<String, String> headers;
   final VoidCallback onTap;
 
+  /// Non-null only for HLS rows; shows the chosen rendition or `自动`.
+  final String? variantLabel;
+  final VoidCallback? onVariantTap;
+
   @override
   Widget build(BuildContext context) {
-    final enabled = resource.downloadable;
-    return Opacity(
-      opacity: enabled ? 1 : 0.62,
-      child: Material(
-        color: selected ? AppColors.signalWash : AppColors.card,
+    return Material(
+      color: selected ? AppColors.signalWash : AppColors.card,
+      borderRadius: BorderRadius.circular(13),
+      child: InkWell(
         borderRadius: BorderRadius.circular(13),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(13),
-          onTap: onTap,
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(8, 7, 10, 7),
-            decoration: BoxDecoration(
-              border: Border.all(
-                color: selected ? AppColors.signalLine : AppColors.line,
-              ),
-              borderRadius: BorderRadius.circular(13),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(8, 7, 10, 7),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: selected ? AppColors.signalLine : AppColors.line,
             ),
-            child: Row(
-              children: <Widget>[
-                _thumbnail(),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        resource.displayName,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                        ),
+            borderRadius: BorderRadius.circular(13),
+          ),
+          child: Row(
+            children: <Widget>[
+              _thumbnail(),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      resource.displayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
                       ),
-                      const SizedBox(height: 3),
-                      Text(
-                        [
-                          resource.kind == ResourceKind.image ? '图片' : '视频',
-                          if (resource.host.isNotEmpty) resource.host,
-                          if (resource.metaLabel.isNotEmpty) resource.metaLabel,
-                        ].join(' · '),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 9,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      [
+                        resource.kind == ResourceKind.image ? '图片' : '视频',
+                        if (resource.host.isNotEmpty) resource.host,
+                        if (resource.metaLabel.isNotEmpty) resource.metaLabel,
+                      ].join(' · '),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 9,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (variantLabel != null) ...<Widget>[
+                const SizedBox(width: 6),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: onVariantTap,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppColors.wash,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Text(
+                          variantLabel!,
+                          style: const TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.ink2,
+                          ),
+                        ),
+                        const SizedBox(width: 2),
+                        const Icon(
+                          Icons.tune_rounded,
+                          size: 11,
                           color: AppColors.muted,
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
-                const SizedBox(width: 8),
-                Icon(
-                  !enabled
-                      ? Icons.lock_outline_rounded
-                      : selected
-                          ? Icons.check_circle_rounded
-                          : Icons.radio_button_unchecked_rounded,
-                  size: 19,
-                  color: enabled ? AppColors.ink : AppColors.faint,
-                ),
               ],
-            ),
+              const SizedBox(width: 8),
+              Icon(
+                selected
+                    ? Icons.check_circle_rounded
+                    : Icons.radio_button_unchecked_rounded,
+                size: 19,
+                color: AppColors.ink,
+              ),
+            ],
           ),
         ),
       ),
@@ -460,6 +540,232 @@ class _ResourceTile extends StatelessWidget {
         errorBuilder: (_, __, ___) => fallback,
         loadingBuilder: (context, child, progress) =>
             progress == null ? child : fallback,
+      ),
+    );
+  }
+}
+
+final class _VariantChoice {
+  const _VariantChoice(this.variant);
+
+  const _VariantChoice.auto() : variant = null;
+
+  final HlsVariant? variant;
+}
+
+/// Quality picker for one HLS row. Renditions come from the master playlist;
+/// a plain media playlist only offers [auto].
+class _VariantSheet extends StatelessWidget {
+  const _VariantSheet({
+    required this.resource,
+    required this.variants,
+    this.current,
+  });
+
+  final SniffedResource resource;
+  final Future<List<HlsVariant>> variants;
+  final HlsVariant? current;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.sizeOf(context).height * 0.55,
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          children: <Widget>[
+            const SizedBox(height: 8),
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.line2,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 12, 18, 9),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text(
+                    '清晰度',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: -0.3,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    resource.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: AppColors.muted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: FutureBuilder<List<HlsVariant>>(
+                future: variants,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState != ConnectionState.done) {
+                    return const Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: <Widget>[
+                          SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: AppColors.ink,
+                            ),
+                          ),
+                          SizedBox(height: 10),
+                          Text(
+                            '正在读取清晰度列表…',
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              color: AppColors.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }
+                  final list = snapshot.data ?? const <HlsVariant>[];
+                  final error = snapshot.error;
+                  return ListView(
+                    padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+                    children: <Widget>[
+                      _VariantTile(
+                        title: '自动（最高画质）',
+                        detail: list.isEmpty
+                            ? '跟随播放列表默认的一档'
+                            : '选择带宽最高的一档',
+                        selected: current == null,
+                        onTap: () => Navigator.of(context).pop(
+                          const _VariantChoice.auto(),
+                        ),
+                      ),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(10, 12, 10, 4),
+                          child: Text(
+                            '读取清晰度失败：$error\n下载时会自动选择一档。',
+                            style: const TextStyle(
+                              fontSize: 10,
+                              height: 1.5,
+                              color: AppColors.danger,
+                            ),
+                          ),
+                        ),
+                      for (final variant in list)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: _VariantTile(
+                            title: variant.label,
+                            detail: variant.detail.isEmpty
+                                ? variant.uri.host
+                                : variant.detail,
+                            selected: current?.uri.toString() ==
+                                variant.uri.toString(),
+                            onTap: () => Navigator.of(context).pop(
+                              _VariantChoice(variant),
+                            ),
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _VariantTile extends StatelessWidget {
+  const _VariantTile({
+    required this.title,
+    required this.detail,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String title;
+  final String detail;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected ? AppColors.signalWash : AppColors.card,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(13, 11, 11, 11),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: selected ? AppColors.signalLine : AppColors.line,
+            ),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (detail.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 3),
+                      Text(
+                        detail,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 9.5,
+                          color: AppColors.muted,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              Icon(
+                selected
+                    ? Icons.check_circle_rounded
+                    : Icons.radio_button_unchecked_rounded,
+                size: 18,
+                color: selected ? AppColors.ink : AppColors.faint,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

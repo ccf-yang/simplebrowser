@@ -4,8 +4,7 @@ import 'package:browser_http/browser_http.dart';
 ///
 /// WebKit exposes no response bodies for subresources, so every entry is a URL
 /// plus whatever metadata the DOM or the Performance API provides. Direct files
-/// are downloadable; `blob:`/MSE streams never leave the page and HLS
-/// playlists are listed but not fetched in this version.
+/// stream as-is; `.m3u8` playlists are expanded by the download manager.
 enum ResourceKind { image, video }
 
 final class SniffedResource {
@@ -19,6 +18,8 @@ final class SniffedResource {
     this.height,
     this.size,
     this.hls = false,
+    this.hlsVariantUrl,
+    this.hlsVariantLabel,
   });
 
   final String url;
@@ -30,10 +31,31 @@ final class SniffedResource {
   final int? height;
   final int? size;
 
-  /// `.m3u8` (Apple HLS). Listed, visibly unsupported, never downloaded.
+  /// `.m3u8` (Apple HLS).
   final bool hls;
 
-  bool get downloadable => !hls;
+  /// A rendition the user picked from the master playlist. Null means the
+  /// downloader takes the highest bandwidth.
+  final String? hlsVariantUrl;
+  final String? hlsVariantLabel;
+
+  bool get downloadable => true;
+
+  SniffedResource withHlsVariant(String? variantUrl, String? label) {
+    return SniffedResource(
+      url: url,
+      pageUrl: pageUrl,
+      kind: kind,
+      title: title,
+      poster: poster,
+      width: width,
+      height: height,
+      size: size,
+      hls: hls,
+      hlsVariantUrl: variantUrl,
+      hlsVariantLabel: label,
+    );
+  }
 
   String get host => Uri.tryParse(url)?.host ?? '';
 
@@ -71,7 +93,10 @@ final class SniffedResource {
       parts.add('${width!}×${height!}');
     }
     if (hls) {
-      parts.add('M3U8 · 暂不支持');
+      parts.add('M3U8');
+      if (hlsVariantLabel != null && hlsVariantLabel!.isNotEmpty) {
+        parts.add(hlsVariantLabel!);
+      }
     } else if (size != null && size! > 0) {
       parts.add(_bytes(size!));
     }

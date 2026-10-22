@@ -771,6 +771,11 @@ class _BrowserPageState extends State<BrowserPage>
       builder: (_) => ResourceSheet(
         controller: _browser,
         userAgent: _effectiveUserAgent,
+        onLoadVariants: (resource) => _downloads.loadVariants(
+          resource.url,
+          userAgent: _effectiveUserAgent,
+          pageUrl: resource.pageUrl,
+        ),
       ),
     );
     if (!mounted || result == null) return;

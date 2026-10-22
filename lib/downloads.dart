@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:browser_http/browser_http.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'hls.dart';
 import 'resources.dart';
 
 enum DownloadStatus {
@@ -22,7 +24,7 @@ extension DownloadStatusLabel on DownloadStatus {
   String get label => switch (this) {
     DownloadStatus.queued => '等待中',
     DownloadStatus.running => '下载中',
-    DownloadStatus.saving => '正在存入相册',
+    DownloadStatus.saving => '正在处理视频',
     DownloadStatus.saved => '已存相册',
     DownloadStatus.downloaded => '已下载',
     DownloadStatus.failed => '失败',
@@ -53,6 +55,9 @@ final class DownloadItem {
     required this.fileName,
     required this.createdAt,
     this.userAgent,
+    this.hls = false,
+    this.hlsVariant,
+    this.hlsVariantLabel,
     this.status = DownloadStatus.queued,
     this.received = 0,
     this.total,
@@ -70,9 +75,20 @@ final class DownloadItem {
   final DateTime createdAt;
   final String? userAgent;
 
+  /// `.m3u8` playlist. [hlsVariant] is the chosen rendition URL, or null to
+  /// take the highest bandwidth the master playlist advertises.
+  final bool hls;
+  final String? hlsVariant;
+
+  /// Resolved from the master playlist when the download starts, so the
+  /// label is filled in even for the automatic choice.
+  String? hlsVariantLabel;
+
   DownloadStatus status;
   int received;
   int? total;
+  int? segmentsDone;
+  int? segmentsTotal;
   String? path;
   String? error;
   String? photoError;
@@ -82,17 +98,37 @@ final class DownloadItem {
   String get host => Uri.tryParse(url)?.host ?? '';
 
   double? get progress {
+    final segments = segmentsTotal;
+    if (segments != null && segments > 0) {
+      return ((segmentsDone ?? 0) / segments).clamp(0.0, 1.0).toDouble();
+    }
     final value = total;
     if (value == null || value <= 0) return null;
     return (received / value).clamp(0.0, 1.0).toDouble();
   }
 
   String get sizeLabel {
+    final segments = segmentsTotal;
+    if (segments != null) {
+      return '${_bytes(received)} · ${segmentsDone ?? 0}/$segments 段';
+    }
     final value = total;
     if (value == null || value <= 0) {
       return received > 0 ? _bytes(received) : '';
     }
     return '${_bytes(received)} / ${_bytes(value)}';
+  }
+
+  bool get playable {
+    final value = path;
+    if (value == null || !status.terminal || kind != ResourceKind.video) {
+      return false;
+    }
+    final lower = value.toLowerCase();
+    return lower.endsWith('.mp4') ||
+        lower.endsWith('.m4v') ||
+        lower.endsWith('.mov') ||
+        lower.endsWith('.ts');
   }
 
   static String _bytes(int bytes) {
@@ -122,6 +158,9 @@ final class DownloadItem {
     'error': error,
     'photoError': photoError,
     'savedToPhotos': savedToPhotos,
+    'hls': hls,
+    'hlsVariant': hlsVariant,
+    'hlsVariantLabel': hlsVariantLabel,
   };
 
   static DownloadItem? fromJson(Map<Object?, Object?> json) {
@@ -145,6 +184,9 @@ final class DownloadItem {
       kind: kind,
       fileName: fileName,
       createdAt: created ?? DateTime.now(),
+      hls: json['hls'] == true,
+      hlsVariant: json['hlsVariant']?.toString(),
+      hlsVariantLabel: json['hlsVariantLabel']?.toString(),
       status: status,
       received: _asInt(json['received']) ?? 0,
       total: _asInt(json['total']),
@@ -163,6 +205,10 @@ final class DownloadItem {
 }
 
 /// Sequential download queue with retry, cancellation and auto-save to Photos.
+///
+/// Plain files stream straight to disk. HLS playlists go through a second
+/// path: fetch the playlist chain, pick a rendition, fetch/decrypt segments
+/// in small batches, concatenate, then remux TS into MP4 natively.
 final class DownloadManager extends ChangeNotifier {
   DownloadManager({required this.session, this.onFinished});
 
@@ -227,9 +273,8 @@ final class DownloadManager extends ChangeNotifier {
   }
 
   void enqueueAll(Iterable<SniffedResource> resources, {String? userAgent}) {
-    final accepted = resources.where((resource) => resource.downloadable);
     var added = 0;
-    for (final resource in accepted) {
+    for (final resource in resources) {
       final item = DownloadItem(
         id: 'dl-${DateTime.now().microsecondsSinceEpoch}-${_counter++}',
         url: resource.url,
@@ -238,6 +283,9 @@ final class DownloadManager extends ChangeNotifier {
         fileName: resource.fileName,
         createdAt: DateTime.now(),
         userAgent: userAgent,
+        hls: resource.hls,
+        hlsVariant: resource.hlsVariantUrl,
+        hlsVariantLabel: resource.hlsVariantLabel,
       );
       items.insert(0, item);
       _queue.add(item);
@@ -265,6 +313,8 @@ final class DownloadManager extends ChangeNotifier {
       ..status = DownloadStatus.queued
       ..received = 0
       ..total = null
+      ..segmentsDone = null
+      ..segmentsTotal = null
       ..path = null
       ..error = null
       ..photoError = null
@@ -287,6 +337,75 @@ final class DownloadManager extends ChangeNotifier {
     items.removeWhere((item) => item.status.terminal);
     _notify(force: true);
     unawaited(_persist());
+  }
+
+  /// Reads a master playlist and returns its renditions, highest first.
+  /// An empty list means the URL points at a media playlist (or is not HLS).
+  Future<List<HlsVariant>> loadVariants(
+    String url, {
+    String? userAgent,
+    String? pageUrl,
+  }) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty) {
+      return const <HlsVariant>[];
+    }
+    final headers = <OrderedHeader>[
+      if (userAgent != null && userAgent.isNotEmpty)
+        OrderedHeader('User-Agent', userAgent),
+      if (pageUrl != null && pageUrl.isNotEmpty)
+        OrderedHeader('Referer', pageUrl),
+      const OrderedHeader(
+        'Accept',
+        'application/vnd.apple.mpegurl,video/*,*/*;q=0.8',
+      ),
+    ];
+    final playlist = HlsPlaylist.parse(
+      await _fetchText(uri, headers, CancelToken())
+          .timeout(const Duration(seconds: 20)),
+      uri,
+    );
+    return playlist.isMaster ? playlist.sortedVariants : const <HlsVariant>[];
+  }
+
+  /// Opens the system player on a completed file.
+  Future<String?> play(DownloadItem item) async {
+    final path = item.path;
+    if (path == null || !await File(path).exists()) return '文件不存在';
+    try {
+      final status = await _media.invokeMethod<String>(
+        'playFile',
+        <String, Object?>{'path': path},
+      );
+      return status == 'ok' ? null : (status ?? '无法播放');
+    } on MissingPluginException {
+      return '当前构建不支持内置播放';
+    } on PlatformException catch (error) {
+      return error.message ?? '无法播放';
+    } on Object catch (error) {
+      return error.toString();
+    }
+  }
+
+  /// Opens the system share sheet so the file can go to Files, AirDrop, etc.
+  Future<String?> share(DownloadItem item) async {
+    final path = item.path;
+    if (path == null || !await File(path).exists()) return '文件不存在';
+    try {
+      final status = await _media.invokeMethod<String>(
+        'shareFile',
+        <String, Object?>{'path': path},
+      );
+      return status == 'ok' ? null : (status ?? '无法分享');
+    } on MissingPluginException {
+      return '当前构建不支持导出';
+    } on PlatformException catch (error) {
+      return error.message ?? '无法分享';
+    } on Object catch (error) {
+      return error.toString();
+    }
   }
 
   Future<void> _pump() async {
@@ -316,6 +435,8 @@ final class DownloadManager extends ChangeNotifier {
       ..status = DownloadStatus.running
       ..received = 0
       ..total = null
+      ..segmentsDone = null
+      ..segmentsTotal = null
       ..path = null
       ..error = null
       ..photoError = null
@@ -325,6 +446,7 @@ final class DownloadManager extends ChangeNotifier {
 
     File? file;
     IOSink? sink;
+    _MediaFile? hlsResult;
     try {
       final uri = Uri.tryParse(item.url);
       if (uri == null ||
@@ -332,78 +454,81 @@ final class DownloadManager extends ChangeNotifier {
           uri.host.isEmpty) {
         throw const FormatException('无效的资源地址');
       }
-      final headers = <OrderedHeader>[
-        if (item.userAgent != null && item.userAgent!.isNotEmpty)
-          OrderedHeader('User-Agent', item.userAgent!),
-        if (item.pageUrl.isNotEmpty)
-          OrderedHeader('Referer', item.pageUrl),
-        OrderedHeader(
-          'Accept',
-          item.kind == ResourceKind.image
-              ? 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-              : 'video/*,*/*;q=0.8',
-        ),
-      ];
-      final response = await session.openStream(
-        TransportRequest(
-          method: 'GET',
-          uri: uri,
-          profileId: session.profile.id,
-          headers: headers,
-        ),
-        cancelToken: token,
-      );
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException('HTTP ${response.statusCode}', uri: uri);
+      final headers = _headersFor(item);
+
+      if (item.hls || uri.path.toLowerCase().endsWith('.m3u8')) {
+        hlsResult = await _downloadHls(item, uri, headers, token);
+        file = hlsResult.file;
+      } else {
+        final response = await session.openStream(
+          TransportRequest(
+            method: 'GET',
+            uri: uri,
+            profileId: session.profile.id,
+            headers: headers,
+          ),
+          cancelToken: token,
+        );
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw HttpException('HTTP ${response.statusCode}', uri: uri);
+        }
+
+        final contentType =
+            (response.header('content-type') ?? '').toLowerCase().trim();
+        if (contentType.startsWith('text/html') ||
+            contentType.startsWith('application/json') ||
+            contentType.startsWith('text/plain')) {
+          throw const FormatException('服务器返回了网页而不是媒体文件');
+        }
+
+        final rawLength = response.header('content-length');
+        final length = rawLength == null ? null : int.tryParse(
+          rawLength.split(';').first.trim(),
+        );
+        item.total = length != null && length > 0 ? length : null;
+
+        final dir = _downloadDir;
+        if (dir == null) throw const FileSystemException('找不到应用目录');
+        await dir.create(recursive: true);
+
+        final name = _fileNameFor(item, contentType);
+        file = File('${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name');
+        item.path = file.path;
+        sink = file.openWrite();
+
+        await for (final chunk in response.body) {
+          if (token.isCancelled) break;
+          sink.add(chunk);
+          item.received += chunk.length;
+          _notify();
+        }
+        if (token.isCancelled) throw const _DownloadCancelled();
+        await sink.flush();
+        await sink.close();
+        sink = null;
       }
 
-      final contentType =
-          (response.header('content-type') ?? '').toLowerCase().trim();
-      if (contentType.startsWith('text/html') ||
-          contentType.startsWith('application/json') ||
-          contentType.startsWith('text/plain')) {
-        throw const FormatException('服务器返回了网页而不是媒体文件');
-      }
-
-      final rawLength = response.header('content-length');
-      final length = rawLength == null ? null : int.tryParse(
-        rawLength.split(';').first.trim(),
-      );
-      item.total = length != null && length > 0 ? length : null;
-
-      final dir = _downloadDir;
-      if (dir == null) throw const FileSystemException('找不到应用目录');
-      await dir.create(recursive: true);
-
-      final name = _fileNameFor(item, contentType);
-      file = File('${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name');
-      item.path = file.path;
-      sink = file.openWrite();
-
-      await for (final chunk in response.body) {
-        if (token.isCancelled) break;
-        sink.add(chunk);
-        item.received += chunk.length;
-        _notify();
-      }
       if (token.isCancelled) throw const _DownloadCancelled();
-      await sink.flush();
-      await sink.close();
-      sink = null;
 
       item.status = DownloadStatus.saving;
       _notify(force: true);
-      final saved = await _saveToPhotos(file, item);
-      if (saved == 'ok') {
-        item
-          ..status = DownloadStatus.saved
-          ..savedToPhotos = true;
-      } else {
+      if (hlsResult != null && !hlsResult.saveable) {
         item
           ..status = DownloadStatus.downloaded
-          ..photoError = saved == 'denied'
-              ? '相册权限未开启，文件留在 App 内'
-              : '存相册失败：$saved';
+          ..photoError = hlsResult.note;
+      } else {
+        final saved = await _saveToPhotos(file, item);
+        if (saved == 'ok') {
+          item
+            ..status = DownloadStatus.saved
+            ..savedToPhotos = true;
+        } else {
+          item
+            ..status = DownloadStatus.downloaded
+            ..photoError = saved == 'denied'
+                ? '相册权限未开启，文件留在 App 内'
+                : '存相册失败：$saved';
+        }
       }
     } on Object catch (error) {
       try {
@@ -431,6 +556,360 @@ final class DownloadManager extends ChangeNotifier {
       _notify(force: true);
       onFinished?.call(item);
     }
+  }
+
+  Future<_MediaFile> _downloadHls(
+    DownloadItem item,
+    Uri rootUri,
+    List<OrderedHeader> headers,
+    CancelToken token,
+  ) async {
+    var playlist = HlsPlaylist.parse(
+      await _fetchText(rootUri, headers, token),
+      rootUri,
+    );
+    if (playlist.isMaster) {
+      final variants = playlist.sortedVariants;
+      if (variants.isEmpty) {
+        throw const FormatException('播放列表没有可选的清晰度');
+      }
+      HlsVariant? selected;
+      final wanted = item.hlsVariant;
+      if (wanted != null) {
+        for (final variant in variants) {
+          if (variant.uri.toString() == wanted) {
+            selected = variant;
+            break;
+          }
+        }
+      }
+      selected ??= variants.first;
+      item.hlsVariantLabel ??= selected.label;
+      playlist = HlsPlaylist.parse(
+        await _fetchText(selected.uri, headers, token),
+        selected.uri,
+      );
+      if (playlist.isMaster) {
+        throw const FormatException('M3U8 嵌套层数过多');
+      }
+    }
+
+    final unsupported = playlist.unsupportedReason;
+    if (unsupported != null) throw FormatException(unsupported);
+    if (playlist.segments.isEmpty) {
+      throw const FormatException('播放列表里没有可下载的分片');
+    }
+
+    final dir = _downloadDir;
+    if (dir == null) throw const FileSystemException('找不到应用目录');
+    await dir.create(recursive: true);
+
+    final fmp4 = playlist.isFragmentedMp4;
+    final base = _hlsBaseName(item);
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final temp = File(
+      '${dir.path}/.${stamp}_$base.${fmp4 ? 'mp4' : 'ts'}',
+    );
+    item
+      ..path = temp.path
+      ..segmentsTotal = playlist.segments.length
+      ..segmentsDone = 0;
+    _notify(force: true);
+
+    final keys = <String, Uint8List>{};
+    IOSink? sink;
+    try {
+      sink = temp.openWrite();
+      final init = playlist.init;
+      if (init != null) {
+        var bytes = await _fetchBytes(
+          init.uri,
+          headers,
+          token,
+          range: init.range,
+        );
+        final initKey = init.key;
+        if (initKey != null && initKey.method == HlsEncryption.aes128) {
+          bytes = await _decryptHls(
+            bytes,
+            initKey,
+            0,
+            keys,
+            headers,
+            token,
+          );
+        }
+        sink.add(bytes);
+        item.received += bytes.length;
+      }
+
+      const window = 4;
+      for (var start = 0; start < playlist.segments.length; start += window) {
+        if (token.isCancelled) throw const _DownloadCancelled();
+        final end = (start + window) < playlist.segments.length
+            ? start + window
+            : playlist.segments.length;
+        final batch = playlist.segments.sublist(start, end);
+        final chunks = await Future.wait(<Future<Uint8List>>[
+          for (final segment in batch)
+            _fetchSegment(segment, headers, token, keys),
+        ]);
+        if (token.isCancelled) throw const _DownloadCancelled();
+        for (var i = 0; i < chunks.length; i++) {
+          sink.add(chunks[i]);
+          item.received += chunks[i].length;
+          item.segmentsDone = start + i + 1;
+          _notify();
+        }
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+    } on Object {
+      try {
+        await sink?.close();
+      } on Object {
+        // The partial file is deleted below either way.
+      }
+      sink = null;
+      try {
+        if (await temp.exists()) await temp.delete();
+      } on Object {
+        // Best effort.
+      }
+      item
+        ..path = null
+        ..segmentsDone = null
+        ..segmentsTotal = null;
+      rethrow;
+    }
+
+    if (token.isCancelled) {
+      try {
+        await temp.delete();
+      } on Object {
+        // Best effort.
+      }
+      item.path = null;
+      throw const _DownloadCancelled();
+    }
+
+    if (fmp4) {
+      // init + fragments already form a complete MP4; only the name is rough.
+      final out = File('${dir.path}/${stamp}_$base.mp4');
+      await temp.rename(out.path);
+      item.path = out.path;
+      return _MediaFile(out, saveable: true);
+    }
+
+    final out = File('${dir.path}/${stamp}_$base.mp4');
+    item.status = DownloadStatus.saving;
+    _notify(force: true);
+    String? note;
+    try {
+      final status = await _media.invokeMethod<String>(
+        'remuxToMp4',
+        <String, Object?>{
+          'source': temp.path,
+          'destination': out.path,
+        },
+      );
+      if (status == 'ok' && await out.exists() && await out.length() > 1024) {
+        try {
+          await temp.delete();
+        } on Object {
+          // The MP4 is what matters; the TS copy can be cleaned later.
+        }
+        item.path = out.path;
+        return _MediaFile(out, saveable: true);
+      }
+      note = status ?? '转封装失败';
+    } on MissingPluginException {
+      note = '当前构建不支持视频转封装';
+    } on PlatformException catch (error) {
+      note = error.message ?? '转封装失败';
+    } on Object catch (error) {
+      note = '$error';
+    }
+
+    item.path = temp.path;
+    final message = note.startsWith('error: ')
+        ? note.substring('error: '.length)
+        : note;
+    return _MediaFile(
+      temp,
+      saveable: false,
+      note: '已保留 TS 文件，转 MP4 失败：$message',
+    );
+  }
+
+  Future<Uint8List> _fetchSegment(
+    HlsSegment segment,
+    List<OrderedHeader> headers,
+    CancelToken token,
+    Map<String, Uint8List> keys,
+  ) async {
+    var bytes = await _fetchBytesRetry(
+      segment.uri,
+      headers,
+      token,
+      range: segment.range,
+    );
+    final key = segment.key;
+    if (key.method == HlsEncryption.unsupported) {
+      throw const FormatException('这个视频使用了暂不支持的 DRM 加密');
+    }
+    if (key.method == HlsEncryption.aes128) {
+      bytes = await _decryptHls(
+        bytes,
+        key,
+        segment.sequence,
+        keys,
+        headers,
+        token,
+      );
+    }
+    return bytes;
+  }
+
+  Future<Uint8List> _decryptHls(
+    Uint8List data,
+    HlsKey key,
+    int sequence,
+    Map<String, Uint8List> keys,
+    List<OrderedHeader> headers,
+    CancelToken token,
+  ) async {
+    final uri = key.uri;
+    if (uri == null) throw const FormatException('加密分片缺少密钥地址');
+    var keyBytes = keys[uri.toString()];
+    if (keyBytes == null) {
+      keyBytes = await _fetchBytes(uri, headers, token);
+      keys[uri.toString()] = keyBytes;
+    }
+    if (keyBytes.length != 16) {
+      throw FormatException('密钥长度异常（${keyBytes.length} 字节）');
+    }
+    final iv = key.iv ?? hlsSequenceIv(sequence);
+    try {
+      final out = await _media.invokeMethod<Uint8List>(
+        'aesDecrypt',
+        <String, Object?>{
+          'data': data,
+          'key': keyBytes,
+          'iv': Uint8List.fromList(iv),
+        },
+      );
+      if (out == null || out.isEmpty) {
+        throw const FormatException('AES 解密返回空数据');
+      }
+      return out;
+    } on MissingPluginException {
+      throw const FormatException('当前构建不支持 AES 解密');
+    } on PlatformException catch (error) {
+      throw FormatException('AES 解密失败：${error.message ?? error.code}');
+    }
+  }
+
+  Future<Uint8List> _fetchBytesRetry(
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token, {
+    HlsByteRange? range,
+  }) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await _fetchBytes(uri, headers, token, range: range);
+      } on FormatException {
+        rethrow;
+      } on Object {
+        if (token.isCancelled || attempt >= 2) rethrow;
+        await Future<void>.delayed(const Duration(milliseconds: 450));
+      }
+    }
+  }
+
+  Future<Uint8List> _fetchBytes(
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token, {
+    HlsByteRange? range,
+  }) async {
+    final response = await session.openStream(
+      TransportRequest(
+        method: 'GET',
+        uri: uri,
+        profileId: session.profile.id,
+        headers: <OrderedHeader>[
+          ...headers,
+          if (range != null)
+            OrderedHeader('Range', 'bytes=${range.start}-${range.end}'),
+        ],
+      ),
+      cancelToken: token,
+    );
+    if (response.statusCode != 200 && response.statusCode != 206) {
+      throw HttpException('HTTP ${response.statusCode}', uri: uri);
+    }
+    final builder = BytesBuilder(copy: false);
+    await for (final chunk in response.body) {
+      if (token.isCancelled) throw const _DownloadCancelled();
+      builder.add(chunk);
+    }
+    var bytes = builder.takeBytes();
+    if (range != null) {
+      if (response.statusCode == 200) {
+        // The server ignored Range; slice the full body ourselves.
+        if (range.end >= bytes.length) {
+          throw const FormatException('Range 请求返回的长度不足');
+        }
+        bytes = Uint8List.sublistView(bytes, range.start, range.end + 1);
+      } else if (bytes.length > range.length) {
+        bytes = Uint8List.sublistView(bytes, 0, range.length);
+      }
+    }
+    return bytes;
+  }
+
+  Future<String> _fetchText(
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token,
+  ) async {
+    final bytes = await _fetchBytes(uri, headers, token);
+    final text = utf8.decode(bytes, allowMalformed: true);
+    if (!text.trimLeft().startsWith('#EXTM3U')) {
+      throw const FormatException('服务器返回的不是 M3U8 播放列表');
+    }
+    return text;
+  }
+
+  List<OrderedHeader> _headersFor(DownloadItem item) {
+    return <OrderedHeader>[
+      if (item.userAgent != null && item.userAgent!.isNotEmpty)
+        OrderedHeader('User-Agent', item.userAgent!),
+      if (item.pageUrl.isNotEmpty)
+        OrderedHeader('Referer', item.pageUrl),
+      OrderedHeader(
+        'Accept',
+        item.hls
+            ? 'application/vnd.apple.mpegurl,video/*,*/*;q=0.8'
+            : item.kind == ResourceKind.image
+                ? 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+                : 'video/*,*/*;q=0.8',
+      ),
+    ];
+  }
+
+  String _hlsBaseName(DownloadItem item) {
+    var name = item.fileName.trim();
+    if (name.isEmpty) name = 'video';
+    final dot = name.lastIndexOf('.');
+    if (dot > 0) name = name.substring(0, dot);
+    name = name.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]+'), '_').trim();
+    if (name.isEmpty) name = 'video';
+    if (name.length > 60) name = name.substring(0, 60);
+    return name;
   }
 
   /// File names from a CDN often have no extension; Photos infers the type
@@ -525,6 +1004,14 @@ final class DownloadManager extends ChangeNotifier {
     }
     super.dispose();
   }
+}
+
+final class _MediaFile {
+  const _MediaFile(this.file, {required this.saveable, this.note});
+
+  final File file;
+  final bool saveable;
+  final String? note;
 }
 
 final class _DownloadCancelled implements Exception {
