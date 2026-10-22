@@ -169,7 +169,26 @@ class _BrowserPageState extends State<BrowserPage>
   // WebView, so it cannot be torn down by a navigation or hidden by page CSS.
   bool _consoleOpen = false;
   double _consoleSize = 50;
+  int _consoleTab = 0; // 0 console, 1 elements, 2 network, 3 storage, 4 page
   final List<_ConsoleLine> _consoleLines = <_ConsoleLine>[];
+  final TextEditingController _jsInput = TextEditingController();
+
+  // Elements tab: the DOM outline is read through evaluate() on demand.
+  final List<_DomNode> _domNodes = <_DomNode>[];
+  bool _domLoading = false;
+  String? _domError;
+
+  // Storage tab: cookies, localStorage and sessionStorage.
+  final List<_StorageRow> _storageRows = <_StorageRow>[];
+  bool _storageLoading = false;
+  String? _storageError;
+  bool _storageLoaded = false;
+
+  /// The Network tab hides rows older than the last Clear without touching
+  /// the info panel's own Log.
+  DateTime? _networkClearedAt;
+
+  Timer? _consoleRefreshTimer;
 
   // Bookmarks live in the app container, not in the WebView profile.
   final List<_Bookmark> _bookmarks = <_Bookmark>[];
@@ -303,9 +322,9 @@ class _BrowserPageState extends State<BrowserPage>
       );
     }
 
-    // Everything below is the Log tab. While the panel is closed (including
-    // the console hiding it) nothing is collected: no rows are kept.
-    if (!_panelVisible) return;
+    // Everything below feeds the Log tab and the console's Network tab. With
+    // both surfaces closed nothing is collected.
+    if (!_panelVisible && !_consoleOpen) return;
 
     final log = RequestLogEvent(
       id: 'nav-${_navSeq++}',
@@ -343,6 +362,12 @@ class _BrowserPageState extends State<BrowserPage>
         _events.removeLast();
       }
     });
+
+    // New document: the DOM and the storage snapshot in the console are stale.
+    if (_consoleOpen &&
+        (event.kind == 'committed' || event.kind == 'redirect')) {
+      _scheduleConsoleRefresh();
+    }
   }
 
   /// Appends one line to the in-app console.
@@ -645,7 +670,7 @@ class _BrowserPageState extends State<BrowserPage>
       // and let it take over again when the console closes.
       if (!_consoleOpen) _panelVisible = value;
     });
-    _applyPanelCollection(clear: !value);
+    _applyPanelCollection(clear: !value && !_consoleOpen);
   }
 
   /// The info panel is the only consumer of Page/Log data. While it is closed
@@ -743,7 +768,6 @@ class _BrowserPageState extends State<BrowserPage>
           break;
       }
     }
-    if (!_panelVisible) return;
     setState(() {
       final existing = _pageRequests[event.key];
       _pageRequests[event.key] = existing == null
@@ -930,6 +954,8 @@ class _BrowserPageState extends State<BrowserPage>
 
   @override
   void dispose() {
+    _consoleRefreshTimer?.cancel();
+    _jsInput.dispose();
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
     unawaited(_pageSubscription.cancel());
@@ -2042,6 +2068,8 @@ class _BrowserPageState extends State<BrowserPage>
     });
     _applyPanelCollection();
     _pushToConsole('Console opened · ${_browser.url ?? ''}');
+    if (_consoleTab == 1) unawaited(_refreshDom());
+    if (_consoleTab == 3) unawaited(_refreshStorage());
   }
 
   void _applyConsoleSize(double value) {
@@ -2050,85 +2078,962 @@ class _BrowserPageState extends State<BrowserPage>
     setState(() => _consoleSize = size);
   }
 
+  // ---------------------------------------------------------------------------
+  // Console tabs: Log / Elements / Network / Storage / Page
+  // ---------------------------------------------------------------------------
+
+  void _selectConsoleTab(int index) {
+    if (_consoleTab == index) {
+      if (index == 1) unawaited(_refreshDom());
+      if (index == 3) unawaited(_refreshStorage());
+      return;
+    }
+    setState(() => _consoleTab = index);
+    if (index == 1) unawaited(_refreshDom());
+    if (index == 3) unawaited(_refreshStorage());
+  }
+
+  /// Re-reads the tab that is on screen after a navigation, once the document
+  /// has had a moment to settle.
+  void _scheduleConsoleRefresh() {
+    _consoleRefreshTimer?.cancel();
+    _consoleRefreshTimer = Timer(const Duration(milliseconds: 900), () {
+      if (!mounted || !_consoleOpen) return;
+      if (_consoleTab == 1) unawaited(_refreshDom());
+      if (_consoleTab == 3) unawaited(_refreshStorage());
+    });
+  }
+
+  // -- JavaScript prompt ------------------------------------------------------
+
+  Future<void> _runConsoleInput() async {
+    final code = _jsInput.text.trim();
+    if (code.isEmpty) return;
+    _jsInput.clear();
+    _pushToConsole('› $code', level: 'input');
+    try {
+      final value = await _browser.evaluate(code);
+      _pushToConsole(_jsText(value), level: 'result');
+    } on Object catch (error) {
+      _pushToConsole('Error: $error', level: 'error');
+    }
+  }
+
+  static String _jsText(Object? value) {
+    final text = switch (value) {
+      null => 'undefined',
+      final String str => str,
+      final Object other => other.toString(),
+    };
+    return text.length <= 4000 ? text : '${text.substring(0, 4000)}…';
+  }
+
+  // -- Elements ---------------------------------------------------------------
+
+  static const String _domOutlineScript = r'''
+(function () {
+  try {
+    var out = [], limit = 700;
+    function walk(el, depth, path) {
+      if (out.length >= limit || depth > 12 || !el || !el.tagName) return;
+      var cls = '';
+      try {
+        if (el.classList && el.classList.length) {
+          cls = '.' + Array.prototype.slice.call(el.classList).slice(0, 3).join('.');
+        }
+      } catch (e) {}
+      var text = '';
+      if (el.children.length === 0) {
+        text = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+      }
+      out.push({
+        d: depth,
+        t: el.tagName.toLowerCase(),
+        i: el.id || '',
+        c: cls,
+        x: text,
+        p: path
+      });
+      for (var k = 0; k < el.children.length; k++) {
+        walk(el.children[k], depth + 1, path.concat([k]));
+      }
+    }
+    walk(document.documentElement, 0, []);
+    return JSON.stringify(out);
+  } catch (e) {
+    return '[]';
+  }
+})()
+''';
+
+  Future<void> _refreshDom() async {
+    if (_domLoading || !_consoleOpen) return;
+    setState(() {
+      _domLoading = true;
+      _domError = null;
+    });
+    try {
+      final raw = await _browser.evaluate(_domOutlineScript);
+      final decoded = jsonDecode(raw?.toString() ?? '[]');
+      final nodes = <_DomNode>[];
+      if (decoded is List) {
+        for (final item in decoded) {
+          if (item is! Map) continue;
+          final tag = item['t'];
+          if (tag is! String || tag.isEmpty) continue;
+          final rawPath = item['p'];
+          nodes.add(
+            _DomNode(
+              depth: item['d'] is int ? item['d'] as int : 0,
+              tag: tag,
+              id: item['i'] is String ? item['i'] as String : '',
+              classes: item['c'] is String ? item['c'] as String : '',
+              text: item['x'] is String ? item['x'] as String : '',
+              path: rawPath is List
+                  ? rawPath.whereType<int>().toList(growable: false)
+                  : const <int>[],
+            ),
+          );
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _domNodes
+          ..clear()
+          ..addAll(nodes);
+        _domLoading = false;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _domError = '$error';
+        _domLoading = false;
+      });
+    }
+  }
+
+  Future<void> _openDomNode(_DomNode node) async {
+    final script = '(function(){try{var e=document.documentElement;'
+        'var p=[${node.path.join(',')}];'
+        'for(var i=0;i<p.length;i++){e=e&&e.children[p[i]];}'
+        'return e?e.outerHTML.slice(0,40000):"";}'
+        'catch(x){return "error: "+x}})()';
+    String html;
+    try {
+      html = (await _browser.evaluate(script))?.toString() ?? '';
+    } on Object catch (error) {
+      html = 'error: $error';
+    }
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(110),
+      builder: (context) => _DomSheet(node: node, html: html),
+    );
+  }
+
+  // -- Storage ----------------------------------------------------------------
+
+  static const String _storageScript = r'''
+(function () {
+  var out = { cookie: '', ls: [], ss: [] };
+  try { out.cookie = document.cookie || ''; } catch (e) {}
+  try {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      out.ls.push({ k: k, v: localStorage.getItem(k) || '' });
+    }
+  } catch (e) {}
+  try {
+    for (var j = 0; j < sessionStorage.length; j++) {
+      var s = sessionStorage.key(j);
+      out.ss.push({ k: s, v: sessionStorage.getItem(s) || '' });
+    }
+  } catch (e) {}
+  return JSON.stringify(out);
+})()
+''';
+
+  Future<void> _refreshStorage() async {
+    if (_storageLoading || !_consoleOpen) return;
+    setState(() {
+      _storageLoading = true;
+      _storageError = null;
+    });
+    try {
+      final raw = await _browser.evaluate(_storageScript);
+      final decoded = jsonDecode(raw?.toString() ?? '{}');
+      final rows = <_StorageRow>[];
+      if (decoded is Map) {
+        final cookie = decoded['cookie'];
+        if (cookie is String) {
+          for (final part in cookie.split(';')) {
+            final item = part.trim();
+            if (item.isEmpty) continue;
+            final eq = item.indexOf('=');
+            rows.add(
+              _StorageRow(
+                'Cookies',
+                eq < 0 ? item : item.substring(0, eq),
+                eq < 0 ? '' : item.substring(eq + 1),
+              ),
+            );
+          }
+        }
+        for (final section in const <(String, String)>[
+          ('Local storage', 'ls'),
+          ('Session storage', 'ss'),
+        ]) {
+          final list = decoded[section.$2];
+          if (list is! List) continue;
+          for (final item in list) {
+            if (item is! Map) continue;
+            final key = item['k'];
+            if (key is! String) continue;
+            final value = item['v'];
+            rows.add(
+              _StorageRow(section.$1, key, value is String ? value : ''),
+            );
+          }
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _storageRows
+          ..clear()
+          ..addAll(rows);
+        _storageLoaded = true;
+        _storageLoading = false;
+      });
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _storageError = '$error';
+        _storageLoading = false;
+      });
+    }
+  }
+
+  // -- Network ----------------------------------------------------------------
+
+  /// Page fetch/XHR plus main-frame navigation, newest first, de-duplicated.
+  List<_NetRow> get _networkRows {
+    final cutoff = _networkClearedAt;
+    final rows = <_NetRow>[
+      for (final event in _pageRequests.values)
+        if (event.url != null && event.url!.isNotEmpty)
+          _NetRow(
+            method: event.method ?? 'GET',
+            url: event.url!,
+            status: event.statusCode,
+            duration: event.duration,
+            at: event.timestamp,
+            fromPage: true,
+            event: event,
+          ),
+      for (final event in _events)
+        if (event.uri != null &&
+            (event.errorCode != null ||
+                event.phase == RequestLogPhase.response))
+          _NetRow(
+            method: event.method ?? 'GET',
+            url: event.uri.toString(),
+            status: event.statusCode,
+            at: event.timestamp,
+          ),
+    ]..sort((a, b) => b.at.compareTo(a.at));
+
+    final seen = <String>{};
+    final out = <_NetRow>[];
+    for (final row in rows) {
+      if (cutoff != null && !row.at.isAfter(cutoff)) continue;
+      if (!seen.add('${row.fromPage}|${row.method}|${row.url}|${row.status}')) {
+        continue;
+      }
+      out.add(row);
+      if (out.length >= 120) break;
+    }
+    return out;
+  }
+
+  void _clearNetwork() {
+    setState(() {
+      _networkClearedAt = DateTime.now();
+      _pageRequests.clear();
+    });
+  }
+
+  static Color _statusColor(int? status) {
+    if (status == null) return AppColors.darkMuted;
+    if (status >= 200 && status < 300) return AppColors.signal;
+    if (status >= 300 && status < 400) return const Color(0xFFE5B85C);
+    return const Color(0xFFFF7B72);
+  }
+
+  // -- Panel ------------------------------------------------------------------
+
   Widget _buildConsolePanel() {
-    return Container(
+    return Material(
       color: AppColors.dark,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           // The white handle sits on the panel's top edge; leave room for it.
           const SizedBox(height: 18),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 6, 4),
-            child: Row(
-              children: <Widget>[
-                const Text(
-                  'CONSOLE',
-                  style: TextStyle(
-                    fontSize: 8.5,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.2,
-                    color: AppColors.darkMuted,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  '${_consoleLines.length}',
-                  style: const TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 9,
-                    fontWeight: FontWeight.w600,
-                    color: AppColors.signal,
-                  ),
-                ),
-                const Spacer(),
-                if (_consoleLines.isNotEmpty)
-                  GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () => setState(_consoleLines.clear),
-                    child: const Padding(
-                      padding: EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                      child: Text(
-                        'Clear',
-                        style: TextStyle(
-                          fontSize: 9.5,
-                          color: AppColors.darkMuted,
-                        ),
+          _buildConsoleTabBar(),
+          Container(height: 1, color: const Color(0xFF30323A)),
+          Expanded(child: _buildConsoleTabBody()),
+          if (_consoleTab == 0) _buildConsolePrompt(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConsoleTabBar() {
+    const tabs = <(IconData, String)>[
+      (Icons.terminal_rounded, 'Console'),
+      (Icons.account_tree_outlined, 'Elements'),
+      (Icons.swap_vert_rounded, 'Network'),
+      (Icons.storage_rounded, 'Storage'),
+      (Icons.info_outline_rounded, 'Page'),
+    ];
+    return SizedBox(
+      height: 30,
+      child: Row(
+        children: <Widget>[
+          for (var i = 0; i < tabs.length; i++)
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => _selectConsoleTab(i),
+                child: Container(
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(
+                        color: i == _consoleTab
+                            ? AppColors.signal
+                            : Colors.transparent,
+                        width: 2,
                       ),
                     ),
                   ),
-              ],
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: <Widget>[
+                      Icon(
+                        tabs[i].$1,
+                        size: 11,
+                        color: i == _consoleTab
+                            ? AppColors.signal
+                            : AppColors.darkMuted,
+                      ),
+                      const SizedBox(width: 3),
+                      Flexible(
+                        child: Text(
+                          tabs[i].$2,
+                          maxLines: 1,
+                          overflow: TextOverflow.fade,
+                          softWrap: false,
+                          style: TextStyle(
+                            fontSize: 8.5,
+                            fontWeight: i == _consoleTab
+                                ? FontWeight.w700
+                                : FontWeight.w500,
+                            color: i == _consoleTab
+                                ? AppColors.signal
+                                : AppColors.darkMuted,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConsoleTabBody() {
+    return switch (_consoleTab) {
+      1 => _buildElementsTab(),
+      2 => _buildNetworkTab(),
+      3 => _buildStorageTab(),
+      4 => _buildConsolePageTab(),
+      _ => _buildConsoleLogTab(),
+    };
+  }
+
+  Widget _consoleTabHeader(String title, {String? detail, Widget? action}) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 5, 4, 3),
+      child: Row(
+        children: <Widget>[
+          Text(
+            title,
+            style: const TextStyle(
+              fontSize: 8.5,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.1,
+              color: AppColors.darkMuted,
             ),
           ),
-          Container(height: 1, color: const Color(0xFF30323A)),
+          if (detail != null) ...<Widget>[
+            const SizedBox(width: 7),
+            Text(
+              detail,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 8.5,
+                color: AppColors.darkMuted,
+              ),
+            ),
+          ],
+          const Spacer(),
+          if (action != null) action,
+        ],
+      ),
+    );
+  }
+
+  Widget _consoleTextAction(String label, VoidCallback onTap) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        child: Text(
+          label,
+          style: const TextStyle(
+            fontSize: 9,
+            fontWeight: FontWeight.w600,
+            color: AppColors.signal,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildConsoleLogTab() {
+    return Column(
+      children: <Widget>[
+        _consoleTabHeader(
+          'OUTPUT',
+          detail: '${_consoleLines.length} lines',
+          action: _consoleLines.isEmpty
+              ? null
+              : _consoleTextAction('Clear', () => setState(_consoleLines.clear)),
+        ),
+        Expanded(
+          child: _consoleLines.isEmpty
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(24, 4, 24, 12),
+                    child: Text(
+                      'No output yet.\nJumps, blocked app links and page '
+                      'requests appear here.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 10,
+                        height: 1.55,
+                        color: AppColors.darkMuted,
+                      ),
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  reverse: true,
+                  padding: const EdgeInsets.fromLTRB(10, 2, 10, 8),
+                  itemCount: _consoleLines.length,
+                  itemBuilder: (context, index) =>
+                      _ConsoleRow(line: _consoleLines[index]),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildConsolePrompt() {
+    return Container(
+      decoration: const BoxDecoration(
+        border: Border(top: BorderSide(color: Color(0xFF30323A))),
+      ),
+      padding: const EdgeInsets.fromLTRB(10, 4, 7, 6),
+      child: Row(
+        children: <Widget>[
+          const Text(
+            '›',
+            style: TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 14,
+              height: 1,
+              color: AppColors.signal,
+            ),
+          ),
+          const SizedBox(width: 7),
           Expanded(
-            child: _consoleLines.isEmpty
-                ? const Center(
-                    child: Padding(
-                      padding: EdgeInsets.fromLTRB(24, 8, 24, 24),
+            child: TextField(
+              controller: _jsInput,
+              autocorrect: false,
+              enableSuggestions: false,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 10,
+                color: AppColors.darkText,
+              ),
+              cursorColor: AppColors.signal,
+              decoration: const InputDecoration(
+                isCollapsed: true,
+                border: InputBorder.none,
+                hintText: 'Evaluate JavaScript',
+                hintStyle: TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 10,
+                  color: AppColors.darkMuted,
+                ),
+              ),
+              textInputAction: TextInputAction.send,
+              onSubmitted: (_) => unawaited(_runConsoleInput()),
+            ),
+          ),
+          const SizedBox(width: 6),
+          GestureDetector(
+            onTap: () => unawaited(_runConsoleInput()),
+            child: Container(
+              width: 26,
+              height: 22,
+              decoration: BoxDecoration(
+                color: AppColors.signal,
+                borderRadius: BorderRadius.circular(7),
+              ),
+              child: const Icon(
+                Icons.play_arrow_rounded,
+                size: 15,
+                color: AppColors.signalInk,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildElementsTab() {
+    return Column(
+      children: <Widget>[
+        _consoleTabHeader(
+          'DOM',
+          detail: _domLoading ? 'reading…' : '${_domNodes.length} nodes',
+          action: _consoleTextAction(
+            'Refresh',
+            () => unawaited(_refreshDom()),
+          ),
+        ),
+        Expanded(child: _buildElementsBody()),
+      ],
+    );
+  }
+
+  Widget _buildElementsBody() {
+    if (_domLoading && _domNodes.isEmpty) {
+      return const Center(
+        child: SizedBox(
+          width: 16,
+          height: 16,
+          child: CircularProgressIndicator(
+            strokeWidth: 1.5,
+            color: AppColors.signal,
+          ),
+        ),
+      );
+    }
+    if (_domError != null) {
+      return _ConsoleError(
+        message: _domError!,
+        onRetry: () => unawaited(_refreshDom()),
+      );
+    }
+    if (_domNodes.isEmpty) {
+      return const Center(
+        child: Text(
+          'No DOM yet. Tap Refresh after the page loads.',
+          style: TextStyle(fontSize: 10, color: AppColors.darkMuted),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.fromLTRB(4, 2, 8, 10),
+      itemCount: _domNodes.length,
+      itemBuilder: (context, index) {
+        final node = _domNodes[index];
+        final indent = (node.depth * 9.0).clamp(0.0, 100.0).toDouble();
+        return InkWell(
+          onTap: () => unawaited(_openDomNode(node)),
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(8 + indent, 2, 0, 2),
+            child: Text.rich(
+              TextSpan(
+                children: <TextSpan>[
+                  TextSpan(
+                    text: '<${node.tag}>',
+                    style: const TextStyle(color: Color(0xFF8AB4F8)),
+                  ),
+                  if (node.id.isNotEmpty)
+                    TextSpan(
+                      text: '#${node.id}',
+                      style: const TextStyle(color: AppColors.signal),
+                    ),
+                  if (node.classes.isNotEmpty)
+                    TextSpan(
+                      text: node.classes,
+                      style: const TextStyle(color: AppColors.darkMuted),
+                    ),
+                  if (node.text.isNotEmpty)
+                    TextSpan(
+                      text: '  ${node.text}',
+                      style: const TextStyle(color: Color(0xFF858A7E)),
+                    ),
+                ],
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9.5,
+                height: 1.4,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildNetworkTab() {
+    final rows = _networkRows;
+    return Column(
+      children: <Widget>[
+        _consoleTabHeader(
+          'REQUESTS',
+          detail: '${rows.length} shown',
+          action: rows.isEmpty
+              ? null
+              : _consoleTextAction('Clear', _clearNetwork),
+        ),
+        Expanded(
+          child: rows.isEmpty
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 24),
+                    child: Text(
+                      'No requests yet.\nPage fetch/XHR calls and every '
+                      'main-frame navigation land here.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 10,
+                        height: 1.55,
+                        color: AppColors.darkMuted,
+                      ),
+                    ),
+                  ),
+                )
+              : ListView.separated(
+                  padding: const EdgeInsets.fromLTRB(10, 1, 10, 10),
+                  itemCount: rows.length,
+                  separatorBuilder: (_, __) =>
+                      Container(height: 1, color: const Color(0xFF26282E)),
+                  itemBuilder: (context, index) {
+                    final row = rows[index];
+                    return InkWell(
+                      onTap: row.event == null
+                          ? null
+                          : () => _openPageDetail(row.event!),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 5),
+                        child: Row(
+                          children: <Widget>[
+                            Container(
+                              width: 5,
+                              height: 5,
+                              decoration: BoxDecoration(
+                                color: row.fromPage
+                                    ? AppColors.signal
+                                    : const Color(0xFF8AB4F8),
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            SizedBox(
+                              width: 34,
+                              child: Text(
+                                row.method,
+                                maxLines: 1,
+                                overflow: TextOverflow.clip,
+                                style: const TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 8.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.darkMuted,
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              child: Text(
+                                row.url,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 9,
+                                  color: AppColors.darkText,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            if (row.duration != null)
+                              Text(
+                                '${row.duration}ms',
+                                style: const TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 8,
+                                  color: AppColors.darkMuted,
+                                ),
+                              ),
+                            const SizedBox(width: 6),
+                            Text(
+                              row.status?.toString() ?? '···',
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 9,
+                                fontWeight: FontWeight.w700,
+                                color: _statusColor(row.status),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStorageTab() {
+    final sections = <String, List<_StorageRow>>{};
+    for (final row in _storageRows) {
+      sections.putIfAbsent(row.section, () => <_StorageRow>[]).add(row);
+    }
+    return Column(
+      children: <Widget>[
+        _consoleTabHeader(
+          'STORAGE',
+          detail: _storageLoading
+              ? 'reading…'
+              : '${_storageRows.length} items',
+          action: _consoleTextAction(
+            'Refresh',
+            () => unawaited(_refreshStorage()),
+          ),
+        ),
+        Expanded(
+          child: _storageError != null
+              ? _ConsoleError(
+                  message: _storageError!,
+                  onRetry: () => unawaited(_refreshStorage()),
+                )
+              : !_storageLoaded
+                  ? const Center(
                       child: Text(
-                        'No jumps yet.\nEvery in-app navigation and every '
-                        'blocked app jump is printed here.',
+                        'Cookies, localStorage and sessionStorage for this '
+                        'page appear here.',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 10,
-                          height: 1.6,
                           color: AppColors.darkMuted,
                         ),
                       ),
-                    ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.fromLTRB(10, 6, 10, 14),
-                    itemCount: _consoleLines.length,
-                    itemBuilder: (context, index) =>
-                        _ConsoleRow(line: _consoleLines[index]),
-                  ),
+                    )
+                  : sections.isEmpty
+                      ? const Center(
+                          child: Text(
+                            'Storage is empty.',
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: AppColors.darkMuted,
+                            ),
+                          ),
+                        )
+                      : ListView(
+                          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                          children: <Widget>[
+                            for (final entry in sections.entries) ...<Widget>[
+                              Padding(
+                                padding:
+                                    const EdgeInsets.only(top: 6, bottom: 3),
+                                child: Text(
+                                  entry.key.toUpperCase(),
+                                  style: const TextStyle(
+                                    fontSize: 8,
+                                    fontWeight: FontWeight.w700,
+                                    letterSpacing: 1,
+                                    color: AppColors.darkMuted,
+                                  ),
+                                ),
+                              ),
+                              for (final row in entry.value)
+                                InkWell(
+                                  onTap: () {
+                                    unawaited(
+                                      Clipboard.setData(
+                                        ClipboardData(text: row.value),
+                                      ),
+                                    );
+                                    _snack('${row.key} copied');
+                                  },
+                                  child: Padding(
+                                    padding:
+                                        const EdgeInsets.symmetric(vertical: 3),
+                                    child: Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: <Widget>[
+                                        Expanded(
+                                          flex: 2,
+                                          child: Text(
+                                            row.key,
+                                            style: const TextStyle(
+                                              fontFamily: 'monospace',
+                                              fontSize: 9,
+                                              color: Color(0xFF8AB4F8),
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          flex: 3,
+                                          child: Text(
+                                            row.value.isEmpty ? '—' : row.value,
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              fontFamily: 'monospace',
+                                              fontSize: 9,
+                                              height: 1.35,
+                                              color: AppColors.darkMuted,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ],
+                        ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildConsolePageTab() {
+    final url = _browser.url ?? '—';
+    final rawTitle = (_browser.title ?? '').trim();
+    final title = rawTitle.isEmpty ? '—' : rawTitle;
+    final ua = _effectiveUserAgent ?? 'WebKit default';
+    final fp = _capture?.response.fingerprint;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 2, 12, 12),
+      children: <Widget>[
+        _darkKv('URL', url),
+        _darkKv('Title', title),
+        _darkKv('Status', _browser.statusCode?.toString() ?? '—'),
+        _darkKv(
+          'History',
+          'back ${_browser.canGoBack ? 'yes' : 'no'} · '
+              'forward ${_browser.canGoForward ? 'yes' : 'no'}',
+        ),
+        _darkKv('User-Agent', ua),
+        _darkKv('Profile', _profileLabel ?? _browser.session.profile.id),
+        _darkKv('Resources', '${_browser.resourceTimings.length} timings'),
+        _darkKv(
+          'Engine',
+          fp == null
+              ? 'native capture not run'
+              : '${fp.tlsVersion} · ${fp.alpn}',
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: <Widget>[
+            _consoleActionButton('Copy URL', () => _copyText(url, 'URL')),
+            const SizedBox(width: 8),
+            _consoleActionButton('Reload', () => unawaited(_reload())),
+            const SizedBox(width: 8),
+            _consoleActionButton(
+              'Capture',
+              () => unawaited(_captureCurrent()),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _darkKv(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 76,
+            child: Text(
+              label,
+              style: const TextStyle(
+                fontSize: 8.5,
+                color: AppColors.darkMuted,
+                letterSpacing: 0.2,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9,
+                height: 1.4,
+                color: AppColors.darkText,
+              ),
+            ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _consoleActionButton(String label, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: AppColors.dark2,
+          border: Border.all(color: const Color(0xFF34373F)),
+          borderRadius: BorderRadius.circular(7),
+        ),
+        child: Text(
+          label,
+          style: const TextStyle(
+            fontSize: 9,
+            fontWeight: FontWeight.w600,
+            color: AppColors.darkText,
+          ),
+        ),
       ),
     );
   }
@@ -2265,6 +3170,58 @@ class _ConsoleLine {
       '${at.second.toString().padLeft(2, '0')}';
 }
 
+/// One node of the Elements outline. [path] is the chain of child indices
+/// from `document.documentElement`, used to fetch the node's outerHTML.
+class _DomNode {
+  const _DomNode({
+    required this.depth,
+    required this.tag,
+    required this.path,
+    this.id = '',
+    this.classes = '',
+    this.text = '',
+  });
+
+  final int depth;
+  final String tag;
+  final List<int> path;
+  final String id;
+  final String classes;
+  final String text;
+
+  String get label => '<$tag>${id.isEmpty ? '' : '#$id'}$classes';
+}
+
+/// One cookie or storage entry shown by the Storage tab.
+class _StorageRow {
+  const _StorageRow(this.section, this.key, this.value);
+
+  final String section;
+  final String key;
+  final String value;
+}
+
+/// One row of the Network tab: a page fetch/XHR or a main-frame navigation.
+class _NetRow {
+  const _NetRow({
+    required this.method,
+    required this.url,
+    required this.at,
+    this.status,
+    this.duration,
+    this.fromPage = false,
+    this.event,
+  });
+
+  final String method;
+  final String url;
+  final DateTime at;
+  final int? status;
+  final int? duration;
+  final bool fromPage;
+  final PageNetworkEvent? event;
+}
+
 /// One saved page. Stored as JSON in the app container, not in the WebView
 /// profile, so clearing site data does not lose the list.
 class _Bookmark {
@@ -2291,6 +3248,8 @@ class _ConsoleRow extends StatelessWidget {
     final color = switch (line.level) {
       'warn' => const Color(0xFFE5B85C),
       'error' => const Color(0xFFFF7B72),
+      'input' => const Color(0xFF8AB4F8),
+      'result' => AppColors.signal,
       _ => AppColors.darkText,
     };
     return Padding(
@@ -2320,6 +3279,149 @@ class _ConsoleRow extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Shared failure state for the console's live tabs.
+class _ConsoleError extends StatelessWidget {
+  const _ConsoleError({required this.message, required this.onRetry});
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 22),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const Icon(
+              Icons.error_outline_rounded,
+              size: 18,
+              color: Color(0xFFFF7B72),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              message,
+              maxLines: 4,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 9,
+                height: 1.5,
+                color: AppColors.darkMuted,
+              ),
+            ),
+            const SizedBox(height: 4),
+            TextButton(
+              onPressed: onRetry,
+              child: const Text(
+                'Retry',
+                style: TextStyle(fontSize: 10, color: AppColors.signal),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// OuterHTML of one DOM node, opened from the Elements tab.
+class _DomSheet extends StatelessWidget {
+  const _DomSheet({required this.node, required this.html});
+
+  final _DomNode node;
+  final String html;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.sizeOf(context).height * 0.68,
+      decoration: const BoxDecoration(
+        color: AppColors.dark2,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 10, 6, 8),
+              child: Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Text(
+                      node.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.signal,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Copy HTML',
+                    onPressed: () {
+                      unawaited(Clipboard.setData(ClipboardData(text: html)));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('HTML copied')),
+                      );
+                    },
+                    icon: const Icon(
+                      Icons.copy_rounded,
+                      size: 15,
+                      color: AppColors.darkMuted,
+                    ),
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints.tightFor(
+                      width: 32,
+                      height: 32,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Close',
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(
+                      Icons.close_rounded,
+                      size: 16,
+                      color: AppColors.darkMuted,
+                    ),
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints.tightFor(
+                      width: 32,
+                      height: 32,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Container(height: 1, color: const Color(0xFF30323A)),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(14, 10, 14, 20),
+                child: SelectableText(
+                  html.isEmpty ? '(empty)' : html,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 9.5,
+                    height: 1.55,
+                    color: AppColors.darkText,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
