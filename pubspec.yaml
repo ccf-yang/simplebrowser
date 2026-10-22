@@ -3,7 +3,7 @@ description: >-
   So~ — small iOS test browser built on browser_http: real WKWebView browsing,
   no exits to other apps, and a debug console that survives every page.
 publish_to: none
-version: 0.3.0+6
+version: 0.3.1+7
 
 environment:
   sdk: ">=3.4.0 <4.0.0"

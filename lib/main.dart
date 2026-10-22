@@ -147,11 +147,11 @@ class _BrowserPageState extends State<BrowserPage>
 
   /// Share of the body height taken by the info panel; draggable.
   double _panelFraction = 0.4;
-  bool _panelVisible = true;
+  bool _panelVisible = false;
   /// The user's panel switch. Unlike [_panelVisible] this is not touched when
   /// the debug console temporarily hides the panel, so collection keeps
   /// following the switch the user actually set.
-  bool _panelPreference = true;
+  bool _panelPreference = false;
 
   /// Cancel navigations that would open another app. On by default: a test
   /// browser that leaves the app cannot be debugged.
@@ -1190,6 +1190,19 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
+  /// WebKit exposes nothing below the document for main-frame navigations:
+  /// no caller headers, no body, no response headers. The row is still shown
+  /// (and now opens) with everything the host does know.
+  void _openNativeDetail(RequestLogEvent event) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(88),
+      builder: (_) => _NativeRequestDetail(event: event),
+    );
+  }
+
   @override
   void dispose() {
     _consoleRefreshTimer?.cancel();
@@ -1248,12 +1261,6 @@ class _BrowserPageState extends State<BrowserPage>
             size: 24,
           ),
           Expanded(child: _buildAddressField()),
-          _toolButton(
-            Icons.travel_explore_rounded,
-            'Resources on this page',
-            _hasDocument ? () => unawaited(_openResources()) : null,
-            size: 19,
-          ),
           _toolButton(
             Icons.tune_rounded,
             'Settings',
@@ -1463,6 +1470,27 @@ class _BrowserPageState extends State<BrowserPage>
               fontFamily: 'monospace',
               fontSize: 9,
               color: AppColors.faint,
+            ),
+          ),
+          const SizedBox(width: 2),
+          Tooltip(
+            message: 'Sniff images and videos on this page',
+            child: Material(
+              color: Colors.transparent,
+              borderRadius: BorderRadius.circular(7),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(7),
+                onTap: _hasDocument ? () => unawaited(_openResources()) : null,
+                child: SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: Icon(
+                    Icons.travel_explore_rounded,
+                    size: 14,
+                    color: _hasDocument ? AppColors.ink : AppColors.faint,
+                  ),
+                ),
+              ),
             ),
           ),
         ],
@@ -2586,7 +2614,9 @@ class _BrowserPageState extends State<BrowserPage>
             method: event.method ?? 'GET',
             url: event.uri.toString(),
             status: event.statusCode,
+            duration: event.elapsed?.inMilliseconds,
             at: event.timestamp,
+            log: event,
           ),
     ]..sort((a, b) => b.at.compareTo(a.at));
 
@@ -2993,9 +3023,11 @@ class _BrowserPageState extends State<BrowserPage>
                   itemBuilder: (context, index) {
                     final row = rows[index];
                     return InkWell(
-                      onTap: row.event == null
-                          ? null
-                          : () => _openPageDetail(row.event!),
+                      onTap: row.event != null
+                          ? () => _openPageDetail(row.event!)
+                          : row.log == null
+                              ? null
+                              : () => _openNativeDetail(row.log!),
                       child: Padding(
                         padding: const EdgeInsets.symmetric(vertical: 5),
                         child: Row(
@@ -3456,6 +3488,7 @@ class _NetRow {
     this.duration,
     this.fromPage = false,
     this.event,
+    this.log,
   });
 
   final String method;
@@ -3465,6 +3498,11 @@ class _NetRow {
   final int? duration;
   final bool fromPage;
   final PageNetworkEvent? event;
+
+  /// Native side of the same request: navigation event or engine capture.
+  /// Rows built from it have no page payload, but still carry a method,
+  /// status, timing and error message worth opening.
+  final RequestLogEvent? log;
 }
 
 /// One saved page. Stored as JSON in the app container, not in the WebView
@@ -4466,6 +4504,224 @@ class _PageRequestDetailState extends State<_PageRequestDetail> {
                       )
                     else
                       _bodyBlock(responseBody),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Detail for a Network row that has no page payload.
+///
+/// These are either main-frame navigations reported by WKWebView or log
+/// entries from the native engine. Neither carries a response body, so the
+/// sheet shows the request line, status, timing and whatever headers exist,
+/// plus an honest note about what WebKit keeps private.
+class _NativeRequestDetail extends StatefulWidget {
+  const _NativeRequestDetail({required this.event});
+
+  final RequestLogEvent event;
+
+  @override
+  State<_NativeRequestDetail> createState() => _NativeRequestDetailState();
+}
+
+class _NativeRequestDetailState extends State<_NativeRequestDetail> {
+  String? _copied;
+  Timer? _copiedTimer;
+
+  Future<void> _copy(String text, String label) async {
+    if (text.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    _copiedTimer?.cancel();
+    setState(() => _copied = label);
+    _copiedTimer = Timer(const Duration(milliseconds: 1400), () {
+      if (mounted) setState(() => _copied = null);
+    });
+  }
+
+  @override
+  void dispose() {
+    _copiedTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final event = widget.event;
+    final headers = event.headers ?? const <String, String>{};
+    final isNavigation = event.id.startsWith('nav-');
+    final url = event.uri?.toString() ?? '';
+    final source = isNavigation ? 'WKWebView navigation' : 'wreq engine';
+    return DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.62,
+      minChildSize: 0.4,
+      maxChildSize: 0.94,
+      builder: (context, scrollController) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+          ),
+          child: Column(
+            children: <Widget>[
+              const SizedBox(height: 8),
+              Container(
+                width: 38,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.line2,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 10, 4),
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text(
+                        '${event.method ?? 'GET'} request',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: -0.2,
+                        ),
+                      ),
+                    ),
+                    AnimatedOpacity(
+                      opacity: _copied == null ? 0 : 1,
+                      duration: const Duration(milliseconds: 160),
+                      child: Container(
+                        margin: const EdgeInsets.only(right: 6),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppColors.signal,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          '${_copied ?? ''} copied',
+                          style: const TextStyle(
+                            fontSize: 8,
+                            fontWeight: FontWeight.w700,
+                            color: AppColors.ink,
+                          ),
+                        ),
+                      ),
+                    ),
+                    _statusBadge(event.statusCode),
+                    const SizedBox(width: 2),
+                    IconButton(
+                      tooltip: 'Close',
+                      onPressed: () => Navigator.of(context).pop(),
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        size: 18,
+                        color: AppColors.faint,
+                      ),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 32,
+                        height: 32,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                child: SelectableText(
+                  url,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 9.5,
+                    height: 1.4,
+                    color: AppColors.muted,
+                  ),
+                ),
+              ),
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Row(
+                  children: <Widget>[
+                    _ActionChip(
+                      label: 'cURL',
+                      icon: Icons.terminal_rounded,
+                      onTap: () =>
+                          _copy(buildLogCurl(event), 'cURL'),
+                    ),
+                    const SizedBox(width: 6),
+                    _ActionChip(
+                      label: 'URL',
+                      icon: Icons.link_rounded,
+                      onTap: () => _copy(url, 'URL'),
+                    ),
+                    if (headers.isNotEmpty) ...<Widget>[
+                      const SizedBox(width: 6),
+                      _ActionChip(
+                        label: 'Headers',
+                        icon: Icons.list_alt_rounded,
+                        onTap: () => _copy(mapBlock(headers), 'Headers'),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 6),
+              Expanded(
+                child: ListView(
+                  controller: scrollController,
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 28),
+                  children: <Widget>[
+                    _detailRow('Source', source),
+                    _detailRow('Status', '${event.statusCode ?? '—'}'),
+                    _detailRow(
+                      'Duration',
+                      event.elapsed == null
+                          ? '—'
+                          : '${event.elapsed!.inMilliseconds} ms',
+                    ),
+                    _detailRow('Phase', event.phase.name),
+                    if (event.profileId != null)
+                      _detailRow('Profile', event.profileId!),
+                    if (event.errorCode != null)
+                      _detailRow('Error code', event.errorCode!),
+                    if (event.message != null)
+                      _detailRow('Message', event.message!),
+                    const SizedBox(height: 14),
+                    _SectionLabel('Request headers · ${headers.length}'),
+                    if (headers.isEmpty)
+                      const _MutedLine('No headers recorded for this row.')
+                    else
+                      for (var i = 0; i < headers.length; i++)
+                        _HeaderLine(
+                          index: '${i + 1}'.padLeft(2, '0'),
+                          name: headers.keys.elementAt(i),
+                          value: headers.values.elementAt(i),
+                        ),
+                    const SizedBox(height: 14),
+                    const _SectionLabel('Why this row is thinner'),
+                    _MutedLine(
+                      isNavigation
+                          ? 'WebKit hands the app only the URL, status and '
+                              'timing of a main-frame navigation. Caller '
+                              'headers, the body and response headers never '
+                              'leave the web process. Page fetch/XHR rows '
+                              '(green dot) keep caller headers and bodies '
+                              'because the injected hook sees them.'
+                          : 'The native engine logs the request line, status '
+                              'and timing. Run Capture on this URL in the '
+                              'Info panel for the full wire headers and body.',
+                    ),
                   ],
                 ),
               ),

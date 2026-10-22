@@ -51,6 +51,19 @@ String buildPageCurl(PageNetworkEvent event) {
   return buffer.toString();
 }
 
+/// cURL for a row rebuilt from the native request log.
+///
+/// Navigation events have no captured headers; engine events do. The body is
+/// never part of the log, so this is a request-line-and-headers reconstruction.
+String buildLogCurl(RequestLogEvent event) {
+  final buffer = StringBuffer('curl -X ${event.method ?? 'GET'}');
+  buffer.write(' ${shellQuote(event.uri?.toString() ?? '')}');
+  for (final entry in (event.headers ?? const <String, String>{}).entries) {
+    buffer.write(' \\\n  -H ${shellQuote('${entry.key}: ${entry.value}')}');
+  }
+  return buffer.toString();
+}
+
 /// Text preview of a native response body, hex-dumping clearly binary data.
 String formatBodyPreview(TransportResponse response) {
   if (response.body.isEmpty) return '(empty)';

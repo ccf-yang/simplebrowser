@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'theme.dart';
@@ -101,12 +103,35 @@ class _SettingsSheetState extends State<SettingsSheet> {
     );
   }
 
-  void _reset() {
+  /// UA, Referer and Cookie are one request identity; they live in their own
+  /// sheet so the top level stays short. Edits come back here and are still
+  /// applied only by Save & reload.
+  Future<void> _openIdentity() async {
+    final result = await showModalBottomSheet<_IdentityValues>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: AppColors.ink.withAlpha(88),
+      builder: (_) => _RequestIdentitySheet(
+        uaIndex: _uaIndex,
+        refererMode: _refererMode,
+        cookie: _cookie.text,
+        uaLabels: widget.uaLabels,
+      ),
+    );
+    if (result == null || !mounted) return;
     setState(() {
-      _uaIndex = 0;
-      _refererMode = 0;
-      _cookie.clear();
+      _uaIndex = result.uaIndex;
+      _refererMode = result.refererMode;
+      _cookie.text = result.cookie;
     });
+  }
+
+  String get _identitySummary {
+    final ua = widget.uaLabels[_uaIndex];
+    final referer = _refererMode == 0 ? 'No referer' : 'Current domain';
+    final cookie = _cookie.text.trim().isEmpty ? 'No cookie' : 'Cookie set';
+    return '$ua · $referer · $cookie';
   }
 
   @override
@@ -167,22 +192,12 @@ class _SettingsSheetState extends State<SettingsSheet> {
                     ),
                   ),
                   const SizedBox(height: 16),
-                  const _FieldLabel('User-Agent'),
+                  const _FieldLabel('Request identity'),
                   const SizedBox(height: 5),
-                  _buildUaField(),
-                  const SizedBox(height: 10),
-                  const _FieldLabel('Referer'),
-                  const SizedBox(height: 5),
-                  _MiniSeg(
-                    options: const <String>['None', 'Current domain'],
-                    index: _refererMode,
-                    onChanged: (value) =>
-                        setState(() => _refererMode = value),
+                  _IdentityTile(
+                    summary: _identitySummary,
+                    onTap: () => unawaited(_openIdentity()),
                   ),
-                  const SizedBox(height: 10),
-                  const _FieldLabel('Cookie'),
-                  const SizedBox(height: 5),
-                  _buildCookieField(),
                   const SizedBox(height: 10),
                   _buildPanelSwitch(),
                   const SizedBox(height: 8),
@@ -238,17 +253,268 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   const SizedBox(height: 10),
                   const _Hint(),
                   const SizedBox(height: 14),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: FilledButton.icon(
+                      onPressed: _save,
+                      icon: const Icon(Icons.check_rounded, size: 16),
+                      label: const Text('Save & reload'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPanelSwitch() => _SwitchRow(
+    title: 'Info panel',
+    subtitle: 'WebView · Engine · Page · Log',
+    value: _showPanel,
+    onChanged: (value) {
+      setState(() => _showPanel = value);
+      widget.onShowPanelChanged(value);
+    },
+  );
+
+  Widget _buildStayInAppSwitch() => _SwitchRow(
+    title: 'Stay in this app',
+    subtitle: 'Block baidu:// and other app jumps',
+    value: _blockExternal,
+    onChanged: (value) {
+      setState(() => _blockExternal = value);
+      widget.onBlockExternalChanged(value);
+    },
+  );
+
+  Widget _buildAdBlockSwitch() => _SwitchRow(
+    title: 'Block ads',
+    subtitle: widget.adBlockStatus.isEmpty
+        ? 'WebKit content rules · reload to apply'
+        : widget.adBlockStatus,
+    value: _adBlock,
+    onChanged: (value) => setState(() => _adBlock = value),
+  );
+}
+
+/// The three header knobs collected by [_RequestIdentitySheet].
+class _IdentityValues {
+  const _IdentityValues({
+    required this.uaIndex,
+    required this.refererMode,
+    required this.cookie,
+  });
+
+  final int uaIndex;
+  final int refererMode;
+  final String cookie;
+}
+
+/// Settings row that opens the request-identity sheet.
+class _IdentityTile extends StatelessWidget {
+  const _IdentityTile({required this.summary, required this.onTap});
+
+  final String summary;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.card,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+          decoration: BoxDecoration(
+            border: Border.all(color: AppColors.line2),
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Row(
+            children: <Widget>[
+              const Icon(
+                Icons.badge_outlined,
+                size: 17,
+                color: AppColors.ink2,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text(
+                      'User-Agent · Referer · Cookie',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      summary,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 9.5,
+                        height: 1.4,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 4),
+              const Icon(
+                Icons.chevron_right_rounded,
+                size: 18,
+                color: AppColors.faint,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Second-level sheet with the request identity fields.
+///
+/// It edits a local copy and returns it to Settings; nothing is applied until
+/// the outer sheet saves.
+class _RequestIdentitySheet extends StatefulWidget {
+  const _RequestIdentitySheet({
+    required this.uaIndex,
+    required this.refererMode,
+    required this.cookie,
+    required this.uaLabels,
+  });
+
+  final int uaIndex;
+  final int refererMode;
+  final String cookie;
+  final List<String> uaLabels;
+
+  @override
+  State<_RequestIdentitySheet> createState() => _RequestIdentitySheetState();
+}
+
+class _RequestIdentitySheetState extends State<_RequestIdentitySheet> {
+  late int _uaIndex = widget.uaIndex;
+  late int _refererMode = widget.refererMode;
+  late final TextEditingController _cookie =
+      TextEditingController(text: widget.cookie);
+
+  @override
+  void dispose() {
+    _cookie.dispose();
+    super.dispose();
+  }
+
+  void _done() {
+    Navigator.of(context).pop(
+      _IdentityValues(
+        uaIndex: _uaIndex,
+        refererMode: _refererMode,
+        cookie: _cookie.text,
+      ),
+    );
+  }
+
+  void _reset() {
+    setState(() {
+      _uaIndex = 0;
+      _refererMode = 0;
+    });
+    _cookie.clear();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
+    return Padding(
+      padding: EdgeInsets.only(bottom: bottomInset),
+      child: Material(
+        color: Colors.transparent,
+        child: Container(
+          decoration: const BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+          ),
+          padding: const EdgeInsets.fromLTRB(18, 8, 18, 0),
+          child: SafeArea(
+            top: false,
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.only(bottom: 24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Center(
+                    child: Container(
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: AppColors.line2,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      const Expanded(
+                        child: Text(
+                          'Request identity',
+                          style: TextStyle(
+                            fontSize: 19,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: -0.3,
+                          ),
+                        ),
+                      ),
+                      _CloseButton(onTap: _done),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Sent with WKWebView navigations and native engine '
+                    'captures. Back in Settings, Save & reload applies them.',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      height: 1.55,
+                      color: AppColors.muted,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  const _FieldLabel('User-Agent'),
+                  const SizedBox(height: 5),
+                  _buildUaField(),
+                  const SizedBox(height: 10),
+                  const _FieldLabel('Referer'),
+                  const SizedBox(height: 5),
+                  _MiniSeg(
+                    options: const <String>['None', 'Current domain'],
+                    index: _refererMode,
+                    onChanged: (value) =>
+                        setState(() => _refererMode = value),
+                  ),
+                  const SizedBox(height: 10),
+                  const _FieldLabel('Cookie'),
+                  const SizedBox(height: 5),
+                  _buildCookieField(),
+                  const SizedBox(height: 16),
                   Row(
                     children: <Widget>[
-                      TextButton(
-                        onPressed: _reset,
-                        child: const Text('Reset'),
-                      ),
+                      TextButton(onPressed: _reset, child: const Text('Reset')),
                       const Spacer(),
                       FilledButton.icon(
-                        onPressed: _save,
+                        onPressed: _done,
                         icon: const Icon(Icons.check_rounded, size: 16),
-                        label: const Text('Save & reload'),
+                        label: const Text('Done'),
                       ),
                     ],
                   ),
@@ -336,35 +602,6 @@ class _SettingsSheetState extends State<SettingsSheet> {
       ),
     );
   }
-
-  Widget _buildPanelSwitch() => _SwitchRow(
-    title: 'Info panel',
-    subtitle: 'WebView · Engine · Page · Log',
-    value: _showPanel,
-    onChanged: (value) {
-      setState(() => _showPanel = value);
-      widget.onShowPanelChanged(value);
-    },
-  );
-
-  Widget _buildStayInAppSwitch() => _SwitchRow(
-    title: 'Stay in this app',
-    subtitle: 'Block baidu:// and other app jumps',
-    value: _blockExternal,
-    onChanged: (value) {
-      setState(() => _blockExternal = value);
-      widget.onBlockExternalChanged(value);
-    },
-  );
-
-  Widget _buildAdBlockSwitch() => _SwitchRow(
-    title: 'Block ads',
-    subtitle: widget.adBlockStatus.isEmpty
-        ? 'WebKit content rules · reload to apply'
-        : widget.adBlockStatus,
-    value: _adBlock,
-    onChanged: (value) => setState(() => _adBlock = value),
-  );
 }
 
 /// One tap target in the Browsing row: Home, Save bookmark or Bookmarks.
