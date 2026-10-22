@@ -214,6 +214,11 @@ final class WebViewBridge {
             holder.webView.reload()
             result(nil)
 
+        case "stopLoading":
+            guard let holder = session(args, result) else { return }
+            holder.webView.stopLoading()
+            result(nil)
+
         case "canGoBack":
             guard let holder = session(args, result) else { return }
             result(holder.webView.canGoBack)
@@ -420,6 +425,82 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// loop when WebKit reports the reload with a normalised URL string.
     private var reissuedAt: [String: Date] = [:]
 
+    // -----------------------------------------------------------------------
+    // Page state: pushed to the host, never polled
+    // -----------------------------------------------------------------------
+
+    /// KVO tokens for the WKWebView properties a browser chrome needs.
+    private var stateObservers: [NSKeyValueObservation] = []
+    /// Last payload sent, so one property change produces one event.
+    private var lastStateSignature = ""
+
+    /// WebKit's `estimatedProgress` / `isLoading` / `url` / `title` /
+    /// `canGoBack` / `canGoForward` are the only accurate source for a browser
+    /// chrome, they are KVO compliant, and there is no delegate method for any
+    /// of them. Observing them lets the address bar follow the page in the
+    /// frame it changes instead of waiting for a poll.
+    private func observeState() {
+        stateObservers.append(webView.observe(\.estimatedProgress) {
+            [weak self] _, _ in self?.publishState()
+        })
+        stateObservers.append(webView.observe(\.isLoading) {
+            [weak self] _, _ in self?.publishState()
+        })
+        stateObservers.append(webView.observe(\.url) {
+            [weak self] _, _ in self?.publishState()
+        })
+        stateObservers.append(webView.observe(\.title) {
+            [weak self] _, _ in self?.publishState()
+        })
+        stateObservers.append(webView.observe(\.canGoBack) {
+            [weak self] _, _ in self?.publishState()
+        })
+        stateObservers.append(webView.observe(\.canGoForward) {
+            [weak self] _, _ in self?.publishState()
+        })
+    }
+
+    /// Reports the WebView's current chrome state. Progress is quantised to 2%
+    /// so a page with hundreds of subresources cannot flood the channel.
+    /// A `state` event carries no decision, only what the page looks like now.
+    private func publishState() {
+        let urlText = webView.url?.absoluteString ?? ""
+        let titleText = webView.title ?? ""
+        let loading = webView.isLoading
+        let progress = (webView.estimatedProgress * 50).rounded() / 50
+        let canBack = webView.canGoBack
+        let canForward = webView.canGoForward
+        let status = lastStatusCode
+        let signature = [
+            urlText, titleText, loading ? "1" : "0", String(progress),
+            canBack ? "1" : "0", canForward ? "1" : "0",
+            status.map(String.init) ?? "-",
+        ].joined(separator: "\u{1}")
+        if signature == lastStateSignature { return }
+        lastStateSignature = signature
+
+        var body: [String: Any] = [
+            "kind": "state",
+            "url": urlText,
+            "method": lastMethod,
+            "mainFrame": true,
+            "navigationType": "state",
+            "ts": Int(Date().timeIntervalSince1970 * 1000),
+            "loading": loading,
+            "progress": progress,
+            "title": titleText,
+            "canGoBack": canBack,
+            "canGoForward": canForward,
+        ]
+        if let status { body["status"] = status }
+        body["sessionId"] = id
+        onNavigationEvent?(body)
+    }
+
+    deinit {
+        stateObservers.removeAll()
+    }
+
     /// Method and trigger of the last main-frame action, reused by the response
     /// and commit callbacks so a log row reads like the request it belongs to.
     private var lastMethod = "GET"
@@ -461,6 +542,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         // Visible WebViews are user-driven (challenge page or browser tab);
         // swipe back/forward should behave like Safari.
         webView.allowsBackForwardNavigationGestures = !headless
+        observeState()
     }
 
     /// Rebuilds the page-request hook. The console is *not* a user script:
@@ -723,7 +805,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// Bumped whenever the native debug pipeline changes. Appended to every
     /// setDebugOverlay status so the host can tell a stale embedded framework
     /// from a real failure.
-    static let debugBuildStamp = "n4"
+    static let debugBuildStamp = "n5"
 
     private static func stamped(_ detail: String) -> String {
         "\(detail)|\(debugBuildStamp)"
@@ -870,6 +952,24 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         webView.load(request)
     }
 
+    /// Rebuilds a tapped request the way the page itself would have made it.
+    ///
+    /// `WKNavigationAction.request` carries the destination, method and body,
+    /// but a programmatic `load` loses the referring document, and several
+    /// Chinese sites answer a referer-less main-frame request with a blank or a
+    /// different page. Re-adding it keeps a re-issued jump faithful.
+    private func reissueRequest(_ action: WKNavigationAction) -> URLRequest {
+        var request = action.request
+        guard request.value(forHTTPHeaderField: "Referer") == nil,
+              let from = webView.url?.absoluteString,
+              from.hasPrefix("http"),
+              action.sourceFrame != nil else {
+            return request
+        }
+        request.setValue(from, forHTTPHeaderField: "Referer")
+        return request
+    }
+
     private func wasReissuedRecently(_ url: URL) -> Bool {
         guard let at = reissuedAt[url.absoluteString] else { return false }
         return Date().timeIntervalSince(at) < 2
@@ -930,26 +1030,40 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             return
         }
 
-        // A page jump must never leave the app, whatever triggered it:
-        // - taps and GET form submits (Universal Link handoff),
-        // - script-driven `location =` / `window.open` (`.other`): the "open in
-        //   app" banner and some news sites jump that way, and the pending user
-        //   gesture is enough for WebKit to honour the Universal Link.
+        // A page jump must never leave the app, but only a *gesture-backed* one
+        // can actually be handed to another app: iOS fires the Universal Link
+        // association for a tap, a form submit or a `window.open` (which keeps
+        // the tap's gesture), never for a script navigation the user did not
+        // activate. So:
+        // - taps / GET form submits and script `window.open` are cancelled and
+        //   re-issued from code, which is what keeps them in this browser;
+        // - a plain in-main-frame `location =` is allowed through instead.
+        //   Cancelling one and reloading it costs a second request for the same
+        //   document *and* leaves the redirecting wrapper page in the
+        //   back/forward list, so the first swipe back showed a blank screen.
+        //   Allowed, WebKit does what Safari does: a redirect issued while the
+        //   document is still loading replaces that entry.
+        // Anything that is not http(s), and any URL whose query carries an app
+        // scheme, is already cancelled above, whatever triggered it.
         // Back/forward and reload are left alone: those URLs are already inside
         // this browser. POST bodies pass through untouched.
         let trigger = navigationAction.navigationType
         let isGesture = trigger == .linkActivated || trigger == .formSubmitted
         let isScriptJump = trigger == .other
         let isWebURL = scheme == "http" || scheme == "https"
+        let opensFromScript = isScriptJump && opensWindow
         if blockExternalNavigations, reissueUserTaps, isWebURL,
            method == "GET",
-           isGesture || isScriptJump,
+           isGesture || opensFromScript,
            targetsMainFrame || opensWindow,
            navigationAction.request.httpBody == nil {
-            // The identical URL was just re-issued (a page that fires both a
-            // tap and a script jump, or a double tap). Cancel instead of
-            // allowing: allowing would hand a Universal Link to the other app.
-            if wasReissuedRecently(url) {
+            // The identical request is already in flight (a page that fires both
+            // a tap and a `window.open`, or a double tap). Cancel it: allowing
+            // would hand the Universal Link over, and a second load would put a
+            // duplicate entry in the back/forward list. Once nothing is loading
+            // the previous attempt is over, so the tap is honoured again instead
+            // of silently doing nothing.
+            if wasReissuedRecently(url), webView.isLoading {
                 decisionHandler(.cancel)
                 reportNavigation(kind: "in-app", url: url, method: method,
                                  mainFrame: targetsMainFrame, type: type,
@@ -961,8 +1075,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             reportNavigation(kind: "in-app", url: url, method: method,
                              mainFrame: targetsMainFrame, type: type,
                              message: "reloaded in-app (no external app)")
+            let reissued = reissueRequest(navigationAction)
             DispatchQueue.main.async { [weak self] in
-                self?.loadInApp(navigationAction.request)
+                self?.loadInApp(reissued)
             }
             return
         }
@@ -1027,12 +1142,16 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                  didStartProvisionalNavigation navigation: WKNavigation!) {
         // Do not report the previous page's status while the new one loads.
         lastStatusCode = nil
+        publishState()
     }
 
     /// The new document exists. This is the earliest point where the console
     /// can be put back into it, so every click, redirect or `window.open`
     /// keeps it without waiting for the load to finish.
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        // The new document is on screen: the address bar must show its URL now,
+        // not when the last subresource finishes.
+        publishState()
         if debugOverlayEnabled { injectDebug() }
     }
 
@@ -1050,6 +1169,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                     mainFrame: true,
                     type: lastNavigationType,
                     status: response.statusCode)
+                // The status is chrome data too (a 404 must be visible without
+                // opening the console), and no KVO key path carries it.
+                publishState()
             }
         }
         decisionHandler(.allow)
@@ -1076,6 +1198,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         programmaticURLs.removeAll()
         reportFailure(url: webView.url, error: error)
+        publishState()
         loadCompletion?(error)
         loadCompletion = nil
     }
@@ -1083,6 +1206,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         programmaticURLs.removeAll()
         reportFailure(url: webView.url, error: error)
+        publishState()
         loadCompletion?(error)
         loadCompletion = nil
     }
@@ -1090,6 +1214,12 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// A failed navigation often has no URL yet; `about:blank` keeps the row
     /// readable instead of dropping the event.
     private func reportFailure(url: URL?, error: Error) {
+        // `stopLoading()` and a navigation superseded mid-flight both fail with
+        // NSURLErrorCancelled. That was the user's own action, not a dead page,
+        // so it must not light up the failure state in the address bar.
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return
+        }
         reportNavigation(
             kind: "failed",
             url: url ?? URL(string: "about:blank")!,

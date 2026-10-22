@@ -99,6 +99,10 @@ abstract interface class WebViewSession {
   Future<void> goForward();
   Future<void> reload();
 
+  /// Cancels the load in flight, the way Safari's Stop button does. A page that
+  /// never answers leaves the host (and its chrome) waiting otherwise.
+  Future<void> stopLoading();
+
   /// Current committed URL, or `null` before the first navigation.
   Future<String?> currentUrl();
 

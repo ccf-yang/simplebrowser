@@ -172,6 +172,15 @@ class _BrowserPageState extends State<BrowserPage>
   bool _seenForward = false;
   int _seenResources = 0;
 
+  /// Why the last main-frame load failed, shown until the next one starts.
+  /// Null while a page is loading or after it succeeded.
+  String? _navError;
+
+  /// Host of the main-frame load currently in flight. The WebView keeps
+  /// reporting the previous URL until its new document commits, so without this
+  /// the status line would name the page the user just left.
+  String? _openingHost;
+
   // Console overlay state. The console is Flutter UI: it lives outside the
   // WebView, so it cannot be torn down by a navigation or hidden by page CSS.
   bool _consoleOpen = false;
@@ -196,6 +205,7 @@ class _BrowserPageState extends State<BrowserPage>
   DateTime? _networkClearedAt;
 
   Timer? _consoleRefreshTimer;
+  Timer? _resourceTimer;
 
   // Bookmarks live in the app container, not in the WebView profile.
   final List<_Bookmark> _bookmarks = <_Bookmark>[];
@@ -250,6 +260,14 @@ class _BrowserPageState extends State<BrowserPage>
     _pageSubscription = _browser.networkEvents.listen(_onPageNetworkEvent);
     _navigationSubscription =
         _browser.navigationEvents.listen(_onNavigationEvent);
+    // Resource timings come out of a JavaScript evaluation, so they are only
+    // pulled while a surface that shows them is open. The page state itself is
+    // pushed by the WebView and needs no timer.
+    _resourceTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) {
+      if (!mounted) return;
+      if (!_panelVisible && !_consoleOpen) return;
+      unawaited(_browser.refreshResources());
+    });
     unawaited(_loadProfileInfo());
     unawaited(_loadBookmarks());
     unawaited(_downloads.load());
@@ -338,8 +356,8 @@ class _BrowserPageState extends State<BrowserPage>
     if (focused != _urlFocused) setState(() => _urlFocused = focused);
   }
 
-  /// The controller polls the WebView; rebuild only on real changes so the
-  /// platform view is not re-laid-out every tick.
+  /// The WebView pushes its own chrome state; rebuild only on real changes so
+  /// the platform view is not re-laid-out on every tick.
   void _onBrowserChanged() {
     if (!mounted) return;
     final changed = _seenUrl != _browser.url ||
@@ -358,6 +376,9 @@ class _BrowserPageState extends State<BrowserPage>
     _seenForward = _browser.canGoForward;
     _seenResources = _browser.resourceTimings.length;
 
+    // A new document means the previous failure no longer describes this one.
+    if (_navError != null && _browser.url != previousUrl) _navError = null;
+
     final previous = previousUrl ?? '';
     setState(() {
       final url = _browser.url;
@@ -366,6 +387,11 @@ class _BrowserPageState extends State<BrowserPage>
           url.isNotEmpty &&
           url != 'about:blank') {
         _urlController.text = url;
+      }
+      // A link tap must clear the start page even when its load fails, or the
+      // mask keeps covering a WebView that has its own error to show.
+      if (!_started && _browser.url != null && _browser.url != 'about:blank') {
+        _started = true;
       }
     });
 
@@ -380,6 +406,11 @@ class _BrowserPageState extends State<BrowserPage>
     }
   }
 
+  void _setNavError(String? message) {
+    if (_navError == message) return;
+    setState(() => _navError = message);
+  }
+
   // ---------------------------------------------------------------------------
   // Page jumps (navigation delegate)
   // ---------------------------------------------------------------------------
@@ -389,6 +420,38 @@ class _BrowserPageState extends State<BrowserPage>
   void _onNavigationEvent(WebViewNavigationEvent event) {
     if (!mounted) return;
     if (!event.isMainFrame) return;
+
+    // A chrome snapshot (progress, title, history flags) is not a page jump.
+    // The controller already consumed it for the address bar; logging it would
+    // flood the console with dozens of rows per navigation.
+    if (event.isState) return;
+
+    // The address bar owns the outcome of the last main-frame load: a dead tap
+    // must say so instead of looking like nothing was pressed.
+    if (event.isFailed) {
+      final host = Uri.tryParse(event.url)?.host ?? '';
+      final reason = (event.message ?? '').trim();
+      _setNavError(
+        reason.isEmpty
+            ? (host.isEmpty ? '页面打开失败' : '$host 打开失败')
+            : '$host · $reason',
+      );
+    } else if (event.isCommitted || event.kind == 'response') {
+      _setNavError(null);
+    }
+
+    // Which page is on its way: the WebView names the new URL only when its
+    // document commits, so the status line takes the destination from the
+    // decision that started the load instead.
+    if (event.kind == 'start' || event.kind == 'in-app') {
+      final host = Uri.tryParse(event.url)?.host ?? '';
+      if (host.isNotEmpty && host != _openingHost) {
+        setState(() => _openingHost = host);
+      }
+    } else if (_openingHost != null &&
+        (event.isCommitted || event.isFailed || event.isBlocked)) {
+      setState(() => _openingHost = null);
+    }
 
     // Blocking is silent by design: pages try to open other apps constantly,
     // and a toast on every one of them is noise. The console line below keeps
@@ -500,6 +563,23 @@ class _BrowserPageState extends State<BrowserPage>
   bool get _hasDocument {
     final url = _browser.url;
     return url != null && url.isNotEmpty && url != 'about:blank';
+  }
+
+  /// The one-line status under the address bar: what is happening to this page
+  /// right now, in the order the user cares about it.
+  String get _contextStatusText {
+    final error = _navError;
+    if (error != null) return error;
+    if (_browser.isLoading) {
+      final host =
+          _openingHost ?? Uri.tryParse(_browser.url ?? '')?.host ?? '';
+      return host.isEmpty ? '正在打开…' : '正在打开 $host';
+    }
+    final title = _browser.title?.trim() ?? '';
+    if (title.isNotEmpty) return title;
+    final host = Uri.tryParse(_browser.url ?? '')?.host ?? '';
+    if (host.isNotEmpty) return host;
+    return 'Engine ready · ${_profileLabel ?? 'native profile'}';
   }
 
   /// UA sent to the engine capture; `null` means "use the profile default".
@@ -1313,6 +1393,7 @@ class _BrowserPageState extends State<BrowserPage>
   @override
   void dispose() {
     _consoleRefreshTimer?.cancel();
+    _resourceTimer?.cancel();
     _jsInput.dispose();
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
@@ -1350,31 +1431,68 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   Widget _buildToolbar() {
-    return Container(
-      color: AppColors.surface,
-      padding: const EdgeInsets.fromLTRB(6, 2, 8, 8),
-      child: Row(
+    // Listening on the controller here, instead of only through setState, keeps
+    // a progress tick to a repaint of this strip: the WebView platform view
+    // below is not re-laid-out while a page streams in.
+    return ListenableBuilder(
+      listenable: _browser,
+      builder: (context, _) => Column(
         children: <Widget>[
-          _toolButton(
-            Icons.chevron_left_rounded,
-            'Back',
-            _browser.canGoBack ? () => unawaited(_browser.goBack()) : null,
-            size: 24,
+          Container(
+            color: AppColors.surface,
+            padding: const EdgeInsets.fromLTRB(6, 2, 8, 6),
+            child: Row(
+              children: <Widget>[
+                _toolButton(
+                  Icons.chevron_left_rounded,
+                  'Back',
+                  _browser.canGoBack ? () => unawaited(_browser.goBack()) : null,
+                  size: 24,
+                ),
+                _toolButton(
+                  Icons.chevron_right_rounded,
+                  'Forward',
+                  _browser.canGoForward
+                      ? () => unawaited(_browser.goForward())
+                      : null,
+                  size: 24,
+                ),
+                Expanded(child: _buildAddressField()),
+                _toolButton(
+                  Icons.tune_rounded,
+                  'Settings',
+                  () => unawaited(_openSettings()),
+                ),
+                _buildConsoleButton(),
+              ],
+            ),
           ),
-          _toolButton(
-            Icons.chevron_right_rounded,
-            'Forward',
-            _browser.canGoForward ? () => unawaited(_browser.goForward()) : null,
-            size: 24,
-          ),
-          Expanded(child: _buildAddressField()),
-          _toolButton(
-            Icons.tune_rounded,
-            'Settings',
-            () => unawaited(_openSettings()),
-          ),
-          _buildConsoleButton(),
+          _buildLoadStrip(),
         ],
+      ),
+    );
+  }
+
+  /// Two pixels of real load state: WebKit's own estimated progress while a
+  /// document is arriving, the failure colour when one did not arrive at all.
+  Widget _buildLoadStrip() {
+    final loading = _browser.isLoading;
+    if (!loading) {
+      return Container(
+        height: 2,
+        color: _navError == null ? AppColors.line : AppColors.danger,
+      );
+    }
+    // An unknown-progress page still deserves motion; a bar frozen at 3% reads
+    // as a hang.
+    final value = _browser.progress > 0.05 ? _browser.progress : null;
+    return SizedBox(
+      height: 2,
+      child: LinearProgressIndicator(
+        value: value,
+        minHeight: 2,
+        backgroundColor: const Color(0xFFE4E4DC),
+        color: AppColors.signal,
       ),
     );
   }
@@ -1452,17 +1570,46 @@ class _BrowserPageState extends State<BrowserPage>
                   _urlFocus.unfocus();
                   unawaited(_go());
                 })
-              : _pillAction(
-                  Icons.refresh_rounded,
-                  'Reload',
-                  () => unawaited(_reload()),
-                ),
+              : _browser.isLoading
+                  // A page that never answers otherwise leaves the browser
+                  // waiting with no way out; Safari has a Stop button here.
+                  ? _pillAction(
+                      Icons.close_rounded,
+                      '停止加载',
+                      () => unawaited(_browser.stopLoading()),
+                    )
+                  : _pillAction(
+                      Icons.refresh_rounded,
+                      _navError == null ? 'Reload' : '重新加载',
+                      () => unawaited(_reload()),
+                    ),
         ],
       ),
     );
   }
 
   Widget _addressLeading(String text) {
+    // Load state first: a tap that is still in flight, and a tap that went
+    // nowhere, must both be visible without opening the console.
+    if (_browser.isLoading) {
+      return const SizedBox(
+        width: 14,
+        height: 14,
+        child: Padding(
+          padding: EdgeInsets.only(right: 1),
+          child: CircularProgressIndicator(
+            strokeWidth: 1.6,
+            color: AppColors.muted,
+          ),
+        ),
+      );
+    }
+    if (_navError != null) {
+      return const Tooltip(
+        message: '上一次加载失败，点右侧重试',
+        child: Icon(Icons.error_outline_rounded, size: 15, color: AppColors.danger),
+      );
+    }
     if (text.isEmpty) {
       return const Icon(
         Icons.search_rounded,
@@ -1559,12 +1706,12 @@ class _BrowserPageState extends State<BrowserPage>
           const SizedBox(width: 6),
           Expanded(
             child: Text(
-              'Engine ready · ${_profileLabel ?? 'native profile'}',
+              _contextStatusText,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 9.5,
-                color: AppColors.muted,
+                color: _navError == null ? AppColors.muted : AppColors.danger,
                 letterSpacing: 0.1,
               ),
             ),

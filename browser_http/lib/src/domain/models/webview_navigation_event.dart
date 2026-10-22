@@ -15,28 +15,53 @@ final class WebViewNavigationEvent {
     this.isMainFrame = true,
     this.statusCode,
     this.message,
+    this.isLoading = false,
+    this.progress = 0,
+    this.title,
+    this.canGoBack,
+    this.canGoForward,
   });
 
   /// Native WebView session id (`WebViewSession.id`).
   final String sessionId;
 
   /// One of `start`, `in-app`, `blocked`, `response`, `redirect`, `committed`,
-  /// `failed`, as reported by the native side.
+  /// `failed`, `state`, as reported by the native side.
+  ///
+  /// `state` is not a decision but a snapshot of the WebView's own chrome
+  /// properties (progress, title, history flags); it is pushed by KVO so a
+  /// browser UI never has to poll the page.
   final String kind;
 
   final String url;
   final DateTime timestamp;
   final String method;
 
-  /// What triggered it: `link`, `form`, `backForward`, `reload`, `other`.
+  /// What triggered it: `link`, `form`, `backForward`, `reload`, `other`,
+  /// `state`.
   final String navigationType;
   final bool isMainFrame;
   final int? statusCode;
   final String? message;
 
+  /// Only set on `state` events: WebKit is still loading the main document.
+  final bool isLoading;
+
+  /// Only set on `state` events: `WKWebView.estimatedProgress`, 0..1, quantised
+  /// natively so a page with hundreds of subresources cannot flood the channel.
+  final double progress;
+
+  /// Only set on `state` events: the document title, once WebKit has one.
+  final String? title;
+
+  /// Only set on `state` events: the back/forward list as WebKit sees it.
+  final bool? canGoBack;
+  final bool? canGoForward;
+
   bool get isBlocked => kind == 'blocked';
   bool get isFailed => kind == 'failed';
   bool get isCommitted => kind == 'committed';
+  bool get isState => kind == 'state';
 
   factory WebViewNavigationEvent.fromJson(Map<String, Object?> json) {
     return WebViewNavigationEvent(
@@ -51,6 +76,13 @@ final class WebViewNavigationEvent {
       isMainFrame: json['mainFrame'] as bool? ?? true,
       statusCode: (json['status'] as num?)?.toInt(),
       message: json['message'] as String?,
+      isLoading: json['loading'] as bool? ?? false,
+      progress: (json['progress'] as num?)?.toDouble() ?? 0,
+      title: (json['title'] as String?)?.isEmpty == true
+          ? null
+          : json['title'] as String?,
+      canGoBack: json['canGoBack'] as bool?,
+      canGoForward: json['canGoForward'] as bool?,
     );
   }
 
@@ -64,6 +96,13 @@ final class WebViewNavigationEvent {
     'mainFrame': isMainFrame,
     if (statusCode != null) 'status': statusCode,
     if (message != null) 'message': message,
+    if (isState) ...<String, Object?>{
+      'loading': isLoading,
+      'progress': progress,
+      'title': title ?? '',
+      'canGoBack': canGoBack,
+      'canGoForward': canGoForward,
+    },
   };
 
   @override

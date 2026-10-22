@@ -494,6 +494,10 @@ final class _ChannelWebViewSession implements WebViewSession {
       _channel.invokeMethod<void>('reload', <String, Object?>{'id': _id});
 
   @override
+  Future<void> stopLoading() =>
+      _channel.invokeMethod<void>('stopLoading', <String, Object?>{'id': _id});
+
+  @override
   Future<String?> currentUrl() => _channel.invokeMethod<String?>(
     'currentUrl',
     <String, Object?>{'id': _id},

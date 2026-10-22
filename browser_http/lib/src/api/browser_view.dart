@@ -40,9 +40,9 @@ final class BrowserController extends ChangeNotifier {
   int? _statusCode;
   bool _canGoBack = false;
   bool _canGoForward = false;
+  bool _loading = false;
+  double _progress = 0;
   List<WebResourceTiming> _resources = const <WebResourceTiming>[];
-
-  Timer? _poll;
 
   WebViewSession? get webView => _webView;
   String? get webViewId => _webView?.id;
@@ -53,6 +53,13 @@ final class BrowserController extends ChangeNotifier {
   int? get statusCode => _statusCode;
   bool get canGoBack => _canGoBack;
   bool get canGoForward => _canGoForward;
+
+  /// The main document is still loading. Pushed by the WebView itself, so it
+  /// turns true in the frame the tap starts the request.
+  bool get isLoading => _loading;
+
+  /// `WKWebView.estimatedProgress`, 0..1, only meaningful while [isLoading].
+  double get progress => _progress;
   List<WebResourceTiming> get resourceTimings => _resources;
 
   /// fetch/XHR/beacon observations from the page script.
@@ -93,16 +100,10 @@ final class BrowserController extends ChangeNotifier {
       _networkSubscription ??= webView.networkEvents.listen((event) {
         if (!_networkEvents.isClosed) _networkEvents.add(event);
       });
-      _navigationSubscription ??= webView.navigationEvents.listen((event) {
-        if (!_navigationEvents.isClosed) _navigationEvents.add(event);
-      });
+      _navigationSubscription ??= webView.navigationEvents.listen(_onWebViewEvent);
       if (!_pageNetwork) await webView.setPageNetworkEnabled(false);
       if (_contentBlocking) await webView.setContentBlockingEnabled(true);
       if (initialUri != null) await webView.navigate(initialUri);
-      _poll = Timer.periodic(
-        const Duration(milliseconds: 800),
-        (_) => unawaited(refresh()),
-      );
       await refresh();
     } on Object catch (error) {
       if (!_disposed) _error = error;
@@ -110,6 +111,56 @@ final class BrowserController extends ChangeNotifier {
       _startFuture = null;
       if (!_disposed) notifyListeners();
     }
+  }
+
+  /// Splits the WebView's reports: a chrome snapshot updates this controller,
+  /// a navigation decision is relayed to the host's log.
+  ///
+  /// The snapshot used to be produced by polling `currentUrl`/`currentTitle`
+  /// eight times a second, which cost five bridge calls plus a JavaScript
+  /// evaluation per tick and still showed a new page up to a full tick late.
+  /// KVO on the native side delivers the same facts in the frame they happen.
+  void _onWebViewEvent(WebViewNavigationEvent event) {
+    if (_disposed) return;
+    if (!event.isState) {
+      if (!_navigationEvents.isClosed) _navigationEvents.add(event);
+      return;
+    }
+    final previousUrl = _url;
+    final urlChanged = event.url.isNotEmpty && event.url != previousUrl;
+    if (urlChanged) {
+      _url = event.url;
+      // A different document brings its own title, and no status code yet.
+      _title = event.title;
+    } else {
+      _title = event.title ?? _title;
+    }
+    _canGoBack = event.canGoBack ?? _canGoBack;
+    _canGoForward = event.canGoForward ?? _canGoForward;
+    _loading = event.isLoading;
+    _progress = event.progress;
+    // While a load is in flight the native side reports no code until the
+    // response arrives, so the address bar must not keep the previous page's.
+    _statusCode = event.isLoading
+        ? event.statusCode
+        : (event.statusCode ?? _statusCode);
+    notifyListeners();
+  }
+
+  /// Marks the start of a navigation this controller issued, so the chrome can
+  /// show progress before the WebView has any new property to report.
+  void _beginNavigation(String? url) {
+    if (_disposed) return;
+    _loading = true;
+    // Never rewind below what the page already reported: a reload of the same
+    // document keeps its title and its half-drawn progress.
+    if (_progress < 0.03) _progress = 0.03;
+    _statusCode = null;
+    if (url != null && url != _url) {
+      _url = url;
+      _title = null;
+    }
+    notifyListeners();
   }
 
   /// Overrides the WebView user agent for subsequent navigations.
@@ -128,6 +179,7 @@ final class BrowserController extends ChangeNotifier {
     await start();
     final webView = _webView;
     if (webView == null) return;
+    _beginNavigation(uri.toString());
     if (userAgent != null) await webView.setUserAgent(userAgent);
     final cookie = headers['Cookie'];
     if (cookie != null && cookie.isNotEmpty) {
@@ -143,6 +195,7 @@ final class BrowserController extends ChangeNotifier {
   }) async {
     final webView = _webView;
     if (webView == null) return;
+    _beginNavigation(null);
     if (userAgent != null) await webView.setUserAgent(userAgent);
     if (headers.isEmpty) {
       await webView.reload();
@@ -162,21 +215,41 @@ final class BrowserController extends ChangeNotifier {
     await refresh();
   }
 
+  /// Cancels the load in flight. The WebView reports itself idle afterwards, so
+  /// the chrome stops on its own.
+  Future<void> stopLoading() async {
+    final webView = _webView;
+    if (webView == null) return;
+    await webView.stopLoading();
+    if (_disposed) return;
+    _loading = false;
+    _progress = 0;
+    notifyListeners();
+    await refresh();
+  }
+
   Future<void> goBack() async {
     final webView = _webView;
-    if (webView == null || !await webView.canGoBack()) return;
+    if (webView == null || !_canGoBack) return;
+    _beginNavigation(null);
     await webView.goBack();
     await refresh();
   }
 
   Future<void> goForward() async {
     final webView = _webView;
-    if (webView == null || !await webView.canGoForward()) return;
+    if (webView == null || !_canGoForward) return;
+    _beginNavigation(null);
     await webView.goForward();
     await refresh();
   }
 
-  /// Reads the current page state from the native side.
+  /// Re-reads the page state from the native side.
+  ///
+  /// Only a gap filler: KVO events keep the fields below current, and this is
+  /// what a host calls after it issues a navigation itself. Resource timings
+  /// are deliberately not fetched here — they come from a JavaScript
+  /// evaluation, so pulling them on every state change would tax the page.
   Future<void> refresh() async {
     final webView = _webView;
     if (webView == null || _disposed) return;
@@ -194,13 +267,14 @@ final class BrowserController extends ChangeNotifier {
           statusCode != _statusCode ||
           canGoBack != _canGoBack ||
           canGoForward != _canGoForward;
-      _url = url;
-      _title = title;
-      _statusCode = statusCode;
+      // A probe between two documents can still answer with the previous URL,
+      // so a missing value never rewinds what the WebView already reported.
+      _url = url ?? _url;
+      _title = title ?? _title;
+      _statusCode = statusCode ?? _statusCode;
       _canGoBack = canGoBack;
       _canGoForward = canGoForward;
 
-      if (changed) await refreshResources(notify: false);
       if (changed && !_disposed) notifyListeners();
     } on Object {
       // The page can be between documents; a failed probe is not fatal.
@@ -308,8 +382,6 @@ final class BrowserController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    _poll?.cancel();
-    _poll = null;
     final webView = _webView;
     _webView = null;
     if (webView != null) unawaited(webView.dispose());
