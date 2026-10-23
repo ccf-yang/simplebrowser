@@ -373,8 +373,12 @@ final class MediaBridge {
     /// not "0.0 MB".
     private static func megabytes(_ bytes: Int) -> String {
         if bytes < 0 { return "未知" }
+        if bytes < 1024 { return "\(bytes) B" }
         if bytes < 1 << 20 {
-            return String(format: "%.0f KB", Double(bytes) / 1024)
+            let kb = Double(bytes) / 1024
+            return kb < 10
+                ? String(format: "%.1f KB", kb)
+                : String(format: "%.0f KB", kb)
         }
         return String(format: "%.1f MB", Double(bytes) / 1_048_576)
     }
