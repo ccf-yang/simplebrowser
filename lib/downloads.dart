@@ -165,6 +165,18 @@ final class DownloadItem {
         lower.endsWith('.ts');
   }
 
+  /// Raw segments kept because the merge refused them: the row gets one more
+  /// attempt instead of making the user pull the whole video down again.
+  bool get remuxable {
+    final value = path;
+    if (value == null ||
+        status != DownloadStatus.downloaded ||
+        kind != ResourceKind.video) {
+      return false;
+    }
+    return value.toLowerCase().endsWith('.ts');
+  }
+
   String get displayName {
     final name = fileName.trim();
     return name.isEmpty ? (kind == ResourceKind.image ? 'image' : 'video') : name;
@@ -474,6 +486,100 @@ final class DownloadManager extends ChangeNotifier {
     unawaited(_pump());
   }
 
+  /// Ids currently being merged in place, so a double tap cannot start two
+  /// exports of the same file.
+  final Set<String> _remuxing = <String>{};
+
+  /// Re-runs the container merge on a stream that was kept as raw segments, so
+  /// a fixed remuxer can be tested without pulling the whole video again. The
+  /// row shows what this attempt said, either way.
+  Future<void> remuxExisting(DownloadItem item) async {
+    final source = item.path;
+    if (source == null || !item.remuxable || _remuxing.contains(item.id)) {
+      return;
+    }
+    final file = File(source);
+    if (!await file.exists()) {
+      item
+        ..path = null
+        ..photoError = '原文件已不在 App 里';
+      await _persist();
+      _notify(force: true);
+      return;
+    }
+
+    _remuxing.add(item.id);
+    item
+      ..status = DownloadStatus.saving
+      ..photoError = null;
+    _notify(force: true);
+
+    // Same timestamp prefix, new container: the row and the offline library
+    // keep sorting where the user left them.
+    final directory = source.substring(0, source.lastIndexOf('/'));
+    final target = File('$directory/${_nameStem(source)}.mp4');
+    String? failure;
+    try {
+      final status = await _media.invokeMethod<String>(
+        'remuxToMp4',
+        <String, Object?>{
+          'source': source,
+          'destination': target.path,
+        },
+      );
+      final text = status ?? '';
+      if (text.startsWith('ok') &&
+          await target.exists() &&
+          await target.length() > 1024) {
+        try {
+          await file.delete();
+        } on Object {
+          // The MP4 is the file that matters now.
+        }
+        final detail = text.startsWith('ok:') ? text.substring(3).trim() : '';
+        item
+          ..path = target.path
+          ..savedToPhotos = false;
+        await _saveLocally(
+          item,
+          target,
+          _MediaFile(
+            target,
+            saveable: true,
+            note: detail.isEmpty ? null : detail,
+          ),
+        );
+      } else {
+        final probe = await _sniffContainer(file);
+        failure = _withoutErrorPrefix(
+          text.isEmpty ? '转封装失败' : text,
+        );
+        item.photoError = '转 MP4 失败：$failure（${probe.diagnosis}）';
+      }
+    } on MissingPluginException {
+      failure = '当前构建不支持视频转封装';
+    } on PlatformException catch (error) {
+      failure = _withoutErrorPrefix(error.message ?? '转封装失败');
+    } on Object catch (error) {
+      failure = '$error';
+    }
+    if (failure != null) {
+      item
+        ..status = DownloadStatus.downloaded
+        ..photoError = '转 MP4 失败：$failure';
+    }
+    _remuxing.remove(item.id);
+    await _persist();
+    _notify(force: true);
+  }
+
+  /// File name without its extension, keeping the timestamp prefix.
+  static String _nameStem(String path) {
+    final name = path.substring(path.lastIndexOf('/') + 1);
+    final dot = name.lastIndexOf('.');
+    return dot > 0 ? name.substring(0, dot) : name;
+  }
+
   void remove(DownloadItem item) {
     if (item.status.active) cancel(item);
     _queue.remove(item);
@@ -760,17 +866,35 @@ final class DownloadManager extends ChangeNotifier {
       return;
     }
     final saved = await _saveToPhotos(file, item);
+    final detail = hlsResult?.note;
     if (saved == 'ok') {
       item
         ..status = DownloadStatus.saved
-        ..savedToPhotos = true;
+        ..savedToPhotos = true
+        // A merge that had to drop data says so on the row; silence here would
+        // turn a short video into a mystery.
+        ..photoError = detail;
     } else {
       item
         ..status = DownloadStatus.downloaded
-        ..photoError = saved == 'denied'
-            ? '相册权限未开启，文件留在 App 内'
-            : '存相册失败：$saved';
+        ..photoError = _joinNotes(
+          saved == 'denied'
+              ? '相册权限未开启，文件留在 App 内'
+              : '存相册失败：$saved',
+          detail,
+        );
     }
+  }
+
+  /// Notes stack instead of replacing each other: the segments that were
+  /// dropped and the reason the container was refused are both facts the user
+  /// needs, in one line.
+  static String? _joinNotes(String? first, String? second) {
+    final parts = <String>[
+      if (first != null && first.isNotEmpty) first,
+      if (second != null && second.isNotEmpty) second,
+    ];
+    return parts.isEmpty ? null : parts.join('；');
   }
 
   /// Download finished locally, now push it to the server and drop the local
@@ -1271,6 +1395,7 @@ final class DownloadManager extends ChangeNotifier {
     _notify(force: true);
 
     final keys = <String, Uint8List>{};
+    String? skipNote;
     IOSink? sink;
     try {
       sink = temp.openWrite();
@@ -1300,6 +1425,7 @@ final class DownloadManager extends ChangeNotifier {
       // Segments are small, so a wider batch hides per-request latency better
       // than a bigger buffer; the sink still writes them in playlist order.
       const window = 6;
+      final badPieces = <int>[];
       for (var start = 0; start < playlist.segments.length; start += window) {
         if (token.isCancelled) throw const _DownloadCancelled();
         final end = (start + window) < playlist.segments.length
@@ -1312,12 +1438,37 @@ final class DownloadManager extends ChangeNotifier {
         ]);
         if (token.isCancelled) throw const _DownloadCancelled();
         for (var i = 0; i < chunks.length; i++) {
-          sink.add(chunks[i]);
-          item.received += chunks[i].length;
+          var bytes = chunks[i];
+          // A CDN that refuses one request out of three hundred answers 200
+          // with a page, and that page wedged into the middle of the stream is
+          // enough for the demuxer to call the whole file unreadable. Ask once
+          // more, then drop the piece: a short jump in the video beats a file
+          // that will not open at all.
+          if (!_pieceIsMedia(bytes, fmp4: fmp4)) {
+            bytes = await _fetchSegment(batch[i], headers, token, keys);
+            if (!_pieceIsMedia(bytes, fmp4: fmp4)) {
+              badPieces.add(start + i + 1);
+              bytes = Uint8List(0);
+            }
+          }
+          if (bytes.isNotEmpty) {
+            sink.add(bytes);
+            item.received += bytes.length;
+          }
           item.segmentsDone = start + i + 1;
           _notify();
         }
       }
+      if (badPieces.length > 3 &&
+          badPieces.length * 5 > playlist.segments.length) {
+        throw FormatException(
+          '服务器拒掉了 ${badPieces.length} 个分片，多半是防盗链或登录过期',
+        );
+      }
+      skipNote = badPieces.isEmpty
+          ? null
+          : '已跳过 ${badPieces.length} 个异常分片'
+                '${badPieces.length <= 6 ? '（第 ${badPieces.join('、')} 段）' : ''}';
       await sink.flush();
       await sink.close();
       sink = null;
@@ -1361,7 +1512,7 @@ final class DownloadManager extends ChangeNotifier {
       final out = File('${dir.path}/${stamp}_$base.mp4');
       await temp.rename(out.path);
       item.path = out.path;
-      return _MediaFile(out, saveable: true);
+      return _MediaFile(out, saveable: true, note: skipNote);
     }
 
     final out = File('${dir.path}/${stamp}_$base.mp4');
@@ -1380,7 +1531,8 @@ final class DownloadManager extends ChangeNotifier {
             'destination': out.path,
           },
         );
-        if (status == 'ok' &&
+        final text = status ?? '';
+        if (text.startsWith('ok') &&
             await out.exists() &&
             await out.length() > 1024) {
           try {
@@ -1389,9 +1541,20 @@ final class DownloadManager extends ChangeNotifier {
             // The MP4 is what matters; the TS copy can be cleaned later.
           }
           item.path = out.path;
-          return _MediaFile(out, saveable: true);
+          // "ok: …" means the native side had to throw away part of the
+          // stream to make the file; the row has to say so, or a video that
+          // ends early looks like a bug in the player.
+          final detail = text.startsWith('ok:') ? text.substring(3).trim() : '';
+          return _MediaFile(
+            out,
+            saveable: true,
+            note: _joinNotes(
+              skipNote,
+              detail.isEmpty ? null : detail,
+            ),
+          );
         }
-        note = '${status ?? '转封装失败'}（${probe.diagnosis}）';
+        note = '${text.isEmpty ? '转封装失败' : text}（${probe.diagnosis}）';
       } on MissingPluginException {
         note = '当前构建不支持视频转封装';
       } on PlatformException catch (error) {
@@ -1415,8 +1578,40 @@ final class DownloadManager extends ChangeNotifier {
     return _MediaFile(
       fallback,
       saveable: false,
-      note: '已保留原始分片文件，转 MP4 失败：$message',
+      note: _joinNotes(
+        skipNote,
+        '已保留原始分片文件，转 MP4 失败：$message（可点「转 MP4」就地重试）',
+      ),
     );
+  }
+
+  /// Is this piece of the stream media data at all? Transport streams start
+  /// with the 0x47 sync byte (again one packet later), fragmented MP4 with a
+  /// box header, and everything else — an HTML error page, a JSON refusal, a
+  /// zero-byte reply — is not something to append to a video.
+  static bool _pieceIsMedia(Uint8List bytes, {required bool fmp4}) {
+    if (bytes.length < 4) return false;
+    if (bytes[0] == 0x47) {
+      // One sync byte is luck; the next packet grid is the evidence. Short
+      // pieces cannot be checked that far, and they are taken on trust.
+      if (bytes.length < 2 * 208) return true;
+      for (final stride in const <int>[188, 192, 204, 208, 194]) {
+        if (bytes.length > stride * 2 && bytes[stride] == 0x47) return true;
+      }
+      return false;
+    }
+    if (bytes.length > 12 && bytes[4] == 0x66) {
+      final type = String.fromCharCodes(bytes.sublist(4, 8));
+      if (type == 'ftyp' || type == 'styp') return true;
+    }
+    if (bytes.length > 12) {
+      final type = String.fromCharCodes(bytes.sublist(4, 8));
+      if (fmp4 &&
+          (type == 'moof' || type == 'sidx' || type == 'free' || type == 'mdat')) {
+        return true;
+      }
+    }
+    return false;
   }
 
   Future<Uint8List> _fetchSegment(
@@ -1684,6 +1879,11 @@ final class DownloadManager extends ChangeNotifier {
 
 /// The moment a file was captured, in its name: `20261023-213456_片段.mp4`.
 ///
+/// The native bridge prefixes its own failures with `error: `, which reads
+/// like a stack trace in a download row. The reason is the useful part.
+String _withoutErrorPrefix(String text) =>
+    text.startsWith('error: ') ? text.substring('error: '.length) : text;
+
 /// CDN names repeat (`1.mp4`, `video.ts`) and a millisecond epoch is unreadable,
 /// so the offline library and the WebDAV target both carry the local time
 /// instead. Nothing parses this prefix back, which is why the same string can

@@ -368,6 +368,11 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
           onCancel: () => _manager.cancel(item),
           onRetry: () => _manager.retry(item),
           onRemove: () => _manager.remove(item),
+          onRemux: !item.remuxable
+              ? null
+              : () {
+                  unawaited(_manager.remuxExisting(item));
+                },
           onPlay: !item.playable
               ? null
               : () async {
@@ -518,6 +523,7 @@ class _DownloadTile extends StatelessWidget {
     required this.onRemove,
     this.onPlay,
     this.onShare,
+    this.onRemux,
   });
 
   final DownloadItem item;
@@ -526,6 +532,10 @@ class _DownloadTile extends StatelessWidget {
   final VoidCallback onRemove;
   final VoidCallback? onPlay;
   final VoidCallback? onShare;
+
+  /// Re-merges a stream that was kept as raw `.ts` segments, without pulling
+  /// the whole video down again.
+  final VoidCallback? onRemux;
 
   @override
   Widget build(BuildContext context) {
@@ -541,7 +551,10 @@ class _DownloadTile extends StatelessWidget {
         '${item.webdavPath ?? '已传服务器'}'
             '${item.webdavError == null ? '' : ' · ${item.webdavError}'}'
             '${item.photoError == null ? '' : ' · ${item.photoError}'}',
-      DownloadStatus.saved => '已存入相册${item.sizeLabel.isEmpty ? '' : ' · ${item.sizeLabel}'}',
+      DownloadStatus.saved =>
+        '已存入相册${item.sizeLabel.isEmpty ? '' : ' · ${item.sizeLabel}'}'
+            // A merge that had to drop data keeps saying so after the save.
+            '${item.photoError == null ? '' : ' · ${item.photoError}'}',
       DownloadStatus.downloaded =>
         item.webdavError ??
         (item.hls
@@ -613,6 +626,14 @@ class _DownloadTile extends StatelessWidget {
                     ],
                   ),
                 ),
+                if (onRemux != null) ...<Widget>[
+                  _MiniButton(
+                    icon: Icons.video_file_outlined,
+                    tooltip: '转 MP4',
+                    onTap: onRemux!,
+                  ),
+                  const SizedBox(width: 4),
+                ],
                 if (onPlay != null)
                   _MiniButton(
                     icon: Icons.play_circle_outline_rounded,
