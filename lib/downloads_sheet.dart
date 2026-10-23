@@ -23,6 +23,12 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
   int _tab = 0;
   List<OfflineFile>? _offline;
 
+  /// The offline library starts out empty-looking and stays that way until the
+  /// eye is pressed. These files are not deleted or moved — the list is simply
+  /// not drawn, the count is not shown, and 「清空文件」 refuses to work on what
+  /// is not on screen, so a first glance at the phone reveals nothing.
+  bool _offlineHidden = true;
+
   /// One offline file at a time: the sheet shows a bar on that row only.
   String? _uploadingPath;
   double? _uploadProgress;
@@ -51,6 +57,15 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
     if (_tab == tab) return;
     setState(() => _tab = tab);
     if (tab == 1) unawaited(_loadOffline());
+  }
+
+  /// The eye: hide the library again, or show what is on disk.
+  void _toggleOfflineVisible() {
+    final revealing = _offlineHidden;
+    setState(() => _offlineHidden = !revealing);
+    // A download can have finished while the list was hidden, so opening it
+    // re-scans instead of showing a stale shelf.
+    if (revealing) unawaited(_loadOffline());
   }
 
   Future<void> _notice(String title, String message) async {
@@ -124,6 +139,9 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
   }
 
   Future<void> _clearOffline() async {
+    // The button is greyed out while hidden; this is the second lock, because
+    // deleting files nobody can see is the one mistake hiding exists to prevent.
+    if (_offlineHidden) return;
     final files = _offline ?? const <OfflineFile>[];
     if (files.isEmpty) return;
     if (!await _confirm(
@@ -290,10 +308,21 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                         )
                       else ...<Widget>[
                         TextButton(
-                          onPressed: (_offline ?? const <OfflineFile>[]).isEmpty
+                          onPressed: _offlineHidden ||
+                                  (_offline ?? const <OfflineFile>[]).isEmpty
                               ? null
                               : () => unawaited(_clearOffline()),
                           child: const Text('清空文件'),
+                        ),
+                        const SizedBox(width: 2),
+                        _MiniButton(
+                          icon: _offlineHidden
+                              ? Icons.visibility_off_rounded
+                              : Icons.visibility_rounded,
+                          tooltip: _offlineHidden
+                              ? '显示离线库'
+                              : '隐藏离线库内容',
+                          onTap: _toggleOfflineVisible,
                         ),
                         const SizedBox(width: 2),
                         _MiniButton(
@@ -322,7 +351,7 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                       const SizedBox(width: 7),
                       _TabChip(
                         label: '离线库',
-                        count: _offline?.length,
+                        count: _offlineHidden ? null : _offline?.length,
                         active: _tab == 1,
                         onTap: () => _selectTab(1),
                       ),
@@ -343,6 +372,9 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
 
   String _subtitle() {
     if (_tab == 1) {
+      // Worded exactly like the empty library, so the hidden state adds nothing
+      // a first glance can pick up on.
+      if (_offlineHidden) return 'App 内还没有文件';
       final files = _offline;
       if (files == null) return '正在读取 App 内的文件…';
       if (files.isEmpty) return 'App 内还没有文件';
@@ -420,6 +452,9 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
   }
 
   Widget _buildOffline() {
+    // Hidden draws the ordinary empty shelf: the same picture, the same words,
+    // so a first glance cannot tell the two apart.
+    if (_offlineHidden) return const _EmptyOffline();
     final files = _offline;
     if (files == null) {
       return const Center(
