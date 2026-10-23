@@ -122,8 +122,8 @@ class _HoldRow extends StatelessWidget {
       );
 }
 
-/// Every window at once: tap a card to go there, close the ones you are done
-/// with, add another.
+/// Every window at once: tap a card to go there, swipe one away or press its
+/// corner ✕ to close it, add another.
 Future<void> showTaskView(
   BuildContext context, {
   required WindowStore store,
@@ -168,7 +168,14 @@ class _TaskViewState extends State<_TaskView> {
   }
 
   void _close(BrowseWindow window) {
-    setState(() => widget.onClose(window));
+    widget.onClose(window);
+    setState(() {});
+    // Closing the last window makes the store open a fresh blank one a few
+    // awaits later, which is after this frame. Rebuild once more so the grid is
+    // never left showing an empty shelf.
+    Future<void>.delayed(const Duration(milliseconds: 320), () {
+      if (mounted) setState(() {});
+    });
   }
 
   void _create() {
@@ -194,40 +201,53 @@ class _TaskViewState extends State<_TaskView> {
             children: <Widget>[
               Padding(
                 padding: const EdgeInsets.fromLTRB(14, 12, 10, 6),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                    const Icon(
-                      Icons.grid_view_rounded,
-                      size: 16,
-                      color: AppColors.ink,
-                    ),
-                    const SizedBox(width: 7),
-                    Text(
-                      '任务视图 · ${windows.length} 个窗口',
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: AppColors.ink,
-                      ),
-                    ),
-                    const Spacer(),
-                    if (windows.length < WindowStore.max)
-                      TextButton.icon(
-                        onPressed: _create,
-                        icon: const Icon(Icons.add_rounded, size: 16),
-                        label: const Text('新窗口'),
-                        style: TextButton.styleFrom(
-                          foregroundColor: AppColors.signalInk,
-                          backgroundColor: AppColors.signal,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(9),
-                          ),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
+                    Row(
+                      children: <Widget>[
+                        const Icon(
+                          Icons.grid_view_rounded,
+                          size: 16,
+                          color: AppColors.ink,
+                        ),
+                        const SizedBox(width: 7),
+                        Text(
+                          '任务视图 · ${windows.length} 个窗口',
+                          style: const TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.ink,
                           ),
                         ),
+                        const Spacer(),
+                        if (windows.length < WindowStore.max)
+                          TextButton.icon(
+                            onPressed: _create,
+                            icon: const Icon(Icons.add_rounded, size: 16),
+                            label: const Text('新窗口'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: AppColors.signalInk,
+                              backgroundColor: AppColors.signal,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(9),
+                              ),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 3),
+                    const Text(
+                      '左滑卡片关闭 · 点卡片切过去',
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: AppColors.faint,
                       ),
+                    ),
                   ],
                 ),
               ),
@@ -265,7 +285,23 @@ class _TaskViewState extends State<_TaskView> {
     return -1;
   }
 
-  Widget _card(BrowseWindow window, {required bool current}) {
+  /// One card in the grid, swipeable away.
+  ///
+  /// The drag is the answer to the corner ✕ being a 22 px bullseye: the whole
+  /// card is the target now, and it only reacts to a horizontal pull, so the
+  /// grid still scrolls vertically under the same finger.
+  Widget _card(BrowseWindow window, {required bool current}) => Dismissible(
+    key: ValueKey<int>(window.number),
+    direction: DismissDirection.endToStart,
+    dismissThresholds: const <DismissDirection, double>{
+      DismissDirection.endToStart: 0.4,
+    },
+    background: const _DeleteBackdrop(),
+    onDismissed: (_) => _close(window),
+    child: _cardBody(window, current: current),
+  );
+
+  Widget _cardBody(BrowseWindow window, {required bool current}) {
     final thumbnail = window.thumbnail;
     return Material(
       color: AppColors.surface,
@@ -310,8 +346,8 @@ class _TaskViewState extends State<_TaskView> {
                         gaplessPlayback: true,
                       ),
                     Positioned(
-                      right: 2,
-                      top: 2,
+                      right: 4,
+                      top: 4,
                       child: _CloseButton(onTap: () => _close(window)),
                     ),
                   ],
@@ -365,15 +401,47 @@ class _CloseButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Material(
         color: AppColors.ink.withAlpha(190),
-        borderRadius: BorderRadius.circular(9),
+        borderRadius: BorderRadius.circular(11),
         child: InkWell(
-          borderRadius: BorderRadius.circular(9),
+          borderRadius: BorderRadius.circular(11),
           onTap: onTap,
           child: const SizedBox(
-            width: 22,
-            height: 22,
-            child: Icon(Icons.close_rounded, size: 13, color: AppColors.onInk),
+            width: 30,
+            height: 30,
+            child: Icon(Icons.close_rounded, size: 17, color: AppColors.onInk),
           ),
+        ),
+      );
+}
+
+/// What a swipe reveals: the window is going away, so it says so in the corner
+/// the card is travelling out of.
+class _DeleteBackdrop extends StatelessWidget {
+  const _DeleteBackdrop();
+
+  @override
+  Widget build(BuildContext context) => Container(
+        decoration: BoxDecoration(
+          color: AppColors.danger.withAlpha(34),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColors.danger.withAlpha(110)),
+        ),
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 16),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Text(
+              '关闭',
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: AppColors.danger,
+              ),
+            ),
+            SizedBox(width: 6),
+            Icon(Icons.delete_outline_rounded, size: 19, color: AppColors.danger),
+          ],
         ),
       );
 }
