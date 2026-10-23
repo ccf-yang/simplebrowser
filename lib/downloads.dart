@@ -486,8 +486,8 @@ final class DownloadManager extends ChangeNotifier {
     unawaited(_pump());
   }
 
-  /// Ids currently being merged in place, so a double tap cannot start two
-  /// exports of the same file.
+  /// Download ids and, for the offline library, file paths currently being
+  /// merged in place, so a double tap cannot start two exports of one file.
   final Set<String> _remuxing = <String>{};
 
   /// Re-runs the container merge on a stream that was kept as raw segments, so
@@ -571,6 +571,62 @@ final class DownloadManager extends ChangeNotifier {
     _remuxing.remove(item.id);
     await _persist();
     _notify(force: true);
+  }
+
+  /// Re-runs the container merge on a `.ts` the offline library is holding, for
+  /// the case where the download record has been cleared and only the file is
+  /// left: the repair lives in the file, not in the row that started it.
+  ///
+  /// `done` says whether the MP4 landed; `note` is whatever the remuxer
+  /// reported — the line about the bytes it dropped on success, the reason it
+  /// refused otherwise.
+  Future<({bool done, String note})> remuxOffline(OfflineFile file) async {
+    final source = file.path;
+    if (!source.toLowerCase().endsWith('.ts')) {
+      return (done: false, note: '只有 .ts 分片文件需要转封装');
+    }
+    if (_remuxing.contains(source)) {
+      return (done: false, note: '这个文件正在转，等一下');
+    }
+    final directory = source.substring(0, source.lastIndexOf('/'));
+    final target = File('$directory/${_nameStem(source)}.mp4');
+    _remuxing.add(source);
+    try {
+      final status = await _media.invokeMethod<String>(
+        'remuxToMp4',
+        <String, Object?>{'source': source, 'destination': target.path},
+      );
+      final text = status ?? '';
+      if (text.startsWith('ok') &&
+          await target.exists() &&
+          await target.length() > 1024) {
+        try {
+          await File(source).delete();
+        } on Object {
+          // The MP4 is the file that matters now.
+        }
+        _notify(force: true);
+        final detail = text.startsWith('ok:') ? text.substring(3).trim() : '';
+        return (done: true, note: detail.isEmpty ? '可以直接播放了' : detail);
+      }
+      final probe = await _sniffContainer(File(source));
+      return (
+        done: false,
+        note: '${_withoutErrorPrefix(text.isEmpty ? '转封装失败' : text)}'
+            '（${probe.diagnosis}）',
+      );
+    } on MissingPluginException {
+      return (done: false, note: '当前构建不支持视频转封装');
+    } on PlatformException catch (error) {
+      return (
+        done: false,
+        note: _withoutErrorPrefix(error.message ?? '转封装失败'),
+      );
+    } on Object catch (error) {
+      return (done: false, note: '$error');
+    } finally {
+      _remuxing.remove(source);
+    }
   }
 
   /// File name without its extension, keeping the timestamp prefix.

@@ -33,6 +33,11 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
   String? _uploadingPath;
   double? _uploadProgress;
 
+  /// The `.ts` rows being merged into an MP4 right now. A file, not a download,
+  /// because the record may have been cleared long ago and the repair still has
+  /// to be reachable.
+  final Set<String> _remuxingPaths = <String>{};
+
   DownloadManager get _manager => widget.manager;
 
   bool get _webDavReady => _manager.webdavConfig?.ready ?? false;
@@ -159,6 +164,24 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
   Future<void> _playOffline(OfflineFile file) async {
     final error = await _manager.playPath(file.path);
     if (error != null) await _notice('播放失败', error);
+  }
+
+  /// Merges a kept-as-`.ts` stream into an MP4 straight from the library, for
+  /// the files whose download record is long gone. This runs for a minute or
+  /// two on a long video, so the row carries a spinner and the answer arrives
+  /// after a reload of the list.
+  Future<void> _remuxOffline(OfflineFile file) async {
+    if (!_remuxingPaths.add(file.path)) return;
+    setState(() {});
+    final result = await _manager.remuxOffline(file);
+    _remuxingPaths.remove(file.path);
+    await _loadOffline();
+    if (!mounted) return;
+    setState(() {});
+    await _notice(
+      result.done ? '已转出 MP4' : '转 MP4 失败',
+      result.note,
+    );
   }
 
   Future<void> _shareOffline(OfflineFile file) async {
@@ -476,6 +499,11 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
       itemBuilder: (context, index) {
         final file = files[index];
         final uploading = _uploadingPath == file.path;
+        final remuxing = _remuxingPaths.contains(file.path);
+        // A `.ts` row spends its last slot on the merge rather than on 导出:
+        // raw segments handed to the Files app are not something a person can
+        // watch, and the row only has room for four buttons.
+        final needsRemux = file.isVideo && file.extension == 'ts';
         return _OfflineTile(
           file: file,
           onOpen: file.isImage
@@ -483,8 +511,14 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
               : file.playable
                   ? () => unawaited(_playOffline(file))
                   : null,
-          onShare: () => unawaited(_shareOffline(file)),
+          onShare: needsRemux
+              ? null
+              : () => unawaited(_shareOffline(file)),
           onDelete: () => unawaited(_deleteOffline(file)),
+          onRemux: !needsRemux || remuxing
+              ? null
+              : () => unawaited(_remuxOffline(file)),
+          remuxing: remuxing,
           onUpload: _webDavReady && !uploading
               ? () => unawaited(_uploadOffline(file))
               : null,
@@ -781,8 +815,10 @@ class _OfflineTile extends StatelessWidget {
   const _OfflineTile({
     required this.file,
     required this.onOpen,
-    required this.onShare,
     required this.onDelete,
+    this.onShare,
+    this.onRemux,
+    this.remuxing = false,
     this.onUpload,
     this.uploading = false,
     this.progress,
@@ -790,8 +826,13 @@ class _OfflineTile extends StatelessWidget {
 
   final OfflineFile file;
   final VoidCallback? onOpen;
-  final VoidCallback onShare;
+  final VoidCallback? onShare;
   final VoidCallback onDelete;
+
+  /// A `.ts` the library is holding as raw segments: one tap merges it into an
+  /// MP4 without pulling the video down again.
+  final VoidCallback? onRemux;
+  final bool remuxing;
 
   /// Null when no WebDAV target is configured.
   final VoidCallback? onUpload;
@@ -843,6 +884,7 @@ class _OfflineTile extends StatelessWidget {
                             file.sizeLabel,
                             _dateLabel(file.modified),
                             if (uploading) '上传中',
+                            if (remuxing) '转封装中',
                           ].join(' · '),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
@@ -863,6 +905,20 @@ class _OfflineTile extends StatelessWidget {
                       onTap: onOpen!,
                     ),
                   const SizedBox(width: 4),
+                  if (onRemux != null || remuxing) ...<Widget>[
+                    remuxing
+                        ? const _MiniButton(
+                            icon: Icons.video_file_outlined,
+                            tooltip: '正在转封装',
+                            busy: true,
+                          )
+                        : _MiniButton(
+                            icon: Icons.video_file_outlined,
+                            tooltip: '转 MP4',
+                            onTap: onRemux!,
+                          ),
+                    const SizedBox(width: 4),
+                  ],
                   if (onUpload != null || uploading)
                     uploading
                         ? const _MiniButton(
@@ -876,12 +932,14 @@ class _OfflineTile extends StatelessWidget {
                             onTap: onUpload!,
                           ),
                   if (onUpload != null || uploading) const SizedBox(width: 4),
-                  _MiniButton(
-                    icon: Icons.ios_share_rounded,
-                    tooltip: '导出到文件',
-                    onTap: onShare,
-                  ),
-                  const SizedBox(width: 4),
+                  if (onShare != null) ...<Widget>[
+                    _MiniButton(
+                      icon: Icons.ios_share_rounded,
+                      tooltip: '导出到文件',
+                      onTap: onShare!,
+                    ),
+                    const SizedBox(width: 4),
+                  ],
                   _MiniButton(
                     icon: Icons.delete_outline_rounded,
                     tooltip: '删除本地文件',
