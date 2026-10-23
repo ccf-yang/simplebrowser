@@ -242,9 +242,10 @@ final class MediaBridge {
         }
     }
 
-    private static func describe(_ error: NSError?) -> String {
+    private static func describe(_ error: (any Error)?) -> String {
         guard let error else { return "未知错误" }
-        return "\(error.domain) \(error.code) · \(error.localizedDescription)"
+        let bridged = error as NSError
+        return "\(bridged.domain) \(bridged.code) · \(bridged.localizedDescription)"
     }
 
     private static func export(_ asset: AVURLAsset,
