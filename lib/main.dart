@@ -573,6 +573,9 @@ class _BrowserPageState extends State<BrowserPage>
     _seenResources = browser.resourceTimings.length;
     _navError = null;
     _openingHost = null;
+    // The DOM and storage panes read the page on screen, so a window switch
+    // re-pulls them the way a new document does.
+    if (_consoleOpen) _scheduleConsoleRefresh();
     final window = _windows.current;
     window.refreshLabel();
     final url = browser.url;
