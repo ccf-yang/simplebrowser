@@ -178,53 +178,105 @@ final class MediaBridge {
         }
         try? FileManager.default.removeItem(at: destination)
 
-        let asset = AVURLAsset(
-            url: source,
-            options: [AVURLAssetPreferPreciseDurationAndTimingKey: true]
-        )
-        asset.loadValuesAsynchronously(forKeys: ["tracks", "duration"]) {
-            var error: NSError?
-            let status = asset.statusOfValue(forKey: "tracks", error: &error)
-            guard status == .loaded else {
-                DispatchQueue.main.async {
-                    result("error: 无法读取视频轨道（\(error?.localizedDescription ?? "unknown")）")
-                }
-                return
-            }
-            guard !asset.tracks(withMediaType: .video).isEmpty else {
+        // Two passes. The precise-timing read indexes the whole file, and a
+        // stream stitched from hundreds of segments sometimes fails there
+        // (PCR gaps, a PAT/PMT only in the first packet group) while the
+        // cheap duration-only load reads the tracks fine.
+        Self.readTracks(of: source, precise: true) { first in
+            switch first {
+            case .ready(let asset):
+                Self.export(asset, to: destination, result: result)
+            case .noVideo:
                 DispatchQueue.main.async {
                     result("error: 源文件没有视频轨道")
                 }
-                return
-            }
-            guard let session = AVAssetExportSession(
-                asset: asset,
-                presetName: AVAssetExportPresetPassthrough
-            ) else {
-                DispatchQueue.main.async {
-                    result("error: 无法创建转封装任务")
-                }
-                return
-            }
-            guard session.supportedFileTypes.contains(.mp4) else {
-                DispatchQueue.main.async {
-                    result("error: 系统不支持 MP4 转封装")
-                }
-                return
-            }
-            session.outputURL = destination
-            session.outputFileType = .mp4
-            session.shouldOptimizeForNetworkUse = true
-            session.exportAsynchronously {
-                DispatchQueue.main.async {
-                    switch session.status {
-                    case .completed:
-                        result("ok")
-                    case .cancelled:
-                        result("error: 转封装被取消")
-                    default:
-                        result("error: \(session.error?.localizedDescription ?? "转封装失败")")
+            case .unloadable(let error):
+                Self.readTracks(of: source, precise: false) { second in
+                    switch second {
+                    case .ready(let asset):
+                        Self.export(asset, to: destination, result: result)
+                    case .noVideo:
+                        DispatchQueue.main.async {
+                            result("error: 源文件没有视频轨道")
+                        }
+                    case .unloadable(let retryError):
+                        // The host shows this string; a bare
+                        // "cannot open file" told nobody whether the bytes
+                        // were the container the playlist promised.
+                        DispatchQueue.main.async {
+                            result("error: 无法读取视频轨道（"
+                                   + Self.describe(retryError ?? error) + "）")
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    private enum TrackRead {
+        case ready(AVURLAsset)
+        case unloadable(NSError?)
+        case noVideo
+    }
+
+    private static func readTracks(of source: URL,
+                                   precise: Bool,
+                                   completion: @escaping (TrackRead) -> Void) {
+        let asset = AVURLAsset(
+            url: source,
+            options: precise
+                ? [AVURLAssetPreferPreciseDurationAndTimingKey: true]
+                : [:]
+        )
+        asset.loadValuesAsynchronously(forKeys: ["tracks"]) {
+            var error: NSError?
+            if asset.statusOfValue(forKey: "tracks", error: &error) != .loaded {
+                completion(.unloadable(error))
+                return
+            }
+            if asset.tracks(withMediaType: .video).isEmpty {
+                completion(.noVideo)
+                return
+            }
+            completion(.ready(asset))
+        }
+    }
+
+    private static func describe(_ error: NSError?) -> String {
+        guard let error else { return "未知错误" }
+        return "\(error.domain) \(error.code) · \(error.localizedDescription)"
+    }
+
+    private static func export(_ asset: AVURLAsset,
+                               to destination: URL,
+                               result: @escaping FlutterResult) {
+        guard let session = AVAssetExportSession(
+            asset: asset,
+            presetName: AVAssetExportPresetPassthrough
+        ) else {
+            DispatchQueue.main.async {
+                result("error: 无法创建转封装任务")
+            }
+            return
+        }
+        guard session.supportedFileTypes.contains(.mp4) else {
+            DispatchQueue.main.async {
+                result("error: 系统不支持 MP4 转封装")
+            }
+            return
+        }
+        session.outputURL = destination
+        session.outputFileType = .mp4
+        session.shouldOptimizeForNetworkUse = true
+        session.exportAsynchronously {
+            DispatchQueue.main.async {
+                switch session.status {
+                case .completed:
+                    result("ok")
+                case .cancelled:
+                    result("error: 转封装被取消")
+                default:
+                    result("error: \(Self.describe(session.error))")
                 }
             }
         }

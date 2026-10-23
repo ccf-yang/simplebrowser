@@ -284,7 +284,8 @@ final class OfflineFile {
   bool get playable =>
       const <String>{'mp4', 'm4v', 'mov', 'ts'}.contains(extension);
 
-  /// The downloader prefixes files with an epoch stamp; hide it in the UI.
+  /// Legacy names carry a 13-digit epoch; the readable timestamp does not,
+  /// because `20261023-213456` is the information the library wants to show.
   String get displayName {
     final match = RegExp(r'^\d{13}_').firstMatch(name);
     return match == null ? name : name.substring(match.end);
@@ -844,6 +845,9 @@ final class DownloadManager extends ChangeNotifier {
     _notify(force: true);
   }
 
+  /// The remote name is the local one, timestamp prefix and all, so a file on
+  /// the NAS says when it was captured. Only the old unreadable 13-digit epoch
+  /// gets dropped, and only for records taken before names carried a date.
   String _remoteNameFor(DownloadItem item, File file) {
     final segments = file.uri.pathSegments;
     final raw = segments.isEmpty ? item.fileName : segments.last;
@@ -965,9 +969,7 @@ final class DownloadManager extends ChangeNotifier {
     await dir.create(recursive: true);
 
     final name = _fileNameFor(item, contentType);
-    final file = File(
-      '${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name',
-    );
+    final file = File('${dir.path}/${_stampPrefix()}_$name');
     item
       ..path = file.path
       ..total = total
@@ -1090,9 +1092,7 @@ final class DownloadManager extends ChangeNotifier {
       await dir.create(recursive: true);
 
       final name = _fileNameFor(item, contentType);
-      final file = File(
-        '${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name',
-      );
+      final file = File('${dir.path}/${_stampPrefix()}_$name');
       item.path = file.path;
       sink = file.openWrite();
 
@@ -1260,7 +1260,7 @@ final class DownloadManager extends ChangeNotifier {
 
     final fmp4 = playlist.isFragmentedMp4;
     final base = _hlsBaseName(item);
-    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final stamp = _stampPrefix();
     final temp = File(
       '${dir.path}/.${stamp}_$base.${fmp4 ? 'mp4' : 'ts'}',
     );
@@ -1350,8 +1350,14 @@ final class DownloadManager extends ChangeNotifier {
       throw const _DownloadCancelled();
     }
 
-    if (fmp4) {
-      // init + fragments already form a complete MP4; only the name is rough.
+    // What is on disk decides, not what the playlist claimed: several CDNs
+    // serve fMP4 behind `.ts` names, and AVFoundation will not open a
+    // "transport stream" whose first box is `ftyp`. Sniffing the bytes also
+    // turns a blind remux failure into a line that says what was downloaded.
+    final probe = await _sniffContainer(temp);
+    if (probe.isMp4 || fmp4) {
+      // init section + fragments already form a complete fragmented MP4; only
+      // the name is rough.
       final out = File('${dir.path}/${stamp}_$base.mp4');
       await temp.rename(out.path);
       item.path = out.path;
@@ -1362,30 +1368,37 @@ final class DownloadManager extends ChangeNotifier {
     item.status = DownloadStatus.saving;
     _notify(force: true);
     String? note;
-    try {
-      final status = await _media.invokeMethod<String>(
-        'remuxToMp4',
-        <String, Object?>{
-          'source': temp.path,
-          'destination': out.path,
-        },
-      );
-      if (status == 'ok' && await out.exists() && await out.length() > 1024) {
-        try {
-          await temp.delete();
-        } on Object {
-          // The MP4 is what matters; the TS copy can be cleaned later.
+    if (probe.isText) {
+      // A login wall or a hotlink guard that answers 200 with a page.
+      note = '分片内容不是视频，开头是「${probe.textPreview}」';
+    } else {
+      try {
+        final status = await _media.invokeMethod<String>(
+          'remuxToMp4',
+          <String, Object?>{
+            'source': temp.path,
+            'destination': out.path,
+          },
+        );
+        if (status == 'ok' &&
+            await out.exists() &&
+            await out.length() > 1024) {
+          try {
+            await temp.delete();
+          } on Object {
+            // The MP4 is what matters; the TS copy can be cleaned later.
+          }
+          item.path = out.path;
+          return _MediaFile(out, saveable: true);
         }
-        item.path = out.path;
-        return _MediaFile(out, saveable: true);
+        note = '${status ?? '转封装失败'}（${probe.diagnosis}）';
+      } on MissingPluginException {
+        note = '当前构建不支持视频转封装';
+      } on PlatformException catch (error) {
+        note = '${error.message ?? '转封装失败'}（${probe.diagnosis}）';
+      } on Object catch (error) {
+        note = '$error';
       }
-      note = status ?? '转封装失败';
-    } on MissingPluginException {
-      note = '当前构建不支持视频转封装';
-    } on PlatformException catch (error) {
-      note = error.message ?? '转封装失败';
-    } on Object catch (error) {
-      note = '$error';
     }
 
     // Keep the TS, but drop the leading dot so the offline library lists it.
@@ -1402,7 +1415,7 @@ final class DownloadManager extends ChangeNotifier {
     return _MediaFile(
       fallback,
       saveable: false,
-      note: '已保留 TS 文件，转 MP4 失败：$message',
+      note: '已保留原始分片文件，转 MP4 失败：$message',
     );
   }
 
@@ -1667,6 +1680,138 @@ final class DownloadManager extends ChangeNotifier {
     }
     super.dispose();
   }
+}
+
+/// The moment a file was captured, in its name: `20261023-213456_片段.mp4`.
+///
+/// CDN names repeat (`1.mp4`, `video.ts`) and a millisecond epoch is unreadable,
+/// so the offline library and the WebDAV target both carry the local time
+/// instead. Nothing parses this prefix back, which is why the same string can
+/// be uploaded to the server untouched.
+String _stampPrefix([DateTime? at]) {
+  final time = at ?? DateTime.now();
+  String two(int value) => value.toString().padLeft(2, '0');
+  return '${time.year}${two(time.month)}${two(time.day)}'
+      '-${two(time.hour)}${two(time.minute)}${two(time.second)}';
+}
+
+/// What the concatenated segment file really holds, read off its first bytes.
+///
+/// The playlist only *claims* a container: `.ts` names hide fMP4/CMAF streams
+/// often enough that trusting it turned every such download into an
+/// "unreadable video track" from AVFoundation.
+final class _ContainerProbe {
+  const _ContainerProbe({
+    required this.isMp4,
+    required this.isTs,
+    required this.isText,
+    required this.size,
+    required this.byteHint,
+    required this.textPreview,
+    required this.stride,
+  });
+
+  final bool isMp4;
+  final bool isTs;
+  final bool isText;
+  final int size;
+
+  /// First bytes as hex, for the case where none of the three flags fits.
+  final String byteHint;
+  final String textPreview;
+
+  /// Packet length the transport-stream sync bytes repeat at (usually 188).
+  final int stride;
+
+  bool get aligned => stride == 0 || size % stride == 0;
+
+  String get summary {
+    if (isMp4) return 'MP4';
+    if (isTs) return aligned ? 'MPEG-TS' : 'MPEG-TS 长度不对齐';
+    if (isText) return '文本';
+    return '未知容器';
+  }
+
+  /// One line that survives a screenshot: what was on disk when the remuxer
+  /// gave up, so the failure can be told apart from a broken CDN answer.
+  String get diagnosis => <String>[
+    summary,
+    formatBytes(size),
+    byteHint.isEmpty ? '空文件' : byteHint,
+    if (isTs && !aligned) '不是 $stride 的整数倍',
+  ].join(' · ');
+}
+
+Future<_ContainerProbe> _sniffContainer(File file) async {
+  var size = 0;
+  var head = Uint8List(0);
+  try {
+    size = await file.length();
+    if (size > 0) {
+      final raf = await file.open();
+      try {
+        head = Uint8List(math.min(size, 64 * 1024));
+        await raf.readInto(head, 0, head.length);
+      } finally {
+        await raf.close();
+      }
+    }
+  } on Object {
+    // Unreadable: the remuxer's own error still gets reported.
+  }
+
+  var isMp4 = false;
+  if (head.length > 12) {
+    isMp4 = head[4] == 0x66 &&
+        head[5] == 0x74 &&
+        head[6] == 0x79 &&
+        head[7] == 0x70; // "ftyp"
+  }
+
+  var stride = 0;
+  if (head.isNotEmpty && head[0] == 0x47) {
+    for (final candidate in const <int>[188, 192, 194, 204, 208]) {
+      if (head.length > candidate * 3 && head[candidate] == 0x47) {
+        stride = candidate;
+        break;
+      }
+    }
+  }
+  final isTs = stride > 0;
+
+  var isText = false;
+  var textPreview = '';
+  if (!isMp4 && !isTs && head.isNotEmpty) {
+    final first = Uint8List.sublistView(head, 0, math.min(head.length, 64));
+    isText = first.every(
+      (byte) => byte == 0x09 ||
+          byte == 0x0a ||
+          byte == 0x0d ||
+          (byte >= 0x20 && byte < 0x7f),
+    );
+    if (isText) {
+      textPreview = String.fromCharCodes(first)
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      if (textPreview.length > 40) {
+        textPreview = '${textPreview.substring(0, 40)}…';
+      }
+    }
+  }
+
+  final hex = head
+      .sublist(0, math.min(head.length, 8))
+      .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+      .join(' ');
+  return _ContainerProbe(
+    isMp4: isMp4,
+    isTs: isTs,
+    isText: isText,
+    size: size,
+    byteHint: hex,
+    textPreview: textPreview,
+    stride: stride,
+  );
 }
 
 final class _MediaFile {
