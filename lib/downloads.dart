@@ -1405,7 +1405,7 @@ final class DownloadManager extends ChangeNotifier {
       sink = temp.openWrite();
       final init = playlist.init;
       if (init != null) {
-        var bytes = await _fetchBytes(
+        var bytes = await _fetchBytesRetry(
           init.uri,
           headers,
           token,
@@ -1430,6 +1430,7 @@ final class DownloadManager extends ChangeNotifier {
       // than a bigger buffer; the sink still writes them in playlist order.
       const window = 6;
       final badPieces = <int>[];
+      final cutPieces = <int>[];
       for (var start = 0; start < playlist.segments.length; start += window) {
         if (token.isCancelled) throw const _DownloadCancelled();
         final end = (start + window) < playlist.segments.length
@@ -1455,6 +1456,25 @@ final class DownloadManager extends ChangeNotifier {
               bytes = Uint8List(0);
             }
           }
+          // A truncated last packet is invisible to everything until the file
+          // is opened again: the 120 stray bytes shift every packet after them,
+          // and a player that loses the grid loses the rest of the film. Ask for
+          // the piece once more, and if the server is still short-handed, cut
+          // the part past the last whole packet. Losing one packet beats losing
+          // the last ten minutes.
+          if (!fmp4 && bytes.isNotEmpty) {
+            final stride = _packetStride(bytes);
+            if (stride > 0 && bytes.length % stride != 0) {
+              final again = await _fetchSegment(batch[i], headers, token, keys);
+              final back = _packetStride(again);
+              if (back == stride && again.length > bytes.length) bytes = again;
+              final stray = bytes.length % stride;
+              if (stray != 0) {
+                bytes = Uint8List.sublistView(bytes, 0, bytes.length - stray);
+                cutPieces.add(start + i + 1);
+              }
+            }
+          }
           if (bytes.isNotEmpty) {
             sink.add(bytes);
             item.received += bytes.length;
@@ -1469,10 +1489,15 @@ final class DownloadManager extends ChangeNotifier {
           '服务器拒掉了 ${badPieces.length} 个分片，多半是防盗链或登录过期',
         );
       }
-      skipNote = badPieces.isEmpty
-          ? null
-          : '已跳过 ${badPieces.length} 个异常分片'
-                '${badPieces.length <= 6 ? '（第 ${badPieces.join('、')} 段）' : ''}';
+      final notes = <String>[
+        if (badPieces.isNotEmpty)
+          '已跳过 ${badPieces.length} 个异常分片'
+              '${badPieces.length <= 6 ? '（第 ${badPieces.join('、')} 段）' : ''}',
+        if (cutPieces.isNotEmpty)
+          '已裁掉 ${cutPieces.length} 个分片的残缺尾包'
+              '${cutPieces.length <= 6 ? '（第 ${cutPieces.join('、')} 段）' : ''}',
+      ];
+      skipNote = notes.isEmpty ? null : notes.join('，');
       await sink.flush();
       await sink.close();
       sink = null;
@@ -1618,6 +1643,28 @@ final class DownloadManager extends ChangeNotifier {
     return false;
   }
 
+  /// The size the server said the body would be, or 0 when it did not say.
+  static int _announcedLength(TransportStream response) {
+    final raw = response.header('content-length');
+    if (raw == null) return 0;
+    return int.tryParse(raw.split(';').first.trim()) ?? 0;
+  }
+
+  /// The packet size a TS piece is made of, or 0 when it is too short or too
+  /// mangled to tell. A piece whose length is not a whole number of packets
+  /// puts every packet after it off the grid.
+  static int _packetStride(Uint8List bytes) {
+    if (bytes.length < 4 * 194 || bytes[0] != 0x47) return 0;
+    for (final stride in const <int>[188, 192, 204, 208, 194]) {
+      if (bytes[stride] == 0x47 &&
+          bytes[stride * 2] == 0x47 &&
+          bytes[stride * 3] == 0x47) {
+        return stride;
+      }
+    }
+    return 0;
+  }
+
   Future<Uint8List> _fetchSegment(
     HlsSegment segment,
     List<OrderedHeader> headers,
@@ -1629,6 +1676,7 @@ final class DownloadManager extends ChangeNotifier {
       headers,
       token,
       range: segment.range,
+      tolerateShort: true,
     );
     final key = segment.key;
     if (key.method == HlsEncryption.unsupported) {
@@ -1691,12 +1739,25 @@ final class DownloadManager extends ChangeNotifier {
     List<OrderedHeader> headers,
     CancelToken token, {
     HlsByteRange? range,
+    bool tolerateShort = false,
   }) async {
+    Uint8List? shortBytes;
     for (var attempt = 0; ; attempt++) {
       try {
         return await _fetchBytes(uri, headers, token, range: range);
       } on FormatException {
         rethrow;
+      } on _ShortBody catch (error) {
+        // A body that stops early is usually one flaky hop, so ask again. If the
+        // server keeps cutting it off, hand back the longest answer that came:
+        // the caller can trim the broken tail, and a video that is one packet
+        // short beats a download that never finishes.
+        if (!tolerateShort || token.isCancelled) rethrow;
+        if (shortBytes == null || error.bytes.length > shortBytes.length) {
+          shortBytes = error.bytes;
+        }
+        if (attempt >= 2) return shortBytes;
+        await Future<void>.delayed(const Duration(milliseconds: 450));
       } on Object {
         if (token.isCancelled || attempt >= 2) rethrow;
         await Future<void>.delayed(const Duration(milliseconds: 450));
@@ -1732,6 +1793,19 @@ final class DownloadManager extends ChangeNotifier {
       builder.add(chunk);
     }
     var bytes = builder.takeBytes();
+    final announced = _announcedLength(response);
+    // A Range the server answered with the whole file says nothing about this
+    // body's length, so only a plain 200 or a matching 206 can be complete.
+    if (announced > 0 &&
+        bytes.length < announced &&
+        (range == null || response.statusCode == 206)) {
+      // The engine answers 200 and then the connection stops: the body is short
+      // by however many packets the CDN never sent. Handing that back as a
+      // finished segment is how a 120-byte hole ends up in the middle of a file
+      // and costs the last ten minutes of the video, so it is a failure and the
+      // caller retries it.
+      throw _ShortBody(bytes, announced);
+    }
     if (range != null) {
       if (response.statusCode == 200) {
         // The server ignored Range; slice the full body ourselves.
@@ -2116,4 +2190,17 @@ final class _FileProbe {
 
 final class _DownloadCancelled implements Exception {
   const _DownloadCancelled();
+}
+
+/// The body stopped short of the length the server announced, with the part
+/// that did arrive attached: a segment is worth keeping even when the CDN cut
+/// it off, as long as the caller can be told it came up short.
+final class _ShortBody implements Exception {
+  const _ShortBody(this.bytes, this.announced);
+
+  final Uint8List bytes;
+  final int announced;
+
+  @override
+  String toString() => '服务器只回了 ${bytes.length} 字节，应有 $announced 字节';
 }
