@@ -116,6 +116,9 @@ final class BrowserController extends ChangeNotifier {
       });
       if (!_pageNetwork) await webView.setPageNetworkEnabled(false);
       if (_contentBlocking) await webView.setContentBlockingEnabled(true);
+      // Whatever the host decided before this WebView existed applies to it from
+      // its first navigation, not from the next policy call.
+      await _applyNavigationPolicy();
       if (initialUri != null) await webView.navigate(initialUri);
       await refresh();
     } on Object catch (error) {
@@ -394,16 +397,52 @@ final class BrowserController extends ChangeNotifier {
     await webView.setDebugDisplaySize(displaySize);
   }
 
-  /// Turns the "never leave the app" navigation rules on or off.
+  /// The "never leave the app" rules this window lives under. Kept on the
+  /// controller because the WebView may not exist yet when they are set — the
+  /// first one created has to come up with them already applied.
+  bool _blockExternalNavigation = true;
+  bool _reissueTaps = true;
+  bool _askExternal = false;
+  List<String> _allowSchemes = const <String>[];
+  List<String> _denySchemes = const <String>[];
+
+  /// Turns the "never leave the app" navigation rules on or off, and says what
+  /// to do with a jump that would leave it: [askExternal] reports it for the
+  /// host's dialog, [allowSchemes] and [denySchemes] decide without asking.
   Future<void> setNavigationPolicy({
     bool blockExternal = true,
     bool reissueTaps = true,
+    bool askExternal = false,
+    List<String> allowSchemes = const <String>[],
+    List<String> denySchemes = const <String>[],
   }) async {
+    _blockExternalNavigation = blockExternal;
+    _reissueTaps = reissueTaps;
+    _askExternal = askExternal;
+    _allowSchemes = List<String>.unmodifiable(allowSchemes);
+    _denySchemes = List<String>.unmodifiable(denySchemes);
     await start();
-    await _webView?.setNavigationPolicy(
-      blockExternal: blockExternal,
-      reissueTaps: reissueTaps,
+    await _applyNavigationPolicy();
+  }
+
+  Future<void> _applyNavigationPolicy() async {
+    final webView = _webView;
+    if (webView == null) return;
+    await webView.setNavigationPolicy(
+      blockExternal: _blockExternalNavigation,
+      reissueTaps: _reissueTaps,
+      askExternal: _askExternal,
+      allowSchemes: _allowSchemes,
+      denySchemes: _denySchemes,
     );
+  }
+
+  /// Gives the URL to the system. This is the only path on which the app lets a
+  /// page take the user somewhere else, and only after the user agreed.
+  Future<void> openExternal(Uri uri) async {
+    final webView = _webView;
+    if (webView == null) return;
+    await webView.openExternal(uri);
   }
 
   @override

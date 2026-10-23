@@ -1,5 +1,6 @@
 import Foundation
 import Flutter
+import UIKit
 import WebKit
 
 /// Bridges `WebViewPort` to real WKWebView instances.
@@ -126,6 +127,29 @@ final class WebViewBridge {
                 ?? holder.blockExternalNavigations
             holder.reissueUserTaps = args["reissueTaps"] as? Bool
                 ?? holder.reissueUserTaps
+            holder.asksAboutExternalJumps = args["askExternal"] as? Bool
+                ?? holder.asksAboutExternalJumps
+            if let allowed = args["allowSchemes"] as? [String] {
+                holder.allowedExternalSchemes = Set(allowed.map { $0.lowercased() })
+            }
+            if let denied = args["denySchemes"] as? [String] {
+                holder.deniedExternalSchemes = Set(denied.map { $0.lowercased() })
+            }
+            result(nil)
+
+        case "openExternal":
+            guard let holder = session(args, result) else { return }
+            guard let raw = args["url"] as? String, let target = URL(string: raw),
+                  let scheme = target.scheme, !scheme.isEmpty else {
+                result(FlutterError(code: "webview.openExternal",
+                                    message: "bad arguments", details: nil))
+                return
+            }
+            // The user said yes to this one. Opening it from code, rather than
+            // letting the cancelled navigation resume, is what keeps the answer
+            // from becoming a no-op.
+            holder.openExternal(target, scheme: scheme.lowercased(), method: "GET",
+                                mainFrame: true, type: "host")
             result(nil)
 
         case "setDebugOverlay":
@@ -436,6 +460,20 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// URL registered as a Universal Link. Re-issuing the identical request
     /// from code keeps the page inside this browser.
     var reissueUserTaps = true
+
+    /// Protocols the user chose to allow ("总是允许 bilibili") — they may leave
+    /// the app without being asked again.
+    var allowedExternalSchemes: Set<String> = []
+
+    /// Protocols the user banned for good ("不允许" in the jump dialog). Kept
+    /// apart from `allowedExternalSchemes` because a refusal must outlive the
+    /// page that asked, while the global switch is still a switch.
+    var deniedExternalSchemes: Set<String> = []
+
+    /// When true, an unranked protocol is reported to the host for its decision
+    /// instead of being cancelled in silence. Off keeps the old behaviour for a
+    /// host that has no dialog to show.
+    var asksAboutExternalJumps = false
 
     /// Requests this holder re-issued itself; their policy call must be allowed
     /// untouched or the re-issue would cancel itself forever.
@@ -834,26 +872,68 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         source + "\n;0;"
     }
 
-    /// Baidu's "open in app" gateway is a plain https page whose query carries
-    /// the real custom scheme. Treat any such wrapper as an exit.
-    private static func isAppLaunchGateway(_ url: URL) -> Bool {
-        guard let raw = url.query?.removingPercentEncoding?.lowercased(),
-              raw.contains("://") else { return false }
-        // The direct form is the one Baidu uses; the key scan covers siblings
-        // such as `?url=weixin%3A%2F%2F…` or `?redirect=itms-apps://…`.
-        if raw.contains("baiduboxapp://") { return true }
-        for pair in raw.split(separator: "&") {
-            guard let eq = pair.firstIndex(of: "=") else { continue }
-            let key = String(pair[..<eq])
-            guard ["scheme", "url", "target", "redirect", "redirecturl"].contains(key) else {
-                continue
-            }
-            let value = pair[pair.index(after: eq)...]
-            guard let sep = value.range(of: "://") else { continue }
-            let proto = value[..<sep.lowerBound]
-            if proto != "http" && proto != "https" { return true }
+    /// One `proto://value` pair inside a query string. Protocol characters only,
+    /// so a plain `key=value` never matches.
+    private static let appLaunchPattern =
+        "([A-Za-z][A-Za-z0-9+.\\-]{1,31})://([^&\\s\"'<>]{1,2048})"
+
+    /// The app URL an "open in app" wrapper page is holding. Baidu keeps it in
+    /// `boxer.baidu.com/scheme?scheme=baiduboxapp%3A%2F%2F…`; the short-video and
+    /// shopping apps use their own keys (`redirect_url`, `targetUrl`, `d`, …), so
+    /// the key name is not what identifies one — any non-web `proto://` inside the
+    /// decoded query is an exit candidate.
+    private static func appLaunchTarget(_ url: URL) -> URL? {
+        guard let raw = url.query?.removingPercentEncoding,
+              raw.contains("://") else { return nil }
+        guard let regex = try? NSRegularExpression(pattern: appLaunchPattern) else {
+            return nil
         }
-        return false
+        let search = NSRange(raw.startIndex..., in: raw)
+        for match in regex.matches(in: raw, range: search) {
+            guard let protoRange = Range(match.range(at: 1), in: raw),
+                  let valueRange = Range(match.range(at: 2), in: raw) else { continue }
+            let proto = String(raw[protoRange]).lowercased()
+            // A page also passes its own endpoints through the query
+            // (`?ws=wss://api.example.com`); those are not another app.
+            if ["http", "https", "ws", "wss"].contains(proto) { continue }
+            if let target = URL(string: "\(proto)://\(String(raw[valueRange]))") {
+                return target
+            }
+        }
+        return nil
+    }
+
+    /// The exit a navigation would perform, if any: a custom scheme straight away
+    /// (`bilibili://video/BV…`), or the protocol carried by an https wrapper page.
+    /// `nil` means this URL stays inside the browser.
+    private static func externalJump(for url: URL) -> (target: URL, scheme: String)? {
+        let scheme = (url.scheme ?? "").lowercased()
+        if !scheme.isEmpty && !Self.inAppSchemes.contains(scheme) {
+            return (url, scheme)
+        }
+        guard let target = Self.appLaunchTarget(url) else { return nil }
+        return (target, (target.scheme ?? "").lowercased())
+    }
+
+    /// Whether a subframe request aims at another site than the page holding it.
+    private static func isCrossOrigin(_ url: URL, against current: URL?) -> Bool {
+        guard let host = current?.host?.lowercased(), !host.isEmpty else { return true }
+        return url.host?.lowercased() != host
+    }
+
+    /// Hands a URL to the system. Only ever reached for a protocol the user has
+    /// said yes to: WebKit's own `.allow` would have been the same hand-over, but
+    /// it happens before the question is answered.
+    func openExternal(_ target: URL, scheme: String, method: String,
+                              mainFrame: Bool, type: String) {
+        UIApplication.shared.open(target, options: [:]) { [weak self] opened in
+            guard let self else { return }
+            self.reportNavigation(
+                kind: opened ? "external-open" : "blocked",
+                url: target, method: method, mainFrame: mainFrame, type: type,
+                message: opened ? "已交给 \(scheme) 应用"
+                                : "本机没有应用处理 \(scheme)://")
+        }
     }
 
     /// Bumped whenever the native debug pipeline changes. Appended to every
@@ -1063,24 +1143,34 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             return
         }
 
-        // baidu://, weixin://, itms-apps://, tel:, … would leave the app.
-        if blockExternalNavigations, !Self.inAppSchemes.contains(scheme) {
+        // baidu://, bilibili://, weixin://, itms-apps://, tel: … and the https
+        // pages whose query carries one. The navigation is always cancelled: WebKit
+        // performing it *is* the hand-over, so it cannot be left in flight while a
+        // dialog waits for an answer. What happens next is the host's call — a
+        // protocol the user banned stays shut, one they allowed is opened from code,
+        // and anything else is reported for its dialog.
+        if blockExternalNavigations, let jump = Self.externalJump(for: url) {
             decisionHandler(.cancel)
+            if deniedExternalSchemes.contains(jump.scheme) {
+                reportNavigation(kind: "blocked", url: url, method: method,
+                                 mainFrame: targetsMainFrame, type: type,
+                                 message: "external app jump banned (\(jump.scheme)://)")
+                return
+            }
+            if allowedExternalSchemes.contains(jump.scheme) {
+                openExternal(jump.target, scheme: jump.scheme, method: method,
+                             mainFrame: targetsMainFrame, type: type)
+                return
+            }
+            if asksAboutExternalJumps {
+                reportNavigation(kind: "ask", url: jump.target, method: method,
+                                 mainFrame: targetsMainFrame, type: type,
+                                 message: "external app jump")
+                return
+            }
             reportNavigation(kind: "blocked", url: url, method: method,
                              mainFrame: targetsMainFrame, type: type,
                              message: "external app jump blocked")
-            return
-        }
-
-        // Baidu wraps its app jump in an https gateway
-        // (`boxer.baidu.com/scheme?scheme=baiduboxapp%3A%2F%2F…`). That page is
-        // itself a Universal Link, so iOS can leave the app before the final
-        // custom-scheme hop is ever seen. Drop it here, whatever triggered it.
-        if blockExternalNavigations, Self.isAppLaunchGateway(url) {
-            decisionHandler(.cancel)
-            reportNavigation(kind: "blocked", url: url, method: method,
-                             mainFrame: targetsMainFrame, type: type,
-                             message: "app-launch gateway blocked")
             return
         }
 
@@ -1106,10 +1196,24 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         let isScriptJump = trigger == .other
         let isWebURL = scheme == "http" || scheme == "https"
         let opensFromScript = isScriptJump && opensWindow
+        // A click handler that sets `location.href` reaches WebKit as `.other`,
+        // but iOS still holds that tap's gesture token, so it is exactly as able to
+        // hand a Universal Link to another app as a plain link tap. It is re-issued
+        // only once its document is on screen: re-issued *during* a load it doubles
+        // the request and leaves the wrapper entry that made the first swipe back
+        // show a blank screen.
+        let settledScriptJump = isScriptJump && targetsMainFrame && !webView.isLoading
+        // An app's "打开 App" button also lives inside a third-party iframe, and a
+        // subframe navigation does not satisfy the main-frame clause above. A tap
+        // aimed at another site belongs in this browser's main frame; same-origin
+        // frame browsing is left alone, or every paginated iframe would hijack the
+        // page it is embedded in.
+        let crossOriginFrameTap = isGesture && !targetsMainFrame && !opensWindow
+            && Self.isCrossOrigin(url, against: webView.url)
         if blockExternalNavigations, reissueUserTaps, isWebURL,
            method == "GET",
-           isGesture || opensFromScript,
-           targetsMainFrame || opensWindow,
+           isGesture || opensFromScript || settledScriptJump || crossOriginFrameTap,
+           targetsMainFrame || opensWindow || crossOriginFrameTap,
            navigationAction.request.httpBody == nil {
             // The identical request is already in flight (a page that fires both
             // a tap and a `window.open`, or a double tap). Cancel it: allowing
@@ -1167,20 +1271,31 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // A new window must also stay in-app; a custom scheme is simply
-        // dropped instead of being handed to `webView.load` or the system.
+        // A new window must also stay in-app. `decidePolicyFor` has usually
+        // already cancelled the request before WebKit gets here, so this is the
+        // second gate, not the first, and it decides the same way.
         if navigationAction.targetFrame == nil,
            let url = navigationAction.request.url,
            !programmaticURLs.contains(url.absoluteString) {
-            let scheme = (url.scheme ?? "").lowercased()
-            if blockExternalNavigations,
-               !Self.inAppSchemes.contains(scheme) || Self.isAppLaunchGateway(url) {
-                reportNavigation(
-                    kind: "blocked", url: url,
-                    method: (navigationAction.request.httpMethod ?? "GET").uppercased(),
-                    mainFrame: true,
-                    type: Self.navigationTypeName(navigationAction.navigationType),
-                    message: "external app jump blocked (new window)")
+            let method = (navigationAction.request.httpMethod ?? "GET").uppercased()
+            let type = Self.navigationTypeName(navigationAction.navigationType)
+            if blockExternalNavigations, let jump = Self.externalJump(for: url) {
+                if deniedExternalSchemes.contains(jump.scheme) {
+                    reportNavigation(kind: "blocked", url: url, method: method,
+                                     mainFrame: true, type: type,
+                                     message: "external app jump banned (new window)")
+                } else if allowedExternalSchemes.contains(jump.scheme) {
+                    openExternal(jump.target, scheme: jump.scheme, method: method,
+                                 mainFrame: true, type: type)
+                } else if asksAboutExternalJumps {
+                    reportNavigation(kind: "ask", url: jump.target, method: method,
+                                     mainFrame: true, type: type,
+                                     message: "external app jump")
+                } else {
+                    reportNavigation(kind: "blocked", url: url, method: method,
+                                     mainFrame: true, type: type,
+                                     message: "external app jump blocked (new window)")
+                }
             } else if !wasReissuedRecently(url) {
                 loadInApp(navigationAction.request)
             }

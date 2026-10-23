@@ -63,6 +63,15 @@ final class WebViewNavigationEvent {
   bool get isCommitted => kind == 'committed';
   bool get isState => kind == 'state';
 
+  /// A jump that would leave the app, cancelled on the way and waiting for the
+  /// host's answer. [url] is the app URL (`bilibili://video/…`), not the wrapper
+  /// page that carried it, so a dialog can name the app it is asking about.
+  bool get isExternalAsk => kind == 'ask';
+
+  /// A jump the host's rules already settled: handed to the system without a
+  /// dialog. The message says whether an app was there to receive it.
+  bool get isExternalOpen => kind == 'external-open';
+
   factory WebViewNavigationEvent.fromJson(Map<String, Object?> json) {
     return WebViewNavigationEvent(
       sessionId: json['sessionId'] as String? ?? '',

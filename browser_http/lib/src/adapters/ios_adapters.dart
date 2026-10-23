@@ -663,11 +663,24 @@ final class _ChannelWebViewSession implements WebViewSession {
   Future<void> setNavigationPolicy({
     bool blockExternal = true,
     bool reissueTaps = true,
+    bool askExternal = false,
+    List<String> allowSchemes = const <String>[],
+    List<String> denySchemes = const <String>[],
   }) => _channel.invokeMethod<void>('setNavigationPolicy', <String, Object?>{
     'id': _id,
     'blockExternal': blockExternal,
     'reissueTaps': reissueTaps,
+    'askExternal': askExternal,
+    'allowSchemes': allowSchemes,
+    'denySchemes': denySchemes,
   });
+
+  @override
+  Future<void> openExternal(Uri uri) =>
+      _channel.invokeMethod<void>('openExternal', <String, Object?>{
+        'id': _id,
+        'url': uri.toString(),
+      });
 
   @override
   Future<void> dispose() =>

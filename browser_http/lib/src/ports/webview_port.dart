@@ -188,10 +188,23 @@ abstract interface class WebViewSession {
 
   /// Whether non-http(s) navigations are cancelled instead of opening another
   /// app, and whether Universal-Link taps are re-issued in-app.
+  ///
+  /// The three protocol lists decide what happens to a jump that would leave the
+  /// app. [deniedSchemes] is closed in silence; [allowedSchemes] is handed to the
+  /// system without asking; anything else is either cancelled quietly or reported
+  /// as a `kind: 'ask'` navigation event for the host to put in a dialog,
+  /// depending on [askExternal].
   Future<void> setNavigationPolicy({
     bool blockExternal = true,
     bool reissueTaps = true,
+    bool askExternal = false,
+    List<String> allowSchemes = const <String>[],
+    List<String> denySchemes = const <String>[],
   });
+
+  /// Hands [uri] to the system — the one way a jump may leave the app on
+  /// purpose, after the user said yes.
+  Future<void> openExternal(Uri uri);
 
   Future<void> dispose();
 }
