@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import '../domain/models/browser_cookie.dart';
 import '../domain/models/page_network_event.dart';
+import '../domain/models/webview_link_press.dart';
 import '../domain/models/webview_navigation_event.dart';
 
 /// One entry from the page's `PerformanceResourceTiming` list.
@@ -135,6 +137,21 @@ abstract interface class WebViewSession {
   /// Includes the jumps the native side cancelled because they would have left
   /// the app for another application.
   Stream<WebViewNavigationEvent> get navigationEvents;
+
+  /// Links the user pressed and held in this WebView.
+  ///
+  /// A host that supports more than one browsing window needs the held anchor
+  /// itself: WebKit's long-press menu cannot offer a command it does not know
+  /// about, and the page script is the only place that sees the hold.
+  Stream<WebViewLinkPress> get linkPresses;
+
+  /// PNG of what the WebView is showing, scaled down to at most [maxWidth]
+  /// pixels wide, or `null` when there is nothing to render.
+  ///
+  /// Ask a window that is still on screen: WebKit composites what it displays,
+  /// so a host takes the picture of a window at the moment it leaves it and
+  /// keeps the card for as long as that window is away.
+  Future<Uint8List?> snapshot({int maxWidth = 360});
 
   /// Installs the persistent debug console (eruda) for every later document.
   ///

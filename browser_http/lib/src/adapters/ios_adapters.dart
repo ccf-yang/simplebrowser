@@ -12,6 +12,7 @@ import '../domain/models/browser_cookie.dart';
 import '../domain/models/page_network_event.dart';
 import '../domain/models/session_snapshot.dart';
 import '../domain/models/transport.dart';
+import '../domain/models/webview_link_press.dart';
 import '../domain/models/webview_navigation_event.dart';
 import '../ffi/api/profile.dart' as ffi_profile;
 import '../ffi/api/transport.dart' as ffi_transport;
@@ -346,6 +347,8 @@ final class _ChannelWebViewAdapter implements WebViewPort {
       StreamController<PageNetworkEvent>.broadcast();
   final StreamController<WebViewNavigationEvent> _navigationEvents =
       StreamController<WebViewNavigationEvent>.broadcast();
+  final StreamController<WebViewLinkPress> _linkPressEvents =
+      StreamController<WebViewLinkPress>.broadcast();
 
   Future<void> _handleNativeCall(MethodCall call) async {
     final raw = call.arguments;
@@ -358,6 +361,10 @@ final class _ChannelWebViewAdapter implements WebViewPort {
       case 'navigationEvent':
         _navigationEvents.add(
           WebViewNavigationEvent.fromJson(raw.cast<String, Object?>()),
+        );
+      case 'linkPress':
+        _linkPressEvents.add(
+          WebViewLinkPress.fromJson(raw.cast<String, Object?>()),
         );
       default:
         break;
@@ -384,6 +391,7 @@ final class _ChannelWebViewAdapter implements WebViewPort {
       id,
       _networkEvents.stream,
       _navigationEvents.stream,
+      _linkPressEvents.stream,
     );
   }
 
@@ -397,12 +405,14 @@ final class _ChannelWebViewSession implements WebViewSession {
     this._id,
     this._allNetworkEvents,
     this._allNavigationEvents,
+    this._allLinkPresses,
   );
 
   final MethodChannel _channel;
   final String _id;
   final Stream<PageNetworkEvent> _allNetworkEvents;
   final Stream<WebViewNavigationEvent> _allNavigationEvents;
+  final Stream<WebViewLinkPress> _allLinkPresses;
 
   @override
   String get id => _id;
@@ -414,6 +424,24 @@ final class _ChannelWebViewSession implements WebViewSession {
   @override
   Stream<WebViewNavigationEvent> get navigationEvents =>
       _allNavigationEvents.where((event) => event.sessionId == _id);
+
+  @override
+  Stream<WebViewLinkPress> get linkPresses =>
+      _allLinkPresses.where((press) => press.sessionId == _id);
+
+  @override
+  Future<Uint8List?> snapshot({int maxWidth = 360}) async {
+    try {
+      return await _channel.invokeMethod<Uint8List>(
+        'snapshot',
+        <String, Object?>{'id': _id, 'maxWidth': maxWidth},
+      );
+    } on PlatformException {
+      // No page to render, or the view is between documents. A missing
+      // thumbnail is not an error the host can act on.
+      return null;
+    }
+  }
 
   @override
   Future<WebViewLoadResult> load(

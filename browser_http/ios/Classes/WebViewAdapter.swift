@@ -18,6 +18,11 @@ final class WebViewBridge {
     /// the Dart side; events carry the owning session id.
     var onNavigationEvent: (([String: Any]) -> Void)?
 
+    /// Forwards "the user pressed and held this link" reports. The host decides
+    /// what to offer — a second browsing window is a host concept, not a WebKit
+    /// one, and WebKit's own preview menu has no such item.
+    var onLinkPress: (([String: Any]) -> Void)?
+
     /// Looks up an existing session so `UiKitView` can host the *same*
     /// WKWebView that will later export clearance cookies.
     func webView(for id: String) -> WKWebView? {
@@ -69,6 +74,9 @@ final class WebViewBridge {
             }
             holder.onNavigationEvent = { [weak self] event in
                 self?.onNavigationEvent?(event)
+            }
+            holder.onLinkPress = { [weak self] event in
+                self?.onLinkPress?(event)
             }
             if let userAgent { holder.webView.customUserAgent = userAgent }
             sessions[id] = holder
@@ -318,6 +326,14 @@ final class WebViewBridge {
                 result(value as? String ?? "")
             }
 
+        case "snapshot":
+            guard let holder = session(args, result) else { return }
+            let requested = (args["maxWidth"] as? Int) ?? 360
+            let width = CGFloat(requested > 0 ? requested : 360)
+            holder.snapshot(maxWidth: width) { data in
+                result(data == nil ? nil : FlutterStandardTypedData(bytes: data!))
+            }
+
         case "dispose":
             if let id = args["id"] as? String {
                 sessions.removeValue(forKey: id)
@@ -402,10 +418,14 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// Page jumps reported to the host: allowed, re-issued, blocked, committed,
     /// failed.
     var onNavigationEvent: (([String: Any]) -> Void)?
+    /// A link the user pressed and held, so the host can offer its own
+    /// "open in a new window" choice for it.
+    var onLinkPress: (([String: Any]) -> Void)?
     private var loadCompletion: ((Error?) -> Void)?
     fileprivate var lastStatusCode: Int?
 
     private static let networkHandlerName = "browserHttpNet"
+    private static let tapHandlerName = "browserHttpTap"
 
     /// Cancels any navigation whose scheme is not http(s)/in-app, so a link can
     /// never hand the URL over to another app (`baidu://`, `weixin://`,
@@ -538,6 +558,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         webView.configuration.userContentController.add(
             WeakScriptMessageHandler(delegate: self),
             name: WebViewHolder.networkHandlerName)
+        webView.configuration.userContentController.add(
+            WeakScriptMessageHandler(delegate: self),
+            name: WebViewHolder.tapHandlerName)
 
         // Visible WebViews are user-driven (challenge page or browser tab);
         // swipe back/forward should behave like Safari.
@@ -552,6 +575,12 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     private func applyUserScripts() {
         let controller = webView.configuration.userContentController
         controller.removeAllUserScripts()
+        // The press-and-hold hook does not belong to the Page tab: opening a
+        // link in another window is wanted whether or not anything is collected.
+        controller.addUserScript(WKUserScript(
+            source: WebViewHolder.tapScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false))
         guard pageNetworkEnabled else { return }
         controller.addUserScript(WKUserScript(
             source: WebViewHolder.networkScript,
@@ -565,6 +594,31 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         guard pageNetworkEnabled != enabled else { return }
         pageNetworkEnabled = enabled
         applyUserScripts()
+    }
+
+    // MARK: - Thumbnail
+
+    /// Renders what the WebView is showing into PNG data no wider than
+    /// [maxWidth], for the host's task switcher.
+    ///
+    /// The host takes the picture of the window it is about to park, while that
+    /// WebView is still on screen: `takeSnapshot` on a view attached to no
+    /// window has nothing composited to read, so a card is a photograph of the
+    /// moment the user left, not a live view of the background page.
+    func snapshot(maxWidth: CGFloat, _ done: @escaping (Data?) -> Void) {
+        let configuration = WKSnapshotConfiguration()
+        if !webView.bounds.isEmpty { configuration.rect = webView.bounds }
+        webView.takeSnapshot(with: configuration) { image, _ in
+            guard let image, image.size.width > 0 else { done(nil); return }
+            let scale = min(1, maxWidth / image.size.width)
+            let size = CGSize(width: (image.size.width * scale).rounded(),
+                              height: (image.size.height * scale).rounded())
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            let small = UIGraphicsImageRenderer(size: size, format: format)
+                .image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
+            done(small.pngData())
+        }
     }
 
     // MARK: - Content blocking
@@ -1090,6 +1144,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// page -> Dart bridge. WebKit calls this on the main thread.
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
+        if message.name == WebViewHolder.tapHandlerName {
+            guard var body = message.body as? [String: Any],
+                  let url = body["url"] as? String, !url.isEmpty else { return }
+            body["sessionId"] = id
+            onLinkPress?(body)
+            return
+        }
         // The hooks stay installed in documents loaded while the Page tab was
         // open; their events are dropped as soon as it closes.
         guard message.name == WebViewHolder.networkHandlerName,
@@ -1228,6 +1289,67 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             type: lastNavigationType,
             message: error.localizedDescription)
     }
+
+    /// Reports a link the user pressed and held for half a second, then swallows
+    /// the click that would otherwise follow, so the hold is never also a visit.
+    ///
+    /// WebKit's own link preview is suppressed for anchors (`contextmenu`) —
+    /// it has no way to ask the host for a second window, and two menus over one
+    /// gesture is worse than none. Text and images keep their normal long-press
+    /// behaviour because only anchors are prevented.
+    private static let tapScript = #"""
+    (function () {
+      if (window.__browserHttpTapInstalled) { return; }
+      window.__browserHttpTapInstalled = true;
+      var HOLD = 520, SLOP = 12;
+      var timer = null, anchor = null, held = null, x0 = 0, y0 = 0;
+      function linkOf(node) {
+        while (node && node.nodeType === 1) {
+          if (node.tagName === 'A' && node.href) { return node; }
+          node = node.parentNode;
+        }
+        return null;
+      }
+      function reset() {
+        if (timer) { clearTimeout(timer); timer = null; }
+        anchor = null;
+      }
+      document.addEventListener('touchstart', function (e) {
+        if (e.touches.length !== 1) { reset(); return; }
+        var t = e.touches[0];
+        x0 = t.clientX; y0 = t.clientY;
+        var a = linkOf(t.target);
+        if (!a) { reset(); return; }
+        anchor = a;
+        if (timer) { clearTimeout(timer); }
+        timer = setTimeout(function () {
+          timer = null;
+          if (!anchor) { return; }
+          held = anchor;
+          var text = (anchor.textContent || anchor.title || '')
+            .replace(/\s+/g, ' ').trim().slice(0, 140);
+          window.webkit.messageHandlers.browserHttpTap.postMessage(
+            {url: anchor.href, text: text});
+        }, HOLD);
+      }, {passive: true});
+      document.addEventListener('touchmove', function (e) {
+        if (!anchor || e.touches.length !== 1) { return; }
+        var t = e.touches[0];
+        if (Math.abs(t.clientX - x0) > SLOP || Math.abs(t.clientY - y0) > SLOP) {
+          reset();
+        }
+      }, {passive: true});
+      document.addEventListener('touchend', function (e) {
+        if (held) { e.preventDefault(); held = null; }
+        reset();
+      }, false);
+      document.addEventListener('touchcancel', function () { reset(); },
+                                {passive: true});
+      document.addEventListener('contextmenu', function (e) {
+        if (linkOf(e.target)) { e.preventDefault(); }
+      }, false);
+    })();
+    """#
 
     /// Hooks `fetch`, `XMLHttpRequest` and `sendBeacon` and forwards method,
     /// URL, caller headers and body to the host. This is what makes POST

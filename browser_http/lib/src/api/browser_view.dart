@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../domain/models/page_network_event.dart';
+import '../domain/models/webview_link_press.dart';
 import '../domain/models/webview_navigation_event.dart';
 import '../ports/webview_port.dart';
 import 'browser_session.dart';
@@ -32,8 +33,11 @@ final class BrowserController extends ChangeNotifier {
       StreamController<PageNetworkEvent>.broadcast();
   final StreamController<WebViewNavigationEvent> _navigationEvents =
       StreamController<WebViewNavigationEvent>.broadcast();
+  final StreamController<WebViewLinkPress> _linkPresses =
+      StreamController<WebViewLinkPress>.broadcast();
   StreamSubscription<PageNetworkEvent>? _networkSubscription;
   StreamSubscription<WebViewNavigationEvent>? _navigationSubscription;
+  StreamSubscription<WebViewLinkPress>? _linkPressSubscription;
 
   String? _url;
   String? _title;
@@ -73,6 +77,12 @@ final class BrowserController extends ChangeNotifier {
   Stream<WebViewNavigationEvent> get navigationEvents =>
       _navigationEvents.stream;
 
+  /// Links the user pressed and held in this page.
+  ///
+  /// This is the host's hook for "open that somewhere else": WebKit's own
+  /// long-press menu has no idea a browser can have a second window.
+  Stream<WebViewLinkPress> get linkPresses => _linkPresses.stream;
+
   /// Creates the WKWebView and navigates to [initialUri] when given.
   ///
   /// Safe to call repeatedly; only the first call creates the native session.
@@ -101,6 +111,9 @@ final class BrowserController extends ChangeNotifier {
         if (!_networkEvents.isClosed) _networkEvents.add(event);
       });
       _navigationSubscription ??= webView.navigationEvents.listen(_onWebViewEvent);
+      _linkPressSubscription ??= webView.linkPresses.listen((press) {
+        if (!_linkPresses.isClosed) _linkPresses.add(press);
+      });
       if (!_pageNetwork) await webView.setPageNetworkEnabled(false);
       if (_contentBlocking) await webView.setContentBlockingEnabled(true);
       if (initialUri != null) await webView.navigate(initialUri);
@@ -300,9 +313,23 @@ final class BrowserController extends ChangeNotifier {
     return webView.evaluate(script);
   }
 
+  /// PNG of the page as this WebView last rendered it, scaled to at most
+  /// [maxWidth] pixels wide, or `null` when there is no WebView or nothing to
+  /// draw. A window the host is not displaying still answers, which is what a
+  /// task switcher needs to draw every window at once.
+  Future<Uint8List?> snapshot({int maxWidth = 360}) async {
+    final webView = _webView;
+    if (webView == null) return null;
+    return webView.snapshot(maxWidth: maxWidth);
+  }
+
   /// Whether the page-script hooks are installed. Off means the Page tab is
   /// closed and nothing from the page is collected.
   bool _pageNetwork = true;
+
+  /// The state a second window should be started in: a browser that collects
+  /// for one window collects for all of them.
+  bool get pageNetworkEnabled => _pageNetwork;
 
   /// Installs (or removes) the debug console for this WebView and every
   /// document it loads afterwards.
@@ -389,8 +416,11 @@ final class BrowserController extends ChangeNotifier {
     _networkSubscription = null;
     unawaited(_navigationSubscription?.cancel());
     _navigationSubscription = null;
+    unawaited(_linkPressSubscription?.cancel());
+    _linkPressSubscription = null;
     unawaited(_networkEvents.close());
     unawaited(_navigationEvents.close());
+    unawaited(_linkPresses.close());
     super.dispose();
   }
 }

@@ -32,6 +32,12 @@ public final class BrowserHttpPlugin: NSObject, FlutterPlugin {
       self?.webChannel.invokeMethod("navigationEvent", arguments: event)
     }
 
+    // A link the user held down. Only the host knows it has more than one
+    // browsing window to offer.
+    webViewBridge.onLinkPress = { [weak self] event in
+      self?.webChannel.invokeMethod("linkPress", arguments: event)
+    }
+
     let cookies = FlutterMethodChannel(
       name: "browser_http/cookies", binaryMessenger: messenger)
     cookies.setMethodCallHandler { [weak self] call, result in

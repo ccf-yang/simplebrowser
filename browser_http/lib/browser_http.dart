@@ -22,6 +22,7 @@ export 'src/domain/models/captured_exchange.dart';
 export 'src/domain/models/page_network_event.dart';
 export 'src/domain/models/session_snapshot.dart';
 export 'src/domain/models/transport.dart';
+export 'src/domain/models/webview_link_press.dart';
 export 'src/domain/models/webview_navigation_event.dart';
 export 'src/ports/cookie_port.dart';
 export 'src/ports/log_sink.dart';

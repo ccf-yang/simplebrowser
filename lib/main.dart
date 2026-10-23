@@ -19,6 +19,8 @@ import 'settings_sheet.dart';
 import 'theme.dart';
 import 'webdav.dart';
 import 'webdav_sheet.dart';
+import 'windows.dart';
+import 'windows_sheet.dart';
 
 void main() => runApp(const SimpleBrApp());
 
@@ -130,10 +132,16 @@ class _BrowserPageState extends State<BrowserPage>
       <String, PageNetworkEvent>{};
 
   late final BrowserSession _session;
-  late final BrowserController _browser;
+
+  /// Every browsing window the user has open. One of them is on screen; the
+  /// rest keep their page alive on the native side.
+  late final WindowStore _windows;
+
+  /// The window the user is looking at. Every browsing command below goes
+  /// through this, so switching windows changes nothing else.
+  BrowserController get _browser => _windows.current.controller;
+
   late final StreamSubscription<RequestLogEvent> _logSubscription;
-  late final StreamSubscription<PageNetworkEvent> _pageSubscription;
-  late final StreamSubscription<WebViewNavigationEvent> _navigationSubscription;
   late final TabController _tabs;
 
   CapturedExchange? _capture;
@@ -238,12 +246,14 @@ class _BrowserPageState extends State<BrowserPage>
   int _adBlockRuleCount = 0;
   String? _adBlockError;
 
+  /// Which compiled list the engine is holding (full or lite snapshot). A new
+  /// window attaches this one instead of recompiling anything.
+  String? _adBlockIdentifier;
+
   @override
   void initState() {
     super.initState();
     _session = BrowserHttp.session(logSink: _logSink);
-    _browser = BrowserController(session: _session)
-      ..addListener(_onBrowserChanged);
     _downloads = DownloadManager(
       session: _session,
       onFinished: _onDownloadFinished,
@@ -254,12 +264,24 @@ class _BrowserPageState extends State<BrowserPage>
       if (!mounted || !_panelVisible) return;
       setState(() => _events.insert(0, event));
     });
-    // The page hooks are installed by the native side; start in whatever state
-    // the panel is in, and let the first document load with them or without.
+    _windows = WindowStore(
+      session: _session,
+      onChanged: _onWindowChanged,
+      onNavigation: _onWindowNavigation,
+      onPageEvent: _onPageNetworkEvent,
+      onLinkPress: _onWindowLinkPress,
+      onRedraw: () {
+        if (mounted) setState(() {});
+      },
+    )..open();
+    // The first window inherits nothing, so it is put into the state the saved
+    // settings describe: no page collection while the panel is closed, and the
+    // "never leave the app" rules from the start.
     unawaited(_browser.setPageNetworkEnabled(_panelVisible));
-    _pageSubscription = _browser.networkEvents.listen(_onPageNetworkEvent);
-    _navigationSubscription =
-        _browser.navigationEvents.listen(_onNavigationEvent);
+    unawaited(_browser.setNavigationPolicy(
+      blockExternal: _blockExternal,
+      reissueTaps: _blockExternal,
+    ));
     // Resource timings come out of a JavaScript evaluation, so they are only
     // pulled while a surface that shows them is open. The page state itself is
     // pushed by the WebView and needs no timer.
@@ -407,12 +429,186 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   // ---------------------------------------------------------------------------
+  // Windows
+  // ---------------------------------------------------------------------------
+
+  /// One of the windows reported a page change.
+  ///
+  /// The current one drives the address bar. A background window only moves its
+  /// own card: a page finishing somewhere else must not rewrite what the user
+  /// is looking at.
+  void _onWindowChanged(BrowseWindow window) {
+    if (!mounted) return;
+    if (identical(window, _windows.current)) {
+      _onBrowserChanged();
+      return;
+    }
+    window.refreshLabel();
+    setState(() {});
+  }
+
+  void _onWindowNavigation(BrowseWindow window, WebViewNavigationEvent event) {
+    final active = identical(window, _windows.current);
+    _handleNavigation(event, active: active);
+    // A window the user is not looking at keeps its card picture and refreshes
+    // only its label: `takeSnapshot` needs the WebView on screen, and its
+    // title/address travel here as plain events anyway.
+    if (!active && event.isCommitted) window.refreshLabel();
+  }
+
+  /// Press-and-hold on a link: the one gesture that reaches a second window.
+  /// Everything else in this browser still moves the page it is on.
+  void _onWindowLinkPress(BrowseWindow window, WebViewLinkPress press) {
+    if (!mounted || !identical(window, _windows.current)) return;
+    final uri = press.uri;
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return;
+    unawaited(_offerLink(uri, press.text));
+  }
+
+  Future<void> _offerLink(Uri uri, String text) async {
+    final choice = await askAboutLink(context, uri: uri, text: text);
+    if (choice == null || !mounted) return;
+    switch (choice) {
+      case LinkAction.newWindow:
+        await _newWindow(uri: uri);
+        if (_consoleOpen) _pushToConsole('新窗口打开 $uri');
+      case LinkAction.currentWindow:
+        setState(() => _started = true);
+        try {
+          await _browser.load(
+            uri,
+            headers: _headersFor(uri),
+            userAgent: _effectiveUserAgent,
+          );
+        } on Object catch (error) {
+          if (mounted) _snack('打开失败：$error');
+        }
+      case LinkAction.copy:
+        await Clipboard.setData(ClipboardData(text: uri.toString()));
+        if (mounted) _snack('链接已复制');
+    }
+  }
+
+  /// Opens a window and copies the live page settings into it: the same
+  /// collection switches, the same "never leave the app" rules, the same
+  /// blocking list. A new window that blocks less than the one it came from
+  /// would be a hole, not a feature.
+  Future<BrowseWindow?> _newWindow({Uri? uri}) async {
+    // Photograph the page being pushed aside first, while its WebView is still
+    // the one on screen.
+    if (!_windows.isEmpty) await _windows.capture(_windows.current);
+    if (!mounted) return null;
+    final parent = _windows.isEmpty ? null : _windows.current.controller;
+    final window = _windows.open();
+    if (window == null) {
+      _snack('已经开了 ${WindowStore.max} 个窗口，先关一个');
+      return null;
+    }
+    final browser = window.controller;
+    await browser.setPageNetworkEnabled(
+      parent?.pageNetworkEnabled ?? (_panelVisible || _consoleOpen),
+    );
+    await browser.setNavigationPolicy(
+      blockExternal: _blockExternal,
+      reissueTaps: _blockExternal,
+    );
+    final rules = _adBlockIdentifier;
+    if (_adBlockEnabled && rules != null) {
+      // The list is compiled once and cached by WebKit, so this is a lookup,
+      // not a recompile of twenty thousand rules.
+      await browser.applyContentRuleList(identifier: rules);
+      await browser.setContentBlockingEnabled(true);
+    }
+    _rebindChrome();
+
+    if (uri != null) {
+      setState(() => _started = true);
+      try {
+        await browser.load(
+          uri,
+          headers: _headersFor(uri),
+          userAgent: _effectiveUserAgent,
+        );
+      } on Object catch (error) {
+        if (mounted) _snack('打开失败：$error');
+      }
+    }
+    return window;
+  }
+
+  Future<void> _switchWindow(BrowseWindow window) async {
+    if (_windows.isEmpty || identical(window, _windows.current)) return;
+    await _windows.capture(_windows.current);
+    if (!mounted) return;
+    if (!_windows.select(window)) return;
+    _rebindChrome();
+    if (_consoleOpen) _pushToConsole('切到窗口 ${window.number} ${window.label}');
+  }
+
+  void _closeWindow(BrowseWindow window) {
+    final tookOver = _windows.close(window);
+    if (tookOver != null) {
+      _rebindChrome();
+      return;
+    }
+    if (_windows.isEmpty) {
+      // Closing the last window lands on a blank one: an app with nowhere to
+      // go is not a browser.
+      unawaited(_newWindow());
+      return;
+    }
+    setState(() {});
+  }
+
+  /// Points the chrome at whichever window is current — its address, its
+  /// failure, its start page. Without this the toolbar keeps describing the
+  /// window the user just left.
+  void _rebindChrome() {
+    final browser = _browser;
+    _seenUrl = browser.url;
+    _seenTitle = browser.title;
+    _seenStatus = browser.statusCode;
+    _seenBack = browser.canGoBack;
+    _seenForward = browser.canGoForward;
+    _seenResources = browser.resourceTimings.length;
+    _navError = null;
+    _openingHost = null;
+    final window = _windows.current;
+    window.refreshLabel();
+    final url = browser.url;
+    final hasPage = url != null && url.isNotEmpty && url != 'about:blank';
+    setState(() {
+      _started = hasPage;
+      if (!_urlFocus.hasFocus) _urlController.text = hasPage ? url : '';
+    });
+  }
+
+  Future<void> _openTaskView() async {
+    // The window on screen is the only card that can be stale right now.
+    await _windows.capture(_windows.current);
+    if (!mounted) return;
+    await showTaskView(
+      context,
+      store: _windows,
+      onSelect: _switchWindow,
+      onClose: _closeWindow,
+      onCreate: () => unawaited(_newWindow()),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // Page jumps (navigation delegate)
   // ---------------------------------------------------------------------------
 
   /// One navigation the WebView decided about: allowed, re-issued in-app,
   /// blocked because it targeted another app, or failed.
-  void _onNavigationEvent(WebViewNavigationEvent event) {
+  ///
+  /// [active] is whether that window is on screen. A page finishing in the
+  /// background belongs in the console and the log, but never in the address
+  /// bar: the failure line and the "正在打开" host describe the page the user
+  /// is looking at, and a hidden window would rewrite both.
+  void _handleNavigation(WebViewNavigationEvent event,
+      {required bool active}) {
     if (!mounted) return;
     if (!event.isMainFrame) return;
 
@@ -423,29 +619,33 @@ class _BrowserPageState extends State<BrowserPage>
 
     // The address bar owns the outcome of the last main-frame load: a dead tap
     // must say so instead of looking like nothing was pressed.
-    if (event.isFailed) {
-      final host = Uri.tryParse(event.url)?.host ?? '';
-      final reason = (event.message ?? '').trim();
-      _setNavError(
-        reason.isEmpty
-            ? (host.isEmpty ? '页面打开失败' : '$host 打开失败')
-            : '$host · $reason',
-      );
-    } else if (event.isCommitted || event.kind == 'response') {
-      _setNavError(null);
+    if (active) {
+      if (event.isFailed) {
+        final host = Uri.tryParse(event.url)?.host ?? '';
+        final reason = (event.message ?? '').trim();
+        _setNavError(
+          reason.isEmpty
+              ? (host.isEmpty ? '页面打开失败' : '$host 打开失败')
+              : '$host · $reason',
+        );
+      } else if (event.isCommitted || event.kind == 'response') {
+        _setNavError(null);
+      }
     }
 
     // Which page is on its way: the WebView names the new URL only when its
     // document commits, so the status line takes the destination from the
     // decision that started the load instead.
-    if (event.kind == 'start' || event.kind == 'in-app') {
-      final host = Uri.tryParse(event.url)?.host ?? '';
-      if (host.isNotEmpty && host != _openingHost) {
-        setState(() => _openingHost = host);
+    if (active) {
+      if (event.kind == 'start' || event.kind == 'in-app') {
+        final host = Uri.tryParse(event.url)?.host ?? '';
+        if (host.isNotEmpty && host != _openingHost) {
+          setState(() => _openingHost = host);
+        }
+      } else if (_openingHost != null &&
+          (event.isCommitted || event.isFailed || event.isBlocked)) {
+        setState(() => _openingHost = null);
       }
-    } else if (_openingHost != null &&
-        (event.isCommitted || event.isFailed || event.isBlocked)) {
-      setState(() => _openingHost = null);
     }
 
     // Blocking is silent by design: pages try to open other apps constantly,
@@ -518,7 +718,8 @@ class _BrowserPageState extends State<BrowserPage>
     });
 
     // New document: the DOM and the storage snapshot in the console are stale.
-    if (_consoleOpen &&
+    if (active &&
+        _consoleOpen &&
         (event.kind == 'committed' || event.kind == 'redirect')) {
       _scheduleConsoleRefresh();
     }
@@ -871,6 +1072,7 @@ class _BrowserPageState extends State<BrowserPage>
       }
       await _browser.setContentBlockingEnabled(true);
       if (!mounted) return;
+      _adBlockIdentifier = identifier;
       setState(() {
         _adBlockReady = true;
         _adBlockRuleCount = count;
@@ -1392,10 +1594,7 @@ class _BrowserPageState extends State<BrowserPage>
     _jsInput.dispose();
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
-    unawaited(_pageSubscription.cancel());
-    unawaited(_navigationSubscription.cancel());
-    _browser.removeListener(_onBrowserChanged);
-    _browser.dispose();
+    _windows.dispose();
     _downloads.dispose();
     unawaited(_session.close());
     _tabs.dispose();
@@ -1453,6 +1652,7 @@ class _BrowserPageState extends State<BrowserPage>
                   size: 24,
                 ),
                 Expanded(child: _buildAddressField()),
+                _buildWindowsButton(),
                 _toolButton(
                   Icons.tune_rounded,
                   'Settings',
@@ -1488,6 +1688,58 @@ class _BrowserPageState extends State<BrowserPage>
         minHeight: 2,
         backgroundColor: const Color(0xFFE4E4DC),
         color: AppColors.signal,
+      ),
+    );
+  }
+
+  /// The task view, with the number of windows open on it. One window is the
+  /// ordinary state, so the count only earns its space from two upwards.
+  Widget _buildWindowsButton() {
+    final count = _windows.count;
+    return Tooltip(
+      message: '任务视图',
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(11),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(11),
+          onTap: () => unawaited(_openTaskView()),
+          child: SizedBox(
+            width: 34,
+            height: 34,
+            child: Stack(
+              alignment: Alignment.center,
+              children: <Widget>[
+                const Icon(
+                  Icons.grid_view_rounded,
+                  size: 19,
+                  color: AppColors.ink,
+                ),
+                if (count > 1)
+                  Positioned(
+                    right: 3,
+                    top: 4,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      decoration: BoxDecoration(
+                        color: AppColors.ink,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        '$count',
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 9,
+                          height: 1.3,
+                          color: AppColors.onInk,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
