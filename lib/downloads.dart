@@ -550,11 +550,11 @@ final class DownloadManager extends ChangeNotifier {
           ),
         );
       } else {
+        // The byte-level probe is what makes this line worth reading, so it
+        // travels with the message instead of being shown and then overwritten.
         final probe = await _sniffContainer(file);
-        failure = _withoutErrorPrefix(
-          text.isEmpty ? '转封装失败' : text,
-        );
-        item.photoError = '转 MP4 失败：$failure（${probe.diagnosis}）';
+        failure = '${_withoutErrorPrefix(text.isEmpty ? '转封装失败' : text)}'
+            '（${probe.diagnosis}）';
       }
     } on MissingPluginException {
       failure = '当前构建不支持视频转封装';
