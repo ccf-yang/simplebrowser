@@ -12,6 +12,7 @@ import 'package:flutter/services.dart'
 
 import 'downloads.dart';
 import 'downloads_sheet.dart';
+import 'external_apps.dart';
 import 'request_format.dart';
 import 'resource_sheet.dart';
 import 'resources.dart';
@@ -168,6 +169,19 @@ class _BrowserPageState extends State<BrowserPage>
   /// browser that leaves the app cannot be debugged.
   bool _blockExternal = true;
 
+  /// Ask before a page gets out, instead of cancelling in silence. The answer is
+  /// remembered per protocol, so bilibili is asked about once and never again.
+  bool _externalAsk = true;
+
+  /// Protocols the user chose "总是允许" / "不允许" for. Both survive launches: a
+  /// refusal that had to be re-decided every session is a refusal nobody keeps.
+  final Set<String> _externalAllowed = <String>{};
+  final Set<String> _externalDenied = <String>{};
+
+  /// One question at a time — a page that fires three app jumps in a row must
+  /// not stack three sheets.
+  bool _externalDialogOpen = false;
+
   /// Serial number for synthetic log rows (page jumps have no engine id).
   int _navSeq = 0;
 
@@ -278,10 +292,8 @@ class _BrowserPageState extends State<BrowserPage>
     // settings describe: no page collection while the panel is closed, and the
     // "never leave the app" rules from the start.
     unawaited(_browser.setPageNetworkEnabled(_panelVisible));
-    unawaited(_browser.setNavigationPolicy(
-      blockExternal: _blockExternal,
-      reissueTaps: _blockExternal,
-    ));
+    _applyNavigationPolicyToAllWindows();
+    unawaited(_loadExternalDecisions());
     // Resource timings come out of a JavaScript evaluation, so they are only
     // pulled while a surface that shows them is open. The page state itself is
     // pushed by the WebView and needs no timer.
@@ -511,6 +523,9 @@ class _BrowserPageState extends State<BrowserPage>
     await browser.setNavigationPolicy(
       blockExternal: _blockExternal,
       reissueTaps: _blockExternal,
+      askExternal: _externalAsk,
+      allowSchemes: _externalAllowed.toList()..sort(),
+      denySchemes: _externalDenied.toList()..sort(),
     );
     final rules = _adBlockIdentifier;
     if (_adBlockEnabled && rules != null) {
@@ -600,6 +615,149 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   // ---------------------------------------------------------------------------
+  // Leaving the app (another app asking to open)
+  // ---------------------------------------------------------------------------
+
+  /// The same answer for every window: a browser that lets bilibili out in one
+  /// window and not in another would be a browser with a hole in it.
+  void _applyNavigationPolicyToAllWindows() {
+    for (final window in _windows.windows) {
+      unawaited(window.controller.setNavigationPolicy(
+        blockExternal: _blockExternal,
+        reissueTaps: _blockExternal,
+        askExternal: _externalAsk,
+        allowSchemes: _externalAllowed.toList()..sort(),
+        denySchemes: _externalDenied.toList()..sort(),
+      ));
+    }
+  }
+
+  Future<void> _loadExternalDecisions() async {
+    final prefs = await _readPrefs();
+    final ask = prefs['externalAsk'];
+    final allowed = prefs['externalAllowSchemes'];
+    final denied = prefs['externalDenySchemes'];
+    if (!mounted) return;
+    setState(() {
+      _externalAsk = ask is bool ? ask : true;
+      _externalAllowed
+        ..clear()
+        ..addAll(_schemeList(allowed));
+      _externalDenied
+        ..clear()
+        ..addAll(_schemeList(denied));
+    });
+    _applyNavigationPolicyToAllWindows();
+  }
+
+  static Set<String> _schemeList(Object? raw) => raw is List
+      ? <String>{
+          for (final item in raw)
+            if (item is String) item.toLowerCase(),
+        }
+      : const <String>{};
+
+  Future<void> _saveExternalDecisions() async {
+    final error = await _setPrefs(<String, Object?>{
+      'externalAsk': _externalAsk,
+      'externalAllowSchemes': _externalAllowed.toList()..sort(),
+      'externalDenySchemes': _externalDenied.toList()..sort(),
+    });
+    if (error != null && mounted) _snack('保存失败：$error');
+  }
+
+  /// The page tried to open another app and the navigation is already dead.
+  /// Nothing happens without an answer here, and the answer outlives the page.
+  Future<void> _offerExternalJump(WebViewNavigationEvent event) async {
+    if (_externalDialogOpen || !mounted) return;
+    final target = Uri.tryParse(event.url);
+    if (target == null || target.scheme.isEmpty) return;
+    final scheme = target.scheme.toLowerCase();
+    final page = Uri.tryParse(_browser.url ?? '');
+    final appName = externalAppNameForJump(target, page);
+    _externalDialogOpen = true;
+    ExternalChoice? choice;
+    try {
+      choice = await askAboutExternalJump(
+        context,
+        uri: target,
+        appName: appName,
+        pageHost: page?.host ?? '',
+      );
+    } finally {
+      _externalDialogOpen = false;
+    }
+    if (choice == null || !mounted) return;
+    switch (choice) {
+      case ExternalChoice.allowOnce:
+        await _browser.openExternal(target);
+        if (_consoleOpen) _pushToConsole('已允许本次打开 $appName');
+      case ExternalChoice.alwaysAllow:
+        setState(() {
+          _externalAllowed.add(scheme);
+          _externalDenied.remove(scheme);
+        });
+        await _saveExternalDecisions();
+        _applyNavigationPolicyToAllWindows();
+        await _browser.openExternal(target);
+        if (_consoleOpen) {
+          _pushToConsole('以后不再询问 $scheme://（$appName）');
+        }
+      case ExternalChoice.copy:
+        await Clipboard.setData(ClipboardData(text: target.toString()));
+        if (mounted) _snack('地址已拷贝');
+      case ExternalChoice.deny:
+        setState(() {
+          _externalDenied.add(scheme);
+          _externalAllowed.remove(scheme);
+        });
+        await _saveExternalDecisions();
+        _applyNavigationPolicyToAllWindows();
+        if (_consoleOpen) {
+          _pushToConsole('已永久禁止 $scheme://（$appName）', level: 'warn');
+        }
+    }
+  }
+
+  /// Applied while the sheet is still open, like the stay-in-app switch: a page
+  /// can try to leave at any moment, and the answer must follow the switch the
+  /// user just moved rather than wait for "Save".
+  void _setAskExternal(bool value) {
+    if (_externalAsk == value) return;
+    setState(() => _externalAsk = value);
+    unawaited(_saveExternalDecisions());
+    _applyNavigationPolicyToAllWindows();
+  }
+
+  /// Clears both lists: every protocol is asked about again.
+  Future<void> _resetExternalDecisions() async {
+    setState(() {
+      _externalAllowed.clear();
+      _externalDenied.clear();
+    });
+    await _saveExternalDecisions();
+    _applyNavigationPolicyToAllWindows();
+    if (mounted) _snack('已清除外部应用的选择，下次会重新询问');
+  }
+
+  /// What the settings sheet shows about the remembered answers, named rather
+  /// than as bare protocols: the user chose "哔哩哔哩", not "bilibili".
+  String get _externalDecisionSummary {
+    if (_externalAllowed.isEmpty && _externalDenied.isEmpty) {
+      return _externalAsk ? '还没有允许或禁止过任何应用' : '外部跳转一律静默拦截';
+    }
+    String describe(String scheme) => externalAppName(scheme);
+    final parts = <String>[];
+    if (_externalAllowed.isNotEmpty) {
+      parts.add('总是允许：${_externalAllowed.map(describe).join('、')}');
+    }
+    if (_externalDenied.isNotEmpty) {
+      parts.add('已禁止：${_externalDenied.map(describe).join('、')}');
+    }
+    return parts.join('\n');
+  }
+
+  // ---------------------------------------------------------------------------
   // Page jumps (navigation delegate)
   // ---------------------------------------------------------------------------
 
@@ -613,7 +771,11 @@ class _BrowserPageState extends State<BrowserPage>
   void _handleNavigation(WebViewNavigationEvent event,
       {required bool active}) {
     if (!mounted) return;
-    if (!event.isMainFrame) return;
+    // An app jump is allowed to come from a subframe — that is exactly where a
+    // page puts its "打开 App" button — so those two kinds are not filtered by
+    // frame the way a page load is.
+    final aboutOtherApps = event.isExternalAsk || event.isExternalOpen;
+    if (!event.isMainFrame && !aboutOtherApps) return;
 
     // A chrome snapshot (progress, title, history flags) is not a page jump.
     // The controller already consumed it for the address bar; logging it would
@@ -651,19 +813,22 @@ class _BrowserPageState extends State<BrowserPage>
       }
     }
 
-    // Blocking is silent by design: pages try to open other apps constantly,
-    // and a toast on every one of them is noise. The console line below keeps
-    // the decision visible for anyone who wants it.
-
-    // Mirror it into the in-app console; the host sees the decision, which the
-    // page cannot. The console keeps working while the info panel is closed
-    // (it even hides it).
+    // Blocking is silent by design: pages try to open other apps constantly, and
+    // a toast on every one of them is noise. The console line below keeps the
+    // decision visible for anyone who wants it, and the dialog further down only
+    // appears when the user asked to be consulted about leaving.
+    //
+    // The host sees the decision, which the page cannot. The console keeps
+    // working while the info panel is closed (it even hides it).
     if (_consoleOpen) {
       _pushToConsole(
         switch (event.kind) {
           'blocked' =>
             '已拦截外部跳转 ${event.method} ${event.url} '
                 '(${event.navigationType})',
+          'ask' => '页面想启动外部应用 ${event.url}（已停在原地）',
+          'external-open' =>
+            '已交给外部应用 ${event.url} ${event.message ?? ''}',
           'in-app' => '点击链接改为站内加载 ${event.url}',
           'failed' => '加载失败 ${event.url} ${event.message ?? ''}',
           'redirect' => '${event.statusCode} 跳转 ${event.url}',
@@ -671,12 +836,19 @@ class _BrowserPageState extends State<BrowserPage>
             '页面已打开 ${event.statusCode ?? ''} ${event.url}',
           _ => null,
         },
-        level: event.isBlocked
+        level: event.isBlocked || event.isExternalAsk
             ? 'warn'
             : event.isFailed
                 ? 'error'
                 : 'info',
       );
+    }
+
+    // Ask the user, but only about the window they are looking at: a background
+    // window's attempt is logged where it happened and waits for the user to
+    // come back to it.
+    if (event.isExternalAsk && active && _externalAsk) {
+      unawaited(_offerExternalJump(event));
     }
 
     // Everything below feeds the Log tab and the console's Network tab. With
@@ -687,6 +859,7 @@ class _BrowserPageState extends State<BrowserPage>
       id: 'nav-${_navSeq++}',
       phase: switch (event.kind) {
         'blocked' => RequestLogPhase.cancelled,
+        'ask' => RequestLogPhase.cancelled,
         'failed' => RequestLogPhase.error,
         'redirect' => RequestLogPhase.redirect,
         'response' => RequestLogPhase.response,
@@ -696,6 +869,7 @@ class _BrowserPageState extends State<BrowserPage>
       timestamp: event.timestamp,
       level: switch (event.kind) {
         'blocked' => RequestLogLevel.warn,
+        'ask' => RequestLogLevel.warn,
         'failed' => RequestLogLevel.error,
         _ => RequestLogLevel.info,
       },
@@ -704,11 +878,15 @@ class _BrowserPageState extends State<BrowserPage>
       statusCode: event.statusCode,
       errorCode: switch (event.kind) {
         'blocked' => 'webview.externalBlocked',
+        'ask' => 'webview.externalAsk',
+        'external-open' => 'webview.externalOpened',
         'failed' => 'webview.navigationFailed',
         _ => null,
       },
       message: switch (event.kind) {
         'blocked' => '${event.message ?? 'blocked'} (${event.navigationType})',
+        'ask' => '想启动外部应用 (${event.navigationType})',
+        'external-open' => event.message ?? 'opened external app',
         'in-app' => 'tap kept in-app',
         _ => event.message,
       },
@@ -1212,6 +1390,7 @@ class _BrowserPageState extends State<BrowserPage>
           cookie: _cookieController.text,
           showPanel: _panelPreference,
           blockExternal: _blockExternal,
+          askExternal: _externalAsk,
           adBlock: _adBlockEnabled,
         ),
         uaLabels: <String>[for (final preset in _uaPresets) preset.label],
@@ -1223,6 +1402,9 @@ class _BrowserPageState extends State<BrowserPage>
         canSaveBookmark: _hasDocument,
         onShowPanelChanged: _setPanelVisible,
         onBlockExternalChanged: _setBlockExternal,
+        onAskExternalChanged: _setAskExternal,
+        externalDecisions: _externalDecisionSummary,
+        onResetExternalDecisions: _resetExternalDecisions,
       ),
     );
     if (result == null || !mounted) return;
@@ -1234,6 +1416,7 @@ class _BrowserPageState extends State<BrowserPage>
           ? _RefererMode.currentDomain
           : _RefererMode.none;
       _blockExternal = result.blockExternal;
+      _externalAsk = result.askExternal;
     });
     if (adBlockChanged) {
       _snack(result.adBlock ? '正在启用广告拦截…' : '已关闭广告拦截');
@@ -1243,10 +1426,7 @@ class _BrowserPageState extends State<BrowserPage>
     // The live switch already applied this; calling again keeps the saved
     // value authoritative if the sheet is dismissed in a weird state.
     _setPanelVisible(result.showPanel);
-    unawaited(_browser.setNavigationPolicy(
-      blockExternal: _blockExternal,
-      reissueTaps: _blockExternal,
-    ));
+    _applyNavigationPolicyToAllWindows();
     _cookieController.text = result.cookie;
 
     final userAgent = _effectiveUserAgent;
@@ -1319,10 +1499,7 @@ class _BrowserPageState extends State<BrowserPage>
   void _setBlockExternal(bool value) {
     if (_blockExternal == value) return;
     setState(() => _blockExternal = value);
-    unawaited(_browser.setNavigationPolicy(
-      blockExternal: value,
-      reissueTaps: value,
-    ));
+    _applyNavigationPolicyToAllWindows();
   }
 
   /// Runs the current URL through the native (Rust/wreq) engine so the panel

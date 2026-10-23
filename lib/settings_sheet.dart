@@ -24,6 +24,7 @@ class SettingsValues {
     required this.cookie,
     required this.showPanel,
     required this.blockExternal,
+    required this.askExternal,
     required this.adBlock,
     this.action,
   });
@@ -35,6 +36,10 @@ class SettingsValues {
 
   /// Cancel jumps that would leave the app (custom schemes and Universal Links).
   final bool blockExternal;
+
+  /// Ask before an app jump happens instead of dropping it silently, so the
+  /// answer can be remembered per protocol (允许 / 总是允许 / 拷贝 / 不允许).
+  final bool askExternal;
 
   /// Install the WebKit content-blocker list for every page.
   final bool adBlock;
@@ -56,18 +61,25 @@ class SettingsSheet extends StatefulWidget {
     required this.uaLabels,
     required this.onShowPanelChanged,
     required this.onBlockExternalChanged,
+    required this.onAskExternalChanged,
     required this.adBlockEnabled,
     this.adBlockStatus = '',
     this.webDavSummary = '未配置',
     this.bookmarkCount = 0,
     this.downloadCount = 0,
     this.canSaveBookmark = false,
+    this.externalDecisions = '',
+    this.onResetExternalDecisions,
   });
 
   final SettingsValues initial;
   final List<String> uaLabels;
   final ValueChanged<bool> onShowPanelChanged;
   final ValueChanged<bool> onBlockExternalChanged;
+
+  /// Turns the "ask before opening an app" dialog on or off. Live, like the
+  /// stay-in-app switch: the sheet can be open while a page tries to leave.
+  final ValueChanged<bool> onAskExternalChanged;
 
   /// Current state plus a short line about the compiled rule set, e.g.
   /// `53283 rules ready` or `compile failed`.
@@ -81,6 +93,13 @@ class SettingsSheet extends StatefulWidget {
   final int downloadCount;
   final bool canSaveBookmark;
 
+  /// The per-protocol answers remembered from the ask dialog, already named
+  /// ("总是允许：哔哩哔哩"). Empty when nothing has been chosen yet.
+  final String externalDecisions;
+
+  /// Clears both remembered lists, so every protocol is asked about again.
+  final Future<void> Function()? onResetExternalDecisions;
+
   @override
   State<SettingsSheet> createState() => _SettingsSheetState();
 }
@@ -90,6 +109,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
   late int _refererMode = widget.initial.refererMode;
   late bool _showPanel = widget.initial.showPanel;
   late bool _blockExternal = widget.initial.blockExternal;
+  late bool _askExternal = widget.initial.askExternal;
   late bool _adBlock = widget.initial.adBlock;
   late final TextEditingController _cookie =
       TextEditingController(text: widget.initial.cookie);
@@ -108,6 +128,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
         cookie: _cookie.text,
         showPanel: _showPanel,
         blockExternal: _blockExternal,
+        askExternal: _askExternal,
         adBlock: _adBlock,
         action: action,
       ),
@@ -214,6 +235,10 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   const SizedBox(height: 8),
                   _buildStayInAppSwitch(),
                   const SizedBox(height: 8),
+                  _buildAskExternalSwitch(),
+                  const SizedBox(height: 8),
+                  _buildExternalDecisions(),
+                  const SizedBox(height: 8),
                   _buildAdBlockSwitch(),
                   const SizedBox(height: 14),
                   const _FieldLabel('Storage'),
@@ -308,6 +333,59 @@ class _SettingsSheetState extends State<SettingsSheet> {
       setState(() => _blockExternal = value);
       widget.onBlockExternalChanged(value);
     },
+  );
+
+  Widget _buildAskExternalSwitch() => _SwitchRow(
+    title: '外跳前询问',
+    subtitle: 'bilibili:// 这类协议弹出：允许 / 总是允许 / 拷贝 / 不允许',
+    value: _askExternal,
+    onChanged: (value) {
+      setState(() => _askExternal = value);
+      widget.onAskExternalChanged(value);
+    },
+  );
+
+  Widget _buildExternalDecisions() => Container(
+    padding: const EdgeInsets.fromLTRB(12, 9, 4, 9),
+    decoration: BoxDecoration(
+      color: AppColors.card,
+      border: Border.all(color: AppColors.line2),
+      borderRadius: BorderRadius.circular(14),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: <Widget>[
+        const Icon(Icons.shield_outlined, size: 17, color: AppColors.ink2),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              const Text(
+                '已记住的选择',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                widget.externalDecisions,
+                style: const TextStyle(
+                  fontSize: 9.5,
+                  height: 1.45,
+                  color: AppColors.muted,
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (widget.onResetExternalDecisions != null)
+          TextButton(
+            onPressed: () => unawaited(
+              widget.onResetExternalDecisions!.call(),
+            ),
+            child: const Text('重置', style: TextStyle(fontSize: 12)),
+          ),
+      ],
+    ),
   );
 
   Widget _buildAdBlockSwitch() => _SwitchRow(
