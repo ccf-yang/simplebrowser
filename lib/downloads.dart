@@ -618,8 +618,12 @@ final class DownloadManager extends ChangeNotifier {
       ),
     ];
     final playlist = HlsPlaylist.parse(
-      await _fetchText(uri, headers, CancelToken())
-          .timeout(const Duration(seconds: 20)),
+      await _fetchTextWithRetry(
+        uri,
+        headers,
+        CancelToken(),
+        perAttempt: const Duration(seconds: 6),
+      ),
       uri,
     );
     return playlist.isMaster ? playlist.sortedVariants : const <HlsVariant>[];
@@ -1343,7 +1347,7 @@ final class DownloadManager extends ChangeNotifier {
     CancelToken token,
   ) async {
     var playlist = HlsPlaylist.parse(
-      await _fetchText(rootUri, headers, token),
+      await _fetchTextWithRetry(rootUri, headers, token),
       rootUri,
     );
     if (playlist.isMaster) {
@@ -1364,7 +1368,7 @@ final class DownloadManager extends ChangeNotifier {
       selected ??= variants.first;
       item.hlsVariantLabel ??= selected.label;
       playlist = HlsPlaylist.parse(
-        await _fetchText(selected.uri, headers, token),
+        await _fetchTextWithRetry(selected.uri, headers, token),
         selected.uri,
       );
       if (playlist.isMaster) {
@@ -1753,6 +1757,80 @@ final class DownloadManager extends ChangeNotifier {
       throw const FormatException('服务器返回的不是 M3U8 播放列表');
     }
     return text;
+  }
+
+  /// Reads a playlist with retries, and one last try on a different stack.
+  ///
+  /// Every playlist read used to go out exactly once, so a proxy node that died
+  /// mid-connect — the `connect closed before response header` family — showed
+  /// up as 「读取清晰度失败」 or as a download that never started, even though the
+  /// next attempt would have worked. Segments already retry; the lists are the
+  /// one place where a single lost connection costs the whole job.
+  ///
+  /// The last attempt deliberately leaves the engine: Dart's own HTTP stack has
+  /// no impersonated Safari fingerprint at all, and a CDN that kills one TLS
+  /// shape often answers the other. It sends the same headers and no cookies,
+  /// which is enough for a playlist and is only ever reached when the engine
+  /// could not deliver it.
+  Future<String> _fetchTextWithRetry(
+    Uri uri,
+    List<OrderedHeader> headers,
+    CancelToken token, {
+    Duration perAttempt = const Duration(seconds: 15),
+  }) async {
+    Object? last;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await _fetchText(uri, headers, token).timeout(perAttempt);
+      } on FormatException {
+        // The answer arrived and was not a playlist: trying again changes nothing.
+        rethrow;
+      } on Object catch (error) {
+        // Cancelled is not an exception the engine throws on its own: the token
+        // says so, and the token still says so after the loop, where there is no
+        // `catch` left to rethrow from.
+        if (token.isCancelled) rethrow;
+        last = error;
+        if (attempt < 2) {
+          await Future<void>.delayed(const Duration(milliseconds: 450));
+        }
+      }
+    }
+    if (token.isCancelled) throw last ?? const _DownloadCancelled();
+    try {
+      return await _fetchTextPlain(uri, headers).timeout(perAttempt);
+    } on FormatException {
+      rethrow;
+    } on Object catch (plainError) {
+      // Report what the engine said: it is the stack the rest of the download
+      // uses, so its failure is the one worth reading.
+      throw last ?? plainError;
+    }
+  }
+
+  Future<String> _fetchTextPlain(
+    Uri uri,
+    List<OrderedHeader> headers,
+  ) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 8);
+    try {
+      final request = await client.openUrl('GET', uri);
+      for (final header in headers) {
+        request.headers.set(header.name, header.value);
+      }
+      final response = await request.close();
+      if (response.statusCode != 200) {
+        throw HttpException('HTTP ${response.statusCode}', uri: uri);
+      }
+      final text = await response.transform(utf8.decoder).join();
+      if (!text.trimLeft().startsWith('#EXTM3U')) {
+        throw const FormatException('服务器返回的不是 M3U8 播放列表');
+      }
+      return text;
+    } finally {
+      client.close(force: true);
+    }
   }
 
   List<OrderedHeader> _headersFor(DownloadItem item) {

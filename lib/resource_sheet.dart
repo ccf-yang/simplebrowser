@@ -828,7 +828,10 @@ class _VariantSheet extends StatelessWidget {
                         Padding(
                           padding: const EdgeInsets.fromLTRB(10, 12, 10, 4),
                           child: Text(
-                            '读取清晰度失败：$error\n下载时会自动选择一档。',
+                            '读取清晰度失败（引擎重试 3 次，又换了一条网络栈）：'
+                            '$error\n'
+                            '下载时会自动选择一档。「连接在建好前被关闭」多半是'
+                            '手机上的代理节点断了或站点 CDN 掐的，关掉代理再试一次。',
                             style: const TextStyle(
                               fontSize: 10,
                               height: 1.5,
