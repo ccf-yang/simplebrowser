@@ -2371,6 +2371,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         mode = '';
         moved = false;
         lastUrl = '';
+        armedUntil = 0;
+        armedStrict = false;
+        if (armTimer) { clearTimeout(armTimer); armTimer = null; }
         release();
         if (reportExit !== false) { report({kind: 'exit'}); }
       }
@@ -2466,30 +2469,21 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         if (theater) { leave(false); }
         var el = videoOf(e.target, e);
         if (!el) {
-          var picked = videoAt(e.clientX, e.clientY);
-          if (picked && worthTaking(picked, e.target, true)) {
+          // A picture under the finger: that is the player, whatever element
+          // the tap actually landed on (its own control bar, a title layer).
+          if (videoAt(e.clientX, e.clientY)) {
             if (e.cancelable) { e.preventDefault(); }
             e.stopPropagation();
-            handOver(picked);
+            handOver(videoAt(e.clientX, e.clientY));
             return;
           }
-          if (playerish(e.target)) {
-            picked = videoNearPoint(e.clientX, e.clientY) ||
-                     videoNear(e.target);
-            if (picked && worthTaking(picked, e.target, false)) {
-              if (e.cancelable) { e.preventDefault(); }
-              e.stopPropagation();
-              handOver(picked);
-              return;
-            }
-          }
-          // The player has not built its <video> yet, or will start it on the
-          // next tick. Every tap arms the watch, but a tap outside a player
-          // only reacts to a video that starts playing after it — a muted
-          // background loop that was already running can never pop up.
+          // Anywhere else the page keeps working: tapping an author name or a
+          // description is a link, not a play button. The watch only opens the
+          // window if this very tap starts a video that was paused; a wrapper
+          // that merely has "video" in its class never counts.
           lastTapX = e.clientX;
           lastTapY = e.clientY;
-          armForPlay(!(playerish(e.target) || picked || videoNear(e.target)));
+          armForPlay(true);
           return;
         }
         // The tap means "play this here". Letting the page see the same click
@@ -2608,8 +2602,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         if (theater || tapMoved) { return; }
         lastTapX = tapX;
         lastTapY = tapY;
-        armForPlay(!(videoAt(tapX, tapY) || playerish(e.target) ||
-                     videoNear(e.target)));
+        armForPlay(!videoAt(tapX, tapY));
       }, {passive: true, capture: true});
 
       // Some players start the video from a touch handler and swallow the
