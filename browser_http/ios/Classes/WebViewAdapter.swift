@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Flutter
 import UIKit
@@ -472,6 +473,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// black letterbox out of the saved frame.
     private var videoWidth: CGFloat = 0
     private var videoHeight: CGFloat = 0
+    private var videoPosition: Double = 0
+    private var videoUrl = ""
+    private var videoReferer = ""
 
     /// Cancels any navigation whose scheme is not http(s)/in-app, so a link can
     /// never hand the URL over to another app (`baidu://`, `weixin://`,
@@ -704,47 +708,121 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
 
     /// Saves the frame the player is showing to Photos.
     ///
-    /// The picture is the page's `<video>` stretched over the viewport with
-    /// `object-fit: contain`, so what the user sees is the aspect-fitted part
-    /// of the WebView. Cropping the snapshot to that rect keeps the letterbox
-    /// out, and the host's control layer was never in the snapshot at all —
-    /// it is Flutter, not page content.
+    /// The video is composited by the system outside the WebView's own
+    /// drawing, so `takeSnapshot` photographs a black hole where the picture
+    /// is. The page element itself can be read instead: drawing it into a
+    /// canvas yields exactly the frame on screen, without the host's control
+    /// layer, because that layer is Flutter and never part of the page.
+    ///
+    /// Cross-origin media taints the canvas, and then the same stream is
+    /// decoded natively at the playhead with the page's user agent and
+    /// referer. HLS playlists and progressive files both work this way; a
+    /// stream the page assembles itself (MSE) normally takes the canvas path.
     func captureVideoFrame(_ done: @escaping (String) -> Void) {
-        let bounds = webView.bounds
-        guard bounds.width > 4, bounds.height > 4 else {
-            done("error: no view")
-            return
-        }
-        var rect = bounds
-        if videoWidth > 0, videoHeight > 0 {
-            let scale = min(bounds.width / videoWidth,
-                            bounds.height / videoHeight)
-            let size = CGSize(width: (videoWidth * scale).rounded(),
-                              height: (videoHeight * scale).rounded())
-            rect = CGRect(x: ((bounds.width - size.width) / 2).rounded(),
-                          y: ((bounds.height - size.height) / 2).rounded(),
-                          width: size.width, height: size.height)
-        }
-        rect = rect.intersection(bounds)
-        guard rect.width > 4, rect.height > 4 else {
-            done("error: no picture")
-            return
-        }
-        let configuration = WKSnapshotConfiguration()
-        configuration.rect = rect
-        webView.takeSnapshot(with: configuration) { image, error in
-            guard let image,
-                  let data = image.jpegData(compressionQuality: 0.95) else {
-                done("error: \(error?.localizedDescription ?? "snapshot failed")")
+        let script = """
+        (function () {
+          var out = {
+            frame: '',
+            ua: navigator.userAgent || '',
+            page: location.href || ''
+          };
+          try {
+            if (typeof window.__soCaptureFrame === 'function') {
+              out.frame = window.__soCaptureFrame() || '';
+            }
+          } catch (e) {}
+          return JSON.stringify(out);
+        })()
+        """
+        webView.evaluateJavaScript(script) { [weak self] value, _ in
+            guard let self else { done("error: no view"); return }
+            var frame = ""
+            var userAgent = ""
+            var page = ""
+            if let text = value as? String,
+               let data = text.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: data),
+               let body = parsed as? [String: Any] {
+                frame = body["frame"] as? String ?? ""
+                userAgent = body["ua"] as? String ?? ""
+                page = body["page"] as? String ?? ""
+            }
+            if let picture = WebViewHolder.imageData(fromDataURL: frame) {
+                self.saveFramePhoto(picture, done)
                 return
             }
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyyMMdd-HHmmss"
-            let name = "so-frame-\(formatter.string(from: Date())).jpg"
-            MediaBridge.savePhotoData(data, filename: name, result: done)
+            self.captureVideoFrameRemotely(userAgent: userAgent, page: page,
+                                           done)
         }
     }
 
+    private static func imageData(fromDataURL value: String) -> Data? {
+        guard value.hasPrefix("data:image/"),
+              let comma = value.firstIndex(of: ",") else { return nil }
+        let encoded = String(value[value.index(after: comma)...])
+        return Data(base64Encoded: encoded)
+    }
+
+    private func saveFramePhoto(_ data: Data, _ done: @escaping (String) -> Void) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let name = "so-frame-\(formatter.string(from: Date())).jpg"
+        MediaBridge.savePhotoData(data, filename: name, result: done)
+    }
+
+    /// Reads a frame out of the media file itself when the page's canvas is
+    /// not allowed to (cross-origin picture). The request carries the page's
+    /// user agent, referer and cookies, or the host will serve nothing.
+    private func captureVideoFrameRemotely(
+        userAgent: String,
+        page: String,
+        _ done: @escaping (String) -> Void
+    ) {
+        guard let url = URL(string: videoUrl),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            done("error: 页面没有给出可以直接读取的视频地址")
+            return
+        }
+        var headers: [String: String] = [:]
+        if !userAgent.isEmpty { headers["User-Agent"] = userAgent }
+        let referer = videoReferer.isEmpty ? page : videoReferer
+        if !referer.isEmpty { headers["Referer"] = referer }
+        if let cookies = HTTPCookieStorage.shared.cookies(for: url),
+           !cookies.isEmpty {
+            let fields = HTTPCookie.requestHeaderFields(with: cookies)
+            for (key, value) in fields { headers[key] = value }
+        }
+        let seconds = max(0, videoPosition)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let asset = AVURLAsset(
+                url: url,
+                options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            let tolerance = CMTime(seconds: 0.5, preferredTimescale: 600)
+            generator.requestedTimeToleranceBefore = tolerance
+            generator.requestedTimeToleranceAfter = tolerance
+            do {
+                let image = try generator.copyCGImage(
+                    at: CMTime(seconds: seconds, preferredTimescale: 600),
+                    actualTime: nil)
+                guard let data = UIImage(cgImage: image)
+                    .jpegData(compressionQuality: 0.95) else {
+                    DispatchQueue.main.async { done("error: 无法编码这一帧") }
+                    return
+                }
+                DispatchQueue.main.async {
+                    guard let self else { done("error: no view"); return }
+                    self.saveFramePhoto(data, done)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    done("error: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
     // MARK: - Content blocking
 
     /// Compiled WebKit content-blocker list, if the host has supplied one.
@@ -1344,16 +1422,29 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         if message.name == WebViewHolder.videoHandlerName {
             guard var body = message.body as? [String: Any] else { return }
             if let width = (body["width"] as? NSNumber)?.doubleValue,
-               width > 0 {
+               width > 0, width.isFinite {
                 videoWidth = CGFloat(width)
             }
             if let height = (body["height"] as? NSNumber)?.doubleValue,
-               height > 0 {
+               height > 0, height.isFinite {
                 videoHeight = CGFloat(height)
+            }
+            if let position = (body["position"] as? NSNumber)?.doubleValue,
+               position > 0, position.isFinite {
+                videoPosition = position
+            }
+            if let url = body["url"] as? String, !url.isEmpty {
+                videoUrl = url
+            }
+            if let referer = body["referer"] as? String, !referer.isEmpty {
+                videoReferer = referer
             }
             if (body["kind"] as? String) == "exit" {
                 videoWidth = 0
                 videoHeight = 0
+                videoPosition = 0
+                videoUrl = ""
+                videoReferer = ""
             }
             body["sessionId"] = id
             onVideoEvent?(body)
@@ -1611,6 +1702,8 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       var lastUrl = '';        // the media source last reported
       var speedTimer = null;   // long press: still counting down
       var speedOn = false;     // 2x while the finger stays down
+      var armedUntil = 0;      // a tap just asked a player to start
+      var armTimer = null;     // polling for the video that tap started
 
       function report(message) {
         try {
@@ -1637,6 +1730,182 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           }
         }
         return file;
+      }
+
+      // Every video this document owns, crossing open shadow roots: custom
+      // players keep both the picture and their controls in there, and a
+      // plain `querySelectorAll` stops at the boundary.
+      function allVideos() {
+        var list = [];
+        function walk(root) {
+          var found = [];
+          try { found = root.querySelectorAll('video'); } catch (e) {}
+          for (var i = 0; i < found.length; i += 1) { list.push(found[i]); }
+          var nodes = [];
+          try { nodes = root.querySelectorAll('*'); } catch (e) {}
+          for (var j = 0; j < nodes.length; j += 1) {
+            if (nodes[j].shadowRoot) { walk(nodes[j].shadowRoot); }
+          }
+        }
+        walk(document);
+        return list;
+      }
+
+      function onScreen(el) {
+        if (!el || el.tagName !== 'VIDEO') { return false; }
+        var rect = null;
+        try { rect = el.getBoundingClientRect(); } catch (e) { return false; }
+        if (!rect || rect.width < 40 || rect.height < 40) { return false; }
+        var style = null;
+        try { style = window.getComputedStyle(el); } catch (e) {}
+        if (style && (style.visibility === 'hidden' ||
+                      style.display === 'none' || style.opacity === '0')) {
+          return false;
+        }
+        return true;
+      }
+
+      // The tap lands on a control bar, a poster layer or a click catcher, not
+      // on the <video>. Pick the picture under the finger; the largest one wins
+      // when two players overlap.
+      function videoAt(x, y) {
+        var list = allVideos();
+        var best = null, bestArea = 0;
+        for (var i = 0; i < list.length; i += 1) {
+          var el = list[i];
+          if (!onScreen(el)) { continue; }
+          var rect = el.getBoundingClientRect();
+          if (x < rect.left - 2 || x > rect.right + 2 ||
+              y < rect.top - 2 || y > rect.bottom + 2) { continue; }
+          var area = rect.width * rect.height;
+          if (area > bestArea) { best = el; bestArea = area; }
+        }
+        return best;
+      }
+
+      // A control row that sits just outside the picture: take the nearest
+      // visible player, but only within a player-looking box.
+      function videoNearPoint(x, y) {
+        var list = allVideos();
+        var best = null, bestArea = 0;
+        for (var i = 0; i < list.length; i += 1) {
+          var el = list[i];
+          if (!onScreen(el)) { continue; }
+          var rect = el.getBoundingClientRect();
+          var dx = Math.max(rect.left - x, 0, x - rect.right);
+          var dy = Math.max(rect.top - y, 0, y - rect.bottom);
+          if (dx > 160 || dy > 160) { continue; }
+          var area = rect.width * rect.height;
+          if (area > bestArea) { best = el; bestArea = area; }
+        }
+        return best;
+      }
+
+      // The video inside the tapped element's player box. The controls and the
+      // picture usually share one wrapper a few levels up.
+      function videoNear(node) {
+        var step = node;
+        for (var depth = 0; step && depth < 8; depth += 1) {
+          if (step.nodeType === 1) {
+            if (step.tagName === 'VIDEO') { return step; }
+            var inner = null;
+            try { inner = step.querySelector('video'); } catch (e) {}
+            if (inner) { return inner; }
+          }
+          step = step.parentElement ||
+                 (step.getRootNode && step.getRootNode().host);
+        }
+        return null;
+      }
+
+      function playerish(node) {
+        var step = node;
+        for (var depth = 0; step && depth < 8; depth += 1) {
+          if (step.nodeType === 1) {
+            var name = String(step.className || '') + ' ' +
+                       String(step.id || '') + ' ' +
+                       String(step.getAttribute('aria-label') || '');
+            if (/(player|video|play|dplayer|jwplayer|prism|bpx|artplayer|xgplayer|vjs)/i.test(name)) {
+              return true;
+            }
+          }
+          step = step.parentElement ||
+                 (step.getRootNode && step.getRootNode().host);
+        }
+        return false;
+      }
+
+      // A muted (or looping) picture with no player around it is a decorative
+      // background, not something the user meant to watch full screen.
+      function backgroundish(el, node) {
+        return !el.controls && !playerish(el) && !playerish(node) &&
+               (el.muted || el.loop);
+      }
+
+      // Whether a video the tap did not land on directly is still the thing the
+      // user meant. A tap inside the picture claims it outright; a pick from
+      // the same player box has to look like a player or fill the screen.
+      function worthTaking(el, node, direct) {
+        if (!el || el.tagName !== 'VIDEO') { return false; }
+        if (backgroundish(el, node)) { return false; }
+        if (direct) { return true; }
+        if (!el.paused || el.controls) { return true; }
+        if (playerish(el) || playerish(node)) { return true; }
+        var rect = el.getBoundingClientRect();
+        return rect.width * rect.height >=
+               window.innerWidth * window.innerHeight * 0.35;
+      }
+
+      // Adopts a video found through something other than a direct hit. Inside
+      // an iframe the frame reports upwards and the top document stretches the
+      // frame; dimensions and the media URL travel with it so the host can
+      // still read a frame and download the stream.
+      function handOver(el) {
+        if (isTop) { enter(el); return; }
+        video = el;
+        watch(el);
+        stretch(el);
+        try {
+          savedControls = el.controls;
+          el.controls = false;
+        } catch (e) {}
+        report({kind: 'enter', paused: !!el.paused,
+                position: el.currentTime || 0,
+                duration: isFinite(el.duration) ? el.duration : 0,
+                width: el.videoWidth || 0, height: el.videoHeight || 0,
+                url: mediaUrl(), referer: location.href});
+        play(el);
+        try {
+          parent.postMessage({__soVideo: 'enter',
+                              width: el.videoWidth || 0,
+                              height: el.videoHeight || 0,
+                              url: mediaUrl(),
+                              referer: location.href}, '*');
+        } catch (e) {}
+      }
+
+      // A player may create its <video>, or only call play(), after the tap
+      // reaches it. For a moment after a tap this frame watches for a video
+      // that starts playing, so the player still opens; autoplay on page load
+      // has no tap behind it and never gets here.
+      function checkArmed() {
+        armTimer = null;
+        if (Date.now() > armedUntil) { return; }
+        var list = allVideos();
+        for (var i = 0; i < list.length; i += 1) {
+          var el = list[i];
+          if (el === video || el.paused || !onScreen(el)) { continue; }
+          if (!worthTaking(el, el, false)) { continue; }
+          armedUntil = 0;
+          handOver(el);
+          return;
+        }
+        armTimer = setTimeout(checkArmed, 120);
+      }
+
+      function armForPlay() {
+        armedUntil = Date.now() + 1800;
+        if (!armTimer) { armTimer = setTimeout(checkArmed, 120); }
       }
 
       function state() {
@@ -1901,7 +2170,10 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       }
 
       // A tap on the playing picture is the host's show/hide switch. A tap on
-      // the page before the window exists is the only way in.
+      // the page before the window exists is the only way in — and it does not
+      // have to land on the <video> itself: HLS players draw their own control
+      // bar over it, so the picture under the finger (or in the same player
+      // box) is what gets taken over.
       document.addEventListener('click', function (e) {
         if (theater && document.contains(theater)) {
           if (Date.now() < suppressUntil) { return; }
@@ -1912,7 +2184,30 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         }
         if (theater) { leave(false); }
         var el = videoOf(e.target, e);
-        if (!el) { return; }
+        if (!el) {
+          var picked = videoAt(e.clientX, e.clientY);
+          if (picked && worthTaking(picked, e.target, true)) {
+            if (e.cancelable) { e.preventDefault(); }
+            e.stopPropagation();
+            handOver(picked);
+            return;
+          }
+          if (playerish(e.target)) {
+            picked = videoNearPoint(e.clientX, e.clientY) ||
+                     videoNear(e.target);
+            if (picked && worthTaking(picked, e.target, false)) {
+              if (e.cancelable) { e.preventDefault(); }
+              e.stopPropagation();
+              handOver(picked);
+              return;
+            }
+          }
+          // The player has not built its <video> yet, or will start it on the
+          // next tick. Watch for it briefly instead of giving up on this tap;
+          // a tap on unrelated page furniture does not arm the watch.
+          if (playerish(e.target) || picked) { armForPlay(); }
+          return;
+        }
         // The tap means "play this here". Letting the page see the same click
         // would let a click-to-toggle player undo the play() below inside the
         // same event, leaving the window open and paused.
@@ -1933,9 +2228,15 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                 position: el.currentTime || 0,
                 duration: isFinite(el.duration) ? el.duration : 0,
                 width: el.videoWidth || 0, height: el.videoHeight || 0,
-                url: mediaUrl()});
+                url: mediaUrl(), referer: location.href});
         play(el);
-        try { parent.postMessage({__soVideo: 'enter'}, '*'); } catch (err) {}
+        try {
+          parent.postMessage({__soVideo: 'enter',
+                              width: el.videoWidth || 0,
+                              height: el.videoHeight || 0,
+                              url: mediaUrl(),
+                              referer: location.href}, '*');
+        } catch (err) {}
       }, true);
 
       window.addEventListener('message', function (e) {
@@ -1951,7 +2252,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
               break;
             }
           }
-          report({kind: 'enter', paused: false, position: 0, duration: 0});
+          report({kind: 'enter', paused: false, position: 0, duration: 0,
+                  width: data.width || 0, height: data.height || 0,
+                  url: data.url || '', referer: data.referer || ''});
           return;
         }
         if (data.__soVideo === 'exit') {
@@ -2098,6 +2401,28 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           try { parent.postMessage({__soVideo: 'exit'}, '*'); } catch (e) {}
         }
       });
+
+      // Reading a frame from the element is the only way to get the picture
+      // itself: a WebView snapshot sees the composited layers, and the video
+      // layer is not one of them. A cross-origin file taints the canvas, so
+      // this returns nothing and the host decodes the stream instead.
+      window.__soCaptureFrame = function () {
+        if (!video || !video.videoWidth || !video.videoHeight) { return ''; }
+        if (video.readyState < 2) { return ''; }
+        var width = video.videoWidth, height = video.videoHeight;
+        var scale = Math.min(1, 1920 / Math.max(width, height));
+        var canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        var context = null;
+        try { context = canvas.getContext('2d'); } catch (e) {}
+        if (!context) { return ''; }
+        try {
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        } catch (e) { return ''; }
+        try { return canvas.toDataURL('image/jpeg', 0.95); }
+        catch (e) { return ''; }
+      };
 
       window.__soVideo = {
         seekBy: function (seconds) {
