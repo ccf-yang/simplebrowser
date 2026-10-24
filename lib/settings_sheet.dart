@@ -25,6 +25,7 @@ class SettingsValues {
     required this.showPanel,
     required this.blockExternal,
     required this.askExternal,
+    required this.blockExternalHint,
     required this.adBlock,
     this.action,
   });
@@ -40,6 +41,10 @@ class SettingsValues {
   /// Ask before an app jump happens instead of dropping it silently, so the
   /// answer can be remembered per protocol (允许 / 总是允许 / 拷贝 / 不允许).
   final bool askExternal;
+
+  /// Show a one-line hint at the bottom when a jump to another app was
+  /// stopped, so a tap that went nowhere explains itself.
+  final bool blockExternalHint;
 
   /// Install the WebKit content-blocker list for every page.
   final bool adBlock;
@@ -62,6 +67,7 @@ class SettingsSheet extends StatefulWidget {
     required this.onShowPanelChanged,
     required this.onBlockExternalChanged,
     required this.onAskExternalChanged,
+    required this.onBlockExternalHintChanged,
     required this.adBlockEnabled,
     this.adBlockStatus = '',
     this.webDavSummary = '未配置',
@@ -80,6 +86,10 @@ class SettingsSheet extends StatefulWidget {
   /// Turns the "ask before opening an app" dialog on or off. Live, like the
   /// stay-in-app switch: the sheet can be open while a page tries to leave.
   final ValueChanged<bool> onAskExternalChanged;
+
+  /// Turns the bottom hint about a stopped app jump on or off. Live, so the
+  /// next attempt already follows the switch.
+  final ValueChanged<bool> onBlockExternalHintChanged;
 
   /// Current state plus a short line about the compiled rule set, e.g.
   /// `53283 rules ready` or `compile failed`.
@@ -110,6 +120,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
   late bool _showPanel = widget.initial.showPanel;
   late bool _blockExternal = widget.initial.blockExternal;
   late bool _askExternal = widget.initial.askExternal;
+  late bool _blockExternalHint = widget.initial.blockExternalHint;
   late bool _adBlock = widget.initial.adBlock;
   late final TextEditingController _cookie =
       TextEditingController(text: widget.initial.cookie);
@@ -129,6 +140,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
         showPanel: _showPanel,
         blockExternal: _blockExternal,
         askExternal: _askExternal,
+        blockExternalHint: _blockExternalHint,
         adBlock: _adBlock,
         action: action,
       ),
@@ -236,6 +248,8 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   _buildStayInAppSwitch(),
                   const SizedBox(height: 8),
                   _buildAskExternalSwitch(),
+                  const SizedBox(height: 8),
+                  _buildBlockHintSwitch(),
                   const SizedBox(height: 8),
                   _buildExternalDecisions(),
                   const SizedBox(height: 8),
@@ -345,8 +359,17 @@ class _SettingsSheetState extends State<SettingsSheet> {
     },
   );
 
-  Widget _buildExternalDecisions() => Container(
-    padding: const EdgeInsets.fromLTRB(12, 9, 4, 9),
+  Widget _buildBlockHintSwitch() => _SwitchRow(
+    title: '拦截时提示',
+    subtitle: '页面想打开 baidu:// 这类应用被拦下时，底部提示一行',
+    value: _blockExternalHint,
+    onChanged: (value) {
+      setState(() => _blockExternalHint = value);
+      widget.onBlockExternalHintChanged(value);
+    },
+  );
+
+  Widget _buildExternalDecisions() => Container(    padding: const EdgeInsets.fromLTRB(12, 9, 4, 9),
     decoration: BoxDecoration(
       color: AppColors.card,
       border: Border.all(color: AppColors.line2),

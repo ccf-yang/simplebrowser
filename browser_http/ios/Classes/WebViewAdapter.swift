@@ -1483,8 +1483,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
 
     /// Loads a link the page wanted to open in a new window into this one.
     /// One request per tap: the page may report the same URL twice (a click
-    /// and its own `window.open`).
-    private func openInPlace(_ url: URL) {
+    /// and its own `window.open`), and the policy hook may see the request the
+    /// tap already started.
+    ///
+    /// The request is reused, not rebuilt from its URL, so the method and the
+    /// headers the page set survive when the policy hook is the one calling.
+    private func openInPlace(_ request: URLRequest) {
+        guard let url = request.url else { return }
         let target = url.absoluteString
         let now = Date()
         if lastOpenURL == target, now.timeIntervalSince(lastOpenAt) < 1.2 {
@@ -1493,14 +1498,20 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         lastOpenURL = target
         lastOpenAt = now
         if webView.url?.absoluteString == target { return }
-        var request = URLRequest(url: url)
-        if let from = webView.url?.absoluteString, from.hasPrefix("http") {
-            request.setValue(from, forHTTPHeaderField: "Referer")
+        var outbound = request
+        if outbound.value(forHTTPHeaderField: "Referer") == nil,
+           let from = webView.url?.absoluteString, from.hasPrefix("http") {
+            outbound.setValue(from, forHTTPHeaderField: "Referer")
         }
-        loadInApp(request)
-        reportNavigation(kind: "in-app", url: url, method: "GET",
+        loadInApp(outbound)
+        reportNavigation(kind: "in-app", url: url,
+                         method: (request.httpMethod ?? "GET").uppercased(),
                          mainFrame: true, type: "other",
                          message: "new-window link opened in place")
+    }
+
+    private func openInPlace(_ url: URL) {
+        openInPlace(URLRequest(url: url))
     }
 
     /// Remembers the user's answer to a certificate warning and reloads the
@@ -1576,7 +1587,22 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             }
             reportNavigation(kind: "blocked", url: url, method: method,
                              mainFrame: targetsMainFrame, type: type,
-                             message: "external app jump blocked")
+                             message: "external app jump blocked (\(jump.scheme)://)")
+            return
+        }
+
+        // A link that asked for another window (`target="_blank"`, a `<base
+        // target>` or `window.open`) has no window here to go to. With no
+        // window to hand back, WebKit drops the request: the tap simply does
+        // nothing. Load the same request in this WebView instead. The
+        // page-side tap hook usually gets there first; the 1.2 s dedupe in
+        // `openInPlace` keeps the two from loading it twice.
+        if opensWindow, scheme == "http" || scheme == "https" {
+            decisionHandler(.cancel)
+            let request = navigationAction.request
+            DispatchQueue.main.async { [weak self] in
+                self?.openInPlace(request)
+            }
             return
         }
 
@@ -1587,8 +1613,8 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         // tap to die: a re-issue dropped with the cancelled navigation, a
         // wrapper entry left in history, or a page firing two jumps that
         // cancelled each other. Safari and every other browser simply allow
-        // it; this one does the same. `target="_blank"` is still kept in-app
-        // by `createWebViewWith` below.
+        // it; this one does the same. `target="_blank"` is kept in-app by the
+        // new-window branch above (and by `createWebViewWith` as a fallback).
 
         reportNavigation(kind: "start", url: url, method: method,
                          mainFrame: targetsMainFrame, type: type)
@@ -1683,7 +1709,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                 } else {
                     reportNavigation(kind: "blocked", url: url, method: method,
                                      mainFrame: true, type: type,
-                                     message: "external app jump blocked (new window)")
+                                     message: "external app jump blocked (\(jump.scheme)://, new window)")
                 }
             } else {
                 // A `target="_blank"` link: WebKit has no window to give us,
@@ -1907,8 +1933,16 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         }
       }, {passive: true});
       document.addEventListener('touchend', function (e) {
-        if (held) { e.preventDefault(); held = null; }
+        if (held) { e.preventDefault(); held = null; reset(); return; }
+        // A page that handles taps itself can cancel the synthetic click,
+        // leaving a new-window link doing nothing. Send the destination
+        // from the touch as well; the host dedupes the two reports.
+        var tapped = anchor;
         reset();
+        if (!tapped) { return; }
+        var want = (tapped.getAttribute('target') || '').trim().toLowerCase();
+        if (want !== '_blank' && want !== '_new') { return; }
+        openInPlace(tapped.href);
       }, false);
       document.addEventListener('touchcancel', function () { reset(); },
                                 {passive: true});
@@ -1933,7 +1967,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         if (e.defaultPrevented) { return; }
         var a = linkOf(e.target);
         if (!a) { return; }
-        var target = (a.getAttribute('target') || '').toLowerCase();
+        var target = (a.getAttribute('target') || '').trim().toLowerCase();
         if (target !== '_blank' && target !== '_new') { return; }
         if (openInPlace(a.href)) {
           e.preventDefault();

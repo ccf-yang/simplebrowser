@@ -221,6 +221,16 @@ class _BrowserPageState extends State<BrowserPage>
   final Set<String> _externalAllowed = <String>{};
   final Set<String> _externalDenied = <String>{};
 
+  /// Say so at the bottom when a jump to another app was stopped, instead of
+  /// leaving the tap looking dead. On by default so a link that does nothing
+  /// can explain itself; switchable because some pages try constantly.
+  bool _externalBlockHint = true;
+
+  /// The last hint shown, so a page retrying the same jump every second does
+  /// not turn the bottom of the screen into a flicker.
+  String _lastBlockedHint = '';
+  DateTime _lastBlockedHintAt = DateTime.fromMillisecondsSinceEpoch(0);
+
   /// One question at a time — a page that fires three app jumps in a row must
   /// not stack three sheets.
   bool _externalDialogOpen = false;
@@ -983,11 +993,13 @@ class _BrowserPageState extends State<BrowserPage>
   Future<void> _loadExternalDecisions() async {
     final prefs = await _readPrefs();
     final ask = prefs['externalAsk'];
+    final hint = prefs['externalBlockHint'];
     final allowed = prefs['externalAllowSchemes'];
     final denied = prefs['externalDenySchemes'];
     if (!mounted) return;
     setState(() {
       _externalAsk = ask is bool ? ask : true;
+      _externalBlockHint = hint is bool ? hint : true;
       _externalAllowed
         ..clear()
         ..addAll(_schemeList(allowed));
@@ -1008,6 +1020,7 @@ class _BrowserPageState extends State<BrowserPage>
   Future<void> _saveExternalDecisions() async {
     final error = await _setPrefs(<String, Object?>{
       'externalAsk': _externalAsk,
+      'externalBlockHint': _externalBlockHint,
       'externalAllowSchemes': _externalAllowed.toList()..sort(),
       'externalDenySchemes': _externalDenied.toList()..sort(),
     });
@@ -1075,6 +1088,47 @@ class _BrowserPageState extends State<BrowserPage>
     setState(() => _externalAsk = value);
     unawaited(_saveExternalDecisions());
     _applyNavigationPolicyToAllWindows();
+  }
+
+  /// The bottom hint for stopped app jumps, live like the other two switches.
+  void _setExternalBlockHint(bool value) {
+    if (_externalBlockHint == value) return;
+    setState(() => _externalBlockHint = value);
+    unawaited(_saveExternalDecisions());
+  }
+
+  /// A page aimed at another app and the navigation is already cancelled. One
+  /// line at the bottom names the protocol, so a tap that went nowhere says why
+  /// instead of looking broken.
+  void _hintBlockedJump(WebViewNavigationEvent event) {
+    final message = event.message ?? '';
+    final scheme = _blockedScheme(event, message);
+    if (scheme == null) return;
+    final now = DateTime.now();
+    if (scheme == _lastBlockedHint &&
+        now.difference(_lastBlockedHintAt) < const Duration(seconds: 6)) {
+      return;
+    }
+    _lastBlockedHint = scheme;
+    _lastBlockedHintAt = now;
+    if (message.contains('本机没有应用')) {
+      _snack('没有应用能打开 $scheme://');
+      return;
+    }
+    final name = externalAppName(scheme);
+    _snack('已阻止跳转到$name（$scheme://）');
+  }
+
+  /// Which protocol the blocked jump was aimed at. The message names it,
+  /// because the event URL may be the https wrapper page that carried the jump.
+  static String? _blockedScheme(WebViewNavigationEvent event, String message) {
+    final match = RegExp(
+      r'([a-zA-Z][a-zA-Z0-9+.\-]*)://',
+    ).firstMatch(message);
+    final scheme =
+        (match?.group(1) ?? Uri.tryParse(event.url)?.scheme ?? '').toLowerCase();
+    if (scheme.isEmpty || scheme == 'http' || scheme == 'https') return null;
+    return scheme;
   }
 
   /// Clears both lists: every protocol is asked about again.
@@ -1220,6 +1274,12 @@ class _BrowserPageState extends State<BrowserPage>
                 ? 'error'
                 : 'info',
       );
+    }
+
+    // A stopped jump says so at the bottom when the hint is on: otherwise the
+    // tap looks dead and the only clue is a console line nobody has open.
+    if (event.isBlocked && active && _externalBlockHint) {
+      _hintBlockedJump(event);
     }
 
     // Ask the user, but only about the window they are looking at: a background
@@ -1795,6 +1855,7 @@ class _BrowserPageState extends State<BrowserPage>
           showPanel: _panelPreference,
           blockExternal: _blockExternal,
           askExternal: _externalAsk,
+          blockExternalHint: _externalBlockHint,
           adBlock: _adBlockEnabled,
         ),
         uaLabels: <String>[for (final preset in _uaPresets) preset.label],
@@ -1807,6 +1868,7 @@ class _BrowserPageState extends State<BrowserPage>
         onShowPanelChanged: _setPanelVisible,
         onBlockExternalChanged: _setBlockExternal,
         onAskExternalChanged: _setAskExternal,
+        onBlockExternalHintChanged: _setExternalBlockHint,
         externalDecisions: _externalDecisionSummary,
         onResetExternalDecisions: _resetExternalDecisions,
       ),
@@ -1821,6 +1883,7 @@ class _BrowserPageState extends State<BrowserPage>
           : _RefererMode.none;
       _blockExternal = result.blockExternal;
       _externalAsk = result.askExternal;
+      _externalBlockHint = result.blockExternalHint;
     });
     if (adBlockChanged) {
       _snack(result.adBlock ? '正在启用广告拦截…' : '已关闭广告拦截');
