@@ -125,6 +125,10 @@ class _SettingsSheetState extends State<SettingsSheet> {
   late final TextEditingController _cookie =
       TextEditingController(text: widget.initial.cookie);
 
+  /// Horizontal travel of the current swipe, accumulated so a short but
+  /// deliberate drag also closes the sheet.
+  double _swipeDx = 0;
+
   @override
   void dispose() {
     _cookie.dispose();
@@ -180,97 +184,117 @@ class _SettingsSheetState extends State<SettingsSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
+    final media = MediaQuery.of(context);
+    final bottomInset = media.viewInsets.bottom;
+    // Capped at three quarters of the screen: the header, the close button and
+    // the status bar must stay apart even when the content is long. Anything
+    // past the cap scrolls.
+    final maxHeight = media.size.height * 0.75;
     return Padding(
       padding: EdgeInsets.only(bottom: bottomInset),
       child: Material(
         color: Colors.transparent,
-        child: Container(
-          decoration: const BoxDecoration(
-            color: AppColors.surface,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-          ),
-          padding: const EdgeInsets.fromLTRB(18, 8, 18, 0),
-          child: SafeArea(
-            top: false,
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.only(bottom: 24),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  Center(
-                    child: Container(
-                      width: 36,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: AppColors.line2,
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+        child: GestureDetector(
+          // A left swipe is the iOS way out of a sheet; a fling is enough even
+          // when the finger barely moved, so the sheet can always be closed.
+          onHorizontalDragStart: (_) => _swipeDx = 0,
+          onHorizontalDragUpdate: (details) => _swipeDx += details.delta.dx,
+          onHorizontalDragEnd: (details) {
+            final fling = details.primaryVelocity ?? 0;
+            if (_swipeDx < -72 || fling < -420) {
+              Navigator.of(context).maybePop();
+            }
+          },
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: maxHeight),
+            child: Container(
+              decoration: const BoxDecoration(
+                color: AppColors.surface,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+              ),
+              padding: const EdgeInsets.fromLTRB(18, 8, 18, 0),
+              child: SafeArea(
+                top: false,
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.only(bottom: 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
-                      const Expanded(
-                        child: Text(
-                          'Settings',
-                          style: TextStyle(
-                            fontSize: 19,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: -0.3,
+                      Center(
+                        child: Container(
+                          width: 36,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: AppColors.line2,
+                            borderRadius: BorderRadius.circular(2),
                           ),
                         ),
                       ),
-                      _CloseButton(onTap: () => Navigator.of(context).pop()),
-                    ],
-                  ),
-                  const SizedBox(height: 4),
-                  const Text(
-                    'Request identity is applied to both WKWebView navigation '
-                    'and the native engine capture.',
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      height: 1.55,
-                      color: AppColors.muted,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  const _FieldLabel('Request identity'),
-                  const SizedBox(height: 5),
-                  _IdentityTile(
-                    summary: _identitySummary,
-                    onTap: () => unawaited(_openIdentity()),
-                  ),
-                  const SizedBox(height: 10),
-                  _buildPanelSwitch(),
-                  const SizedBox(height: 8),
-                  _buildStayInAppSwitch(),
-                  const SizedBox(height: 8),
-                  _buildAskExternalSwitch(),
-                  const SizedBox(height: 8),
-                  _buildBlockHintSwitch(),
-                  const SizedBox(height: 8),
-                  _buildExternalDecisions(),
-                  const SizedBox(height: 8),
-                  _buildAdBlockSwitch(),
-                  const SizedBox(height: 14),
-                  const _FieldLabel('Storage'),
-                  const SizedBox(height: 5),
-                  _IdentityTile(
-                    title: 'WebDAV 存储',
-                    icon: Icons.cloud_outlined,
-                    summary: widget.webDavSummary,
-                    onTap: () => _save(SettingsAction.openWebDav),
-                  ),
-                  const SizedBox(height: 14),
-                  const _FieldLabel('Browsing'),
-                  const SizedBox(height: 5),
-                  Row(
-                    children: <Widget>[
-                      Expanded(
-                        child: _ActionTile(
-                          icon: Icons.home_rounded,
+                      const SizedBox(height: 14),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          const Expanded(
+                            child: Text(
+                              'Settings',
+                              style: TextStyle(
+                                fontSize: 19,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: -0.3,
+                              ),
+                            ),
+                          ),
+                          _CloseButton(
+                            onTap: () => Navigator.of(context).pop(),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'Request identity is applied to both WKWebView navigation '
+                        'and the native engine capture.',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          height: 1.55,
+                          color: AppColors.muted,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      const _FieldLabel('Request identity'),
+                      const SizedBox(height: 5),
+                      _IdentityTile(
+                        summary: _identitySummary,
+                        onTap: () => unawaited(_openIdentity()),
+                      ),
+                      const SizedBox(height: 10),
+                      _buildPanelSwitch(),
+                      const SizedBox(height: 8),
+                      _buildStayInAppSwitch(),
+                      const SizedBox(height: 8),
+                      _buildAskExternalSwitch(),
+                      const SizedBox(height: 8),
+                      _buildBlockHintSwitch(),
+                      const SizedBox(height: 8),
+                      _buildExternalDecisions(),
+                      const SizedBox(height: 8),
+                      _buildAdBlockSwitch(),
+                      const SizedBox(height: 14),
+                      const _FieldLabel('Storage'),
+                      const SizedBox(height: 5),
+                      _IdentityTile(
+                        title: 'WebDAV 存储',
+                        icon: Icons.cloud_outlined,
+                        summary: widget.webDavSummary,
+                        onTap: () => _save(SettingsAction.openWebDav),
+                      ),
+                      const SizedBox(height: 14),
+                      const _FieldLabel('Browsing'),
+                      const SizedBox(height: 5),
+                      Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: _ActionTile(
+                              icon: Icons.home_rounded,
                           label: 'Home',
                           onTap: () => _save(SettingsAction.goHome),
                         ),
@@ -320,7 +344,9 @@ class _SettingsSheetState extends State<SettingsSheet> {
                       label: const Text('Save & reload'),
                     ),
                   ),
-                ],
+                    ],
+                  ),
+                ),
               ),
             ),
           ),
