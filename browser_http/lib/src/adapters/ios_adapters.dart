@@ -14,6 +14,7 @@ import '../domain/models/session_snapshot.dart';
 import '../domain/models/transport.dart';
 import '../domain/models/webview_link_press.dart';
 import '../domain/models/webview_navigation_event.dart';
+import '../domain/models/webview_video_event.dart';
 import '../ffi/api/profile.dart' as ffi_profile;
 import '../ffi/api/transport.dart' as ffi_transport;
 import '../ffi/frb_generated.dart' show RustLib;
@@ -349,6 +350,8 @@ final class _ChannelWebViewAdapter implements WebViewPort {
       StreamController<WebViewNavigationEvent>.broadcast();
   final StreamController<WebViewLinkPress> _linkPressEvents =
       StreamController<WebViewLinkPress>.broadcast();
+  final StreamController<WebViewVideoEvent> _videoEvents =
+      StreamController<WebViewVideoEvent>.broadcast();
 
   Future<void> _handleNativeCall(MethodCall call) async {
     final raw = call.arguments;
@@ -365,6 +368,10 @@ final class _ChannelWebViewAdapter implements WebViewPort {
       case 'linkPress':
         _linkPressEvents.add(
           WebViewLinkPress.fromJson(raw.cast<String, Object?>()),
+        );
+      case 'videoEvent':
+        _videoEvents.add(
+          WebViewVideoEvent.fromJson(raw.cast<String, Object?>()),
         );
       default:
         break;
@@ -392,6 +399,7 @@ final class _ChannelWebViewAdapter implements WebViewPort {
       _networkEvents.stream,
       _navigationEvents.stream,
       _linkPressEvents.stream,
+      _videoEvents.stream,
     );
   }
 
@@ -406,6 +414,7 @@ final class _ChannelWebViewSession implements WebViewSession {
     this._allNetworkEvents,
     this._allNavigationEvents,
     this._allLinkPresses,
+    this._allVideoEvents,
   );
 
   final MethodChannel _channel;
@@ -413,6 +422,7 @@ final class _ChannelWebViewSession implements WebViewSession {
   final Stream<PageNetworkEvent> _allNetworkEvents;
   final Stream<WebViewNavigationEvent> _allNavigationEvents;
   final Stream<WebViewLinkPress> _allLinkPresses;
+  final Stream<WebViewVideoEvent> _allVideoEvents;
 
   @override
   String get id => _id;
@@ -428,6 +438,10 @@ final class _ChannelWebViewSession implements WebViewSession {
   @override
   Stream<WebViewLinkPress> get linkPresses =>
       _allLinkPresses.where((press) => press.sessionId == _id);
+
+  @override
+  Stream<WebViewVideoEvent> get videoEvents =>
+      _allVideoEvents.where((event) => event.sessionId == _id);
 
   @override
   Future<Uint8List?> snapshot({int maxWidth = 360}) async {

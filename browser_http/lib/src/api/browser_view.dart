@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../domain/models/page_network_event.dart';
 import '../domain/models/webview_link_press.dart';
 import '../domain/models/webview_navigation_event.dart';
+import '../domain/models/webview_video_event.dart';
 import '../ports/webview_port.dart';
 import 'browser_session.dart';
 
@@ -35,9 +36,12 @@ final class BrowserController extends ChangeNotifier {
       StreamController<WebViewNavigationEvent>.broadcast();
   final StreamController<WebViewLinkPress> _linkPresses =
       StreamController<WebViewLinkPress>.broadcast();
+  final StreamController<WebViewVideoEvent> _videoEvents =
+      StreamController<WebViewVideoEvent>.broadcast();
   StreamSubscription<PageNetworkEvent>? _networkSubscription;
   StreamSubscription<WebViewNavigationEvent>? _navigationSubscription;
   StreamSubscription<WebViewLinkPress>? _linkPressSubscription;
+  StreamSubscription<WebViewVideoEvent>? _videoSubscription;
 
   String? _url;
   String? _title;
@@ -83,6 +87,13 @@ final class BrowserController extends ChangeNotifier {
   /// long-press menu has no idea a browser can have a second window.
   Stream<WebViewLinkPress> get linkPresses => _linkPresses.stream;
 
+  /// Player-window reports from the page: the theater was entered or left, or
+  /// playback state changed.
+  ///
+  /// The WebView keeps playing the page's own `<video>`; the host draws the
+  /// controls around it and talks back through `window.__soVideo`.
+  Stream<WebViewVideoEvent> get videoEvents => _videoEvents.stream;
+
   /// Creates the WKWebView and navigates to [initialUri] when given.
   ///
   /// Safe to call repeatedly; only the first call creates the native session.
@@ -113,6 +124,9 @@ final class BrowserController extends ChangeNotifier {
       _navigationSubscription ??= webView.navigationEvents.listen(_onWebViewEvent);
       _linkPressSubscription ??= webView.linkPresses.listen((press) {
         if (!_linkPresses.isClosed) _linkPresses.add(press);
+      });
+      _videoSubscription ??= webView.videoEvents.listen((event) {
+        if (!_videoEvents.isClosed) _videoEvents.add(event);
       });
       if (!_pageNetwork) await webView.setPageNetworkEnabled(false);
       if (_contentBlocking) await webView.setContentBlockingEnabled(true);
@@ -457,9 +471,12 @@ final class BrowserController extends ChangeNotifier {
     _navigationSubscription = null;
     unawaited(_linkPressSubscription?.cancel());
     _linkPressSubscription = null;
+    unawaited(_videoSubscription?.cancel());
+    _videoSubscription = null;
     unawaited(_networkEvents.close());
     unawaited(_navigationEvents.close());
     unawaited(_linkPresses.close());
+    unawaited(_videoEvents.close());
     super.dispose();
   }
 }

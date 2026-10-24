@@ -38,6 +38,12 @@ public final class BrowserHttpPlugin: NSObject, FlutterPlugin {
       self?.webChannel.invokeMethod("linkPress", arguments: event)
     }
 
+    // The page's video: opened, closed, or the playhead moved. The player
+    // window is host UI, so its state belongs on the same channel.
+    webViewBridge.onVideoEvent = { [weak self] event in
+      self?.webChannel.invokeMethod("videoEvent", arguments: event)
+    }
+
     let cookies = FlutterMethodChannel(
       name: "browser_http/cookies", binaryMessenger: messenger)
     cookies.setMethodCallHandler { [weak self] call, result in

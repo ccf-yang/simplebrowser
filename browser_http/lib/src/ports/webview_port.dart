@@ -5,6 +5,7 @@ import '../domain/models/browser_cookie.dart';
 import '../domain/models/page_network_event.dart';
 import '../domain/models/webview_link_press.dart';
 import '../domain/models/webview_navigation_event.dart';
+import '../domain/models/webview_video_event.dart';
 
 /// One entry from the page's `PerformanceResourceTiming` list.
 ///
@@ -144,6 +145,15 @@ abstract interface class WebViewSession {
   /// itself: WebKit's long-press menu cannot offer a command it does not know
   /// about, and the page script is the only place that sees the hold.
   Stream<WebViewLinkPress> get linkPresses;
+
+  /// The page's video, for a host that draws its own player window.
+  ///
+  /// The page keeps the picture — WebKit stays the player — and this stream
+  /// says when the user tapped a video, where the playhead is, and when the
+  /// window was closed. Drive it with
+  /// `evaluate('window.__soVideo.seekBy(seconds)')`,
+  /// `window.__soVideo.toggle()` and `window.__soVideo.close()`.
+  Stream<WebViewVideoEvent> get videoEvents;
 
   /// PNG of what the WebView is showing, scaled down to at most [maxWidth]
   /// pixels wide, or `null` when there is nothing to render.

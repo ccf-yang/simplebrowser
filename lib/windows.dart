@@ -34,6 +34,7 @@ final class BrowseWindow {
   StreamSubscription<WebViewNavigationEvent>? _navigationSubscription;
   StreamSubscription<PageNetworkEvent>? _pageSubscription;
   StreamSubscription<WebViewLinkPress>? _linkSubscription;
+  StreamSubscription<WebViewVideoEvent>? _videoSubscription;
   VoidCallback? _listener;
 
   bool get isBlank => url.isEmpty || url == 'about:blank';
@@ -79,9 +80,11 @@ final class BrowseWindow {
     unawaited(_navigationSubscription?.cancel());
     unawaited(_pageSubscription?.cancel());
     unawaited(_linkSubscription?.cancel());
+    unawaited(_videoSubscription?.cancel());
     _navigationSubscription = null;
     _pageSubscription = null;
     _linkSubscription = null;
+    _videoSubscription = null;
     controller.dispose();
   }
 }
@@ -97,6 +100,7 @@ final class WindowStore {
     required this.onNavigation,
     required this.onPageEvent,
     required this.onLinkPress,
+    required this.onVideoState,
     required this.onRedraw,
   });
 
@@ -123,6 +127,9 @@ final class WindowStore {
 
   /// The user pressed and held a link in this window.
   final void Function(BrowseWindow window, WebViewLinkPress press) onLinkPress;
+
+  /// The player window of this page opened, closed, or reported playback.
+  final void Function(BrowseWindow window, WebViewVideoEvent event) onVideoState;
 
   /// Something worth repainting (a thumbnail landed).
   final VoidCallback onRedraw;
@@ -160,6 +167,9 @@ final class WindowStore {
     window._pageSubscription = controller.networkEvents.listen(onPageEvent);
     window._linkSubscription = controller.linkPresses.listen((press) {
       onLinkPress(window, press);
+    });
+    window._videoSubscription = controller.videoEvents.listen((event) {
+      onVideoState(window, event);
     });
 
     _list.add(window);

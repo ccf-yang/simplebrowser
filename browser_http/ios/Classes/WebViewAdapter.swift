@@ -24,6 +24,10 @@ final class WebViewBridge {
     /// one, and WebKit's own preview menu has no such item.
     var onLinkPress: (([String: Any]) -> Void)?
 
+    /// Forwards what the page's video is doing. The host draws the player
+    /// controls, so it needs to know when a video was tapped and where it is.
+    var onVideoEvent: (([String: Any]) -> Void)?
+
     /// Looks up an existing session so `UiKitView` can host the *same*
     /// WKWebView that will later export clearance cookies.
     func webView(for id: String) -> WKWebView? {
@@ -78,6 +82,9 @@ final class WebViewBridge {
             }
             holder.onLinkPress = { [weak self] event in
                 self?.onLinkPress?(event)
+            }
+            holder.onVideoEvent = { [weak self] event in
+                self?.onVideoEvent?(event)
             }
             if let userAgent { holder.webView.customUserAgent = userAgent }
             sessions[id] = holder
@@ -445,11 +452,16 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// A link the user pressed and held, so the host can offer its own
     /// "open in a new window" choice for it.
     var onLinkPress: (([String: Any]) -> Void)?
+    /// The page's video: the player window opened/closed, or the playhead moved.
+    var onVideoEvent: (([String: Any]) -> Void)?
     private var loadCompletion: ((Error?) -> Void)?
     fileprivate var lastStatusCode: Int?
 
     private static let networkHandlerName = "browserHttpNet"
     private static let tapHandlerName = "browserHttpTap"
+    /// Playback of the page's own video, reported from the video script: the
+    /// player window opened or closed, and where the playhead is.
+    private static let videoHandlerName = "browserHttpVideo"
 
     /// Cancels any navigation whose scheme is not http(s)/in-app, so a link can
     /// never hand the URL over to another app (`baidu://`, `weixin://`,
@@ -585,6 +597,17 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         // Persistent store is mandatory: ephemeral stores break clearance reuse.
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        // On an iPhone a <video> otherwise hands itself to the system player
+        // the moment it starts, and that player is also what comes back when
+        // the page resumes the element later: the picture leaves this WebView,
+        // so the app can neither put its own controls around it nor keep it
+        // from reappearing while the user scrolls. Inline playback keeps the
+        // video in the page, where the video script can size it and the host
+        // can draw a control bar over it.
+        config.allowsInlineMediaPlayback = true
+        // Nothing plays on its own — not on load and not when a page calls
+        // play() on scroll. Sound starts from a tap or not at all.
+        config.mediaTypesRequiringUserActionForPlayback = .all
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         webView.navigationDelegate = self
@@ -599,6 +622,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         webView.configuration.userContentController.add(
             WeakScriptMessageHandler(delegate: self),
             name: WebViewHolder.tapHandlerName)
+        webView.configuration.userContentController.add(
+            WeakScriptMessageHandler(delegate: self),
+            name: WebViewHolder.videoHandlerName)
 
         // Visible WebViews are user-driven (challenge page or browser tab);
         // swipe back/forward should behave like Safari.
@@ -617,6 +643,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         // link in another window is wanted whether or not anything is collected.
         controller.addUserScript(WKUserScript(
             source: WebViewHolder.tapScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false))
+        // Video ownership is not a Page-tab setting: whichever pages are open,
+        // a video must not be able to take the screen with the system player
+        // the app cannot put controls around.
+        controller.addUserScript(WKUserScript(
+            source: WebViewHolder.videoScript,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false))
         guard pageNetworkEnabled else { return }
@@ -1255,6 +1288,12 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             onLinkPress?(body)
             return
         }
+        if message.name == WebViewHolder.videoHandlerName {
+            guard var body = message.body as? [String: Any] else { return }
+            body["sessionId"] = id
+            onVideoEvent?(body)
+            return
+        }
         // The hooks stay installed in documents loaded while the Page tab was
         // open; their events are dropped as soon as it closes.
         guard message.name == WebViewHolder.networkHandlerName,
@@ -1463,6 +1502,327 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       document.addEventListener('contextmenu', function (e) {
         if (linkOf(e.target)) { e.preventDefault(); }
       }, false);
+    })();
+    """#
+
+    /// Owns the page's video: a tap on a video hands the picture to the app's
+    /// player window instead of WebKit's system player, which the app cannot
+    /// put controls around and which comes back on its own whenever the page
+    /// resumes the element.
+    ///
+    /// The video keeps playing inside the page — stretched over the viewport,
+    /// at the top of the stacking order — so every stream WebKit can play
+    /// (progressive MP4, HLS, MSE) keeps working. The host draws its bar over
+    /// it and drives it through `window.__soVideo`.
+    ///
+    /// A video inside a cross-origin iframe cannot stretch past the frame, so
+    /// the frame reports upwards and the *top* document stretches the iframe
+    /// itself. Only a tap opens the window; nothing here reacts to a page that
+    /// starts playing by itself.
+    private static let videoScript = #"""
+    (function () {
+      if (window.__soVideoInstalled) { return; }
+      window.__soVideoInstalled = true;
+      var isTop = window.top === window;
+      var video = null;        // the element this frame has taken over
+      var theater = null;      // the element stretched over the viewport
+      var savedStyle = null;   // its inline style before we changed it
+      var child = null;        // top frame: the frame whose video is showing
+      var startY = 0, startX = 0, swiping = false;
+      var lifted = [];         // ancestors neutralised while the window is up
+
+      // Room kept free under the picture for this app's control bar. The page
+      // cannot draw there, and the bar never covers the player's own controls.
+      var BAR = 78;
+
+      function report(message) {
+        try {
+          window.webkit.messageHandlers.browserHttpVideo.postMessage(message);
+        } catch (e) {}
+      }
+
+      function state() {
+        if (!video) { return; }
+        report({
+          kind: 'state',
+          paused: !!video.paused,
+          position: video.currentTime || 0,
+          duration: isFinite(video.duration) ? video.duration : 0
+        });
+      }
+
+      function play(el) {
+        try {
+          var started = el.play();
+          if (started && started.catch) { started.catch(function () {}); }
+        } catch (e) {}
+      }
+
+      // A fixed element is still laid out inside its nearest ancestor with a
+      // transform, a filter or containment — which is exactly how a player
+      // frame is usually built. Those ancestors are neutralised for as long as
+      // the window is up and put back byte for byte on the way out.
+      function liftContainers(node) {
+        releaseContainers();
+        while (node && node.nodeType === 1) {
+          var cs = null;
+          try { cs = window.getComputedStyle(node); } catch (e) {}
+          var will = cs ? String(cs.willChange || '') : '';
+          if (cs && (cs.transform !== 'none' || cs.filter !== 'none' ||
+                     cs.perspective !== 'none' ||
+                     (cs.contain && cs.contain !== 'none') ||
+                     will.indexOf('transform') >= 0 ||
+                     will.indexOf('filter') >= 0)) {
+            lifted.push([node, node.getAttribute('style') || '']);
+            node.style.setProperty('transform', 'none', 'important');
+            node.style.setProperty('filter', 'none', 'important');
+            node.style.setProperty('perspective', 'none', 'important');
+            node.style.setProperty('contain', 'none', 'important');
+            node.style.setProperty('will-change', 'auto', 'important');
+          }
+          node = node.parentNode;
+        }
+      }
+
+      function releaseContainers() {
+        for (var i = 0; i < lifted.length; i += 1) {
+          var entry = lifted[i];
+          if (entry[1] === '') { entry[0].removeAttribute('style'); }
+          else { entry[0].setAttribute('style', entry[1]); }
+        }
+        lifted = [];
+      }
+
+      function stretch(el) {
+        if (!el || savedStyle !== null) { return; }
+        savedStyle = el.getAttribute('style') || '';
+        liftContainers(el.parentNode);
+        // The top document leaves the bottom strip to the control bar; a frame
+        // stretched inside it already ends above that strip.
+        var height = isTop ? 'calc(100vh - ' + BAR + 'px)' : '100vh';
+        // Fixed positioning leaves the page's layout and any clipping wrapper
+        // behind; touch-action:none keeps a downward swipe available to the
+        // close gesture instead of scrolling the page under the video.
+        el.setAttribute('style', savedStyle + ';'
+          + 'position:fixed!important;top:0!important;left:0!important;'
+          + 'right:0!important;bottom:auto!important;'
+          + 'width:100vw!important;height:' + height + '!important;'
+          + 'min-width:0!important;min-height:0!important;'
+          + 'max-width:none!important;max-height:none!important;'
+          + 'margin:0!important;padding:0!important;'
+          + 'transform:none!important;object-fit:contain!important;'
+          + 'background:#000!important;z-index:2147483647!important;'
+          + 'touch-action:none!important;');
+        theater = el;
+      }
+
+      function release() {
+        if (theater) {
+          if (savedStyle === '') { theater.removeAttribute('style'); }
+          else { theater.setAttribute('style', savedStyle); }
+        }
+        theater = null;
+        savedStyle = null;
+        releaseContainers();
+      }
+
+      function stop() {
+        if (video) { try { video.pause(); } catch (e) {} }
+      }
+
+      // Watch one element. Position updates arrive four times a second, the
+      // pace a progress row needs; the rest pin the bar to real playback.
+      function watch(el) {
+        if (el.__soVideoWatched) { return; }
+        el.__soVideoWatched = true;
+        var names = ['play', 'pause', 'seeked', 'ended', 'loadedmetadata'];
+        for (var i = 0; i < names.length; i += 1) {
+          el.addEventListener(names[i], function () {
+            if (el === video) { state(); }
+          }, false);
+        }
+        el.addEventListener('timeupdate', function () {
+          if (el === video) { state(); }
+        }, false);
+      }
+
+      function enter(el) {
+        video = el;
+        watch(el);
+        stretch(el);
+        report({kind: 'enter', paused: !!el.paused,
+                position: el.currentTime || 0,
+                duration: isFinite(el.duration) ? el.duration : 0});
+        play(el);
+      }
+
+      // Closes this frame's window. A frame under an iframe theater leaves the
+      // reporting to the top document, which owns the iframe's style.
+      function leave(reportExit) {
+        stop();
+        release();
+        if (reportExit !== false) { report({kind: 'exit'}); }
+      }
+
+      function close() {
+        if (!isTop) {
+          leave(false);
+          try { parent.postMessage({__soVideo: 'exit'}, '*'); } catch (e) {}
+          return;
+        }
+        if (child) {
+          var inner = child;
+          child = null;
+          try { inner.postMessage({__soVideo: 'exit'}, '*'); } catch (e) {}
+        }
+        leave(true);
+      }
+
+      function seek(el, by) {
+        var target = (el.currentTime || 0) + by;
+        var end = isFinite(el.duration) ? el.duration : 0;
+        if (end > 0) { target = Math.min(target, Math.max(0, end - 0.25)); }
+        el.currentTime = Math.max(0, target);
+        state();
+      }
+
+      function toggle(el) {
+        if (el.paused) { play(el); } else { try { el.pause(); } catch (e) {} }
+        state();
+      }
+
+      // Players built from custom elements keep the video behind a shadow
+      // root, where `target` has already been retargeted to the host; the
+      // composed path still names the real element.
+      function videoOf(node, event) {
+        if (event && event.composedPath) {
+          var path = event.composedPath();
+          for (var i = 0; i < path.length; i += 1) {
+            var step = path[i];
+            if (step && step.nodeType === 1 && step.tagName === 'VIDEO') {
+              return step;
+            }
+          }
+        }
+        while (node && node.nodeType === 1) {
+          if (node.tagName === 'VIDEO') { return node; }
+          node = node.parentNode;
+        }
+        return null;
+      }
+
+      // The only way into the player window: a tap on the video surface. A
+      // scroll produces no click, and a page that starts playing on its own
+      // never gets here.
+      document.addEventListener('click', function (e) {
+        if (theater && document.contains(theater)) { return; }
+        if (theater) { leave(false); }
+        var el = videoOf(e.target, e);
+        if (!el) { return; }
+        if (isTop) {
+          enter(el);
+          return;
+        }
+        video = el;
+        watch(el);
+        stretch(el);
+        play(el);
+        try { parent.postMessage({__soVideo: 'enter'}, '*'); } catch (err) {}
+      }, true);
+
+      window.addEventListener('message', function (e) {
+        var data = e.data;
+        if (!data || !data.__soVideo) { return; }
+        if (data.__soVideo === 'enter') {
+          if (!isTop) { return; }
+          child = e.source;
+          var frames = document.getElementsByTagName('iframe');
+          for (var i = 0; i < frames.length; i += 1) {
+            if (frames[i].contentWindow === e.source) {
+              stretch(frames[i]);
+              break;
+            }
+          }
+          report({kind: 'enter', paused: false, position: 0, duration: 0});
+          return;
+        }
+        if (data.__soVideo === 'exit') {
+          if (isTop) {
+            child = null;
+            release();
+            report({kind: 'exit'});
+          } else if (video) {
+            leave(false);
+          }
+          return;
+        }
+        if (!isTop && video) {
+          if (data.__soVideo === 'seekBy') { seek(video, data.by || 0); }
+          else if (data.__soVideo === 'toggle') { toggle(video); }
+        }
+      }, false);
+
+      // Swipe down on the playing video closes the window. 16 px are enough to
+      // claim the gesture and keep the page's own seek/brightness drag from
+      // fighting it; 96 px commit the close.
+      document.addEventListener('touchstart', function (e) {
+        if (!theater || e.touches.length !== 1) { swiping = false; return; }
+        swiping = true;
+        startY = e.touches[0].clientY;
+        startX = e.touches[0].clientX;
+      }, {passive: true, capture: true});
+      document.addEventListener('touchmove', function (e) {
+        if (!swiping || !theater || e.touches.length !== 1) { return; }
+        var t = e.touches[0];
+        var dy = t.clientY - startY;
+        var dx = Math.abs(t.clientX - startX);
+        if (dy > 16 && dx < 90 && e.cancelable) { e.preventDefault(); }
+        if (dy > 96 && dx < 90) {
+          swiping = false;
+          close();
+        }
+      }, {passive: false, capture: true});
+      document.addEventListener('touchend', function () { swiping = false; },
+                                {passive: true, capture: true});
+      document.addEventListener('touchcancel', function () { swiping = false; },
+                                {passive: true, capture: true});
+
+      // The system player must stay out of reach even if a page asks for it
+      // directly: it is the thing that reappears over the page on its own.
+      try {
+        HTMLVideoElement.prototype.webkitEnterFullscreen = function () {};
+        HTMLVideoElement.prototype.webkitExitFullscreen = function () {};
+        HTMLVideoElement.prototype.webkitSetPresentationMode = function () {};
+      } catch (e) {}
+
+      window.addEventListener('pagehide', function () {
+        if (!theater) { return; }
+        report({kind: 'exit'});
+        // A frame under an iframe theater must let the top document put the
+        // iframe back, or the frame would stay stretched over the page.
+        if (!isTop) {
+          try { parent.postMessage({__soVideo: 'exit'}, '*'); } catch (e) {}
+        }
+      });
+
+      window.__soVideo = {
+        seekBy: function (seconds) {
+          if (child) {
+            try { child.postMessage({__soVideo: 'seekBy', by: seconds}, '*'); }
+            catch (e) {}
+            return;
+          }
+          if (video) { seek(video, seconds); }
+        },
+        toggle: function () {
+          if (child) {
+            try { child.postMessage({__soVideo: 'toggle'}, '*'); } catch (e) {}
+            return;
+          }
+          if (video) { toggle(video); }
+        },
+        close: function () { close(); }
+      };
     })();
     """#
 

@@ -157,6 +157,15 @@ class _BrowserPageState extends State<BrowserPage>
   bool _urlFocused = false;
   bool _started = false;
 
+  // Web video player. The page keeps its own <video>; the injected script
+  // stretches it over the page and this bar puts the controls around it. Only a
+  // tap on the page opens it, and closing pauses — nothing resumes on scroll.
+  bool _videoOpen = false;
+  bool _videoPaused = true;
+  double _videoPosition = 0;
+  double _videoDuration = 0;
+  double _videoDrag = 0;
+
   /// Share of the body height taken by the info panel; draggable.
   double _panelFraction = 0.4;
   bool _panelVisible = false;
@@ -284,6 +293,7 @@ class _BrowserPageState extends State<BrowserPage>
       onNavigation: _onWindowNavigation,
       onPageEvent: _onPageNetworkEvent,
       onLinkPress: _onWindowLinkPress,
+      onVideoState: _onWindowVideo,
       onRedraw: () {
         if (mounted) setState(() {});
       },
@@ -477,6 +487,78 @@ class _BrowserPageState extends State<BrowserPage>
     unawaited(_offerLink(uri, press.text));
   }
 
+  /// The page's video window opened, closed, or reported where the playhead is.
+  ///
+  /// Events from a background window are dropped: its theater stays exactly as
+  /// the user left it, and only the window on screen may draw a control bar.
+  void _onWindowVideo(BrowseWindow window, WebViewVideoEvent event) {
+    if (!mounted || !identical(window, _windows.current)) return;
+    if (event.isEnter) {
+      setState(() {
+        _videoOpen = true;
+        _videoPaused = false;
+        _videoPosition = 0;
+        _videoDuration = 0;
+        _videoDrag = 0;
+      });
+      if (_consoleOpen) _pushToConsole('视频窗口打开 ${window.host}');
+      return;
+    }
+    if (event.isExit) {
+      _hideVideoWindow();
+      if (_consoleOpen) _pushToConsole('视频窗口关闭');
+      return;
+    }
+    if (event.isState && _videoOpen) {
+      setState(() {
+        _videoPaused = event.paused;
+        _videoPosition = event.position;
+        _videoDuration = event.duration;
+      });
+    }
+  }
+
+  /// Drops the bar without asking the page anything. Exiting the theater is
+  /// always the page script's own step, triggered by [_closeVideoWindow] or by
+  /// the document going away.
+  void _hideVideoWindow() {
+    if (!_videoOpen && _videoDrag == 0) return;
+    setState(() {
+      _videoOpen = false;
+      _videoPaused = true;
+      _videoPosition = 0;
+      _videoDuration = 0;
+      _videoDrag = 0;
+    });
+  }
+
+  /// Asks the page to close the theater, which also pauses its video.
+  void _closeVideoWindow() {
+    _videoCommand('close()');
+    _hideVideoWindow();
+  }
+
+  /// Drives the injected `window.__soVideo` API. The page owns playback; this
+  /// only sends it commands the bar's buttons stand for.
+  void _videoCommand(String call) {
+    final webView = _browser.webView;
+    if (webView == null) return;
+    unawaited(webView.evaluate('window.__soVideo && window.__soVideo.$call'));
+  }
+
+  /// `m:ss`, or `h:mm:ss` past the hour. A zero or missing length is `0:00`.
+  String _videoClock(double seconds) {
+    if (seconds.isNaN || seconds.isInfinite || seconds <= 0) return '0:00';
+    final total = seconds.round();
+    final hours = total ~/ 3600;
+    final minutes = (total % 3600) ~/ 60;
+    final secs = (total % 60).toString().padLeft(2, '0');
+    if (hours > 0) {
+      return '$hours:${minutes.toString().padLeft(2, '0')}:$secs';
+    }
+    return '$minutes:$secs';
+  }
+
   Future<void> _offerLink(Uri uri, String text) async {
     final choice = await askAboutLink(context, uri: uri, text: text);
     if (choice == null || !mounted) return;
@@ -553,6 +635,10 @@ class _BrowserPageState extends State<BrowserPage>
 
   Future<void> _switchWindow(BrowseWindow window) async {
     if (_windows.isEmpty || identical(window, _windows.current)) return;
+    // The window being left stops playing: its theater stays behind with it,
+    // but audio that keeps running from an unseen page is not a background
+    // feature anyone asked for.
+    if (_videoOpen) _closeVideoWindow();
     await _windows.capture(_windows.current);
     if (!mounted) return;
     if (!_windows.select(window)) return;
@@ -597,6 +683,11 @@ class _BrowserPageState extends State<BrowserPage>
     final hasPage = url != null && url.isNotEmpty && url != 'about:blank';
     setState(() {
       _started = hasPage;
+      _videoOpen = false;
+      _videoPaused = true;
+      _videoPosition = 0;
+      _videoDuration = 0;
+      _videoDrag = 0;
       if (!_urlFocus.hasFocus) _urlController.text = hasPage ? url : '';
     });
   }
@@ -781,6 +872,14 @@ class _BrowserPageState extends State<BrowserPage>
     // The controller already consumed it for the address bar; logging it would
     // flood the console with dozens of rows per navigation.
     if (event.isState) return;
+
+    // A new main-frame document replaces the one the theater belonged to; a bar
+    // left floating over the new page would control nothing.
+    if (active && _videoOpen && event.isMainFrame &&
+        (event.kind == 'start' || event.isCommitted ||
+            event.kind == 'in-app' || event.isFailed)) {
+      _hideVideoWindow();
+    }
 
     // The address bar owns the outcome of the last main-frame load: a dead tap
     // must say so instead of looking like nothing was pressed.
@@ -2223,6 +2322,12 @@ class _BrowserPageState extends State<BrowserPage>
             BrowserView(controller: _browser),
             if (!_started && !_hasDocument)
               _StartPage(onOpen: _openShortcut),
+            // The page's video fills the area behind this bar; the bar itself
+            // keeps clear of the console when that is open.
+            if (_videoOpen)
+              _buildVideoBar(
+                bottom: _consoleOpen ? height * _consoleSize / 100 : 0,
+              ),
             if (_consoleOpen) ...<Widget>[
               Positioned(
                 left: 0,
@@ -2245,6 +2350,145 @@ class _BrowserPageState extends State<BrowserPage>
           ],
         );
       },
+    );
+  }
+
+  /// The control bar of the video window.
+  ///
+  /// It sits on the lower edge of the page, not over the middle of the video:
+  /// the page's own controls stay reachable behind it. Dragging it down closes
+  /// the window — the same gesture as swiping a sheet away.
+  Widget _buildVideoBar({required double bottom}) {
+    final length = _videoDuration > 0 ? _videoClock(_videoDuration) : '--:--';
+    return Positioned(
+      left: 12,
+      right: 12,
+      bottom: bottom + 12,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onVerticalDragStart: (_) {
+          if (_videoDrag != 0) setState(() => _videoDrag = 0);
+        },
+        onVerticalDragUpdate: (details) {
+          final next = math.max(0.0, _videoDrag + details.delta.dy);
+          setState(() => _videoDrag = next);
+        },
+        onVerticalDragEnd: (_) {
+          final close = _videoDrag > 56;
+          setState(() => _videoDrag = 0);
+          if (close) _closeVideoWindow();
+        },
+        child: Transform.translate(
+          offset: Offset(0, _videoDrag),
+          child: Opacity(
+            opacity: (1 - _videoDrag / 200).clamp(0.4, 1.0).toDouble(),
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(14, 7, 6, 5),
+              decoration: BoxDecoration(
+                color: const Color(0xF015161A),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: Colors.white.withAlpha(30)),
+                boxShadow: const <BoxShadow>[
+                  BoxShadow(
+                    color: Color(0x55000000),
+                    blurRadius: 18,
+                    offset: Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Container(
+                    width: 34,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withAlpha(76),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: <Widget>[
+                      Text(
+                        _videoClock(_videoPosition),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      Text(
+                        ' / $length',
+                        style: const TextStyle(
+                          color: AppColors.darkMuted,
+                          fontSize: 12.5,
+                        ),
+                      ),
+                      const Spacer(),
+                      _videoControl(
+                        Icons.replay_10_rounded,
+                        '后退 10 秒',
+                        () => _videoCommand('seekBy(-10)'),
+                      ),
+                      _videoControl(
+                        _videoPaused
+                            ? Icons.play_arrow_rounded
+                            : Icons.pause_rounded,
+                        _videoPaused ? '播放' : '暂停',
+                        () => _videoCommand('toggle()'),
+                        primary: true,
+                      ),
+                      _videoControl(
+                        Icons.forward_10_rounded,
+                        '前进 10 秒',
+                        () => _videoCommand('seekBy(10)'),
+                      ),
+                      _videoControl(
+                        Icons.close_rounded,
+                        '关闭视频窗口',
+                        _closeVideoWindow,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _videoControl(
+    IconData icon,
+    String label,
+    VoidCallback onTap, {
+    bool primary = false,
+  }) {
+    return Semantics(
+      button: true,
+      label: label,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 2),
+        child: Material(
+          color: primary ? AppColors.signal : Colors.transparent,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onTap,
+            child: SizedBox(
+              width: primary ? 40 : 36,
+              height: primary ? 40 : 36,
+              child: Icon(
+                icon,
+                size: primary ? 24 : 21,
+                color: primary ? AppColors.signalInk : Colors.white,
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
