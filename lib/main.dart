@@ -6502,8 +6502,15 @@ class _BookmarksPage extends StatefulWidget {
 class _BookmarksPageState extends State<_BookmarksPage> {
   late final List<_Bookmark> _items = List<_Bookmark>.of(widget.bookmarks);
 
+  /// Every visit starts hidden: a phone handed to someone else shows an empty
+  /// bookmarks page, count included. A double tap on the page reveals the list
+  /// for this visit and another double tap hides it again. Deliberately
+  /// silent — a hint would give the hiding away.
+  bool _revealed = false;
+
   @override
   Widget build(BuildContext context) {
+    final showList = _revealed && _items.isNotEmpty;
     return Scaffold(
       backgroundColor: AppColors.paper,
       appBar: AppBar(
@@ -6529,7 +6536,7 @@ class _BookmarksPageState extends State<_BookmarksPage> {
             child: Padding(
               padding: const EdgeInsets.only(right: 16),
               child: Text(
-                '${_items.length}',
+                _revealed ? '${_items.length}' : '',
                 style: const TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 11,
@@ -6544,75 +6551,79 @@ class _BookmarksPageState extends State<_BookmarksPage> {
           child: Divider(height: 1),
         ),
       ),
-      body: _items.isEmpty
-          ? const Center(
-              child: Padding(
-                padding: EdgeInsets.symmetric(horizontal: 40),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Icon(
-                      Icons.bookmarks_outlined,
-                      size: 30,
-                      color: AppColors.faint,
-                    ),
-                    SizedBox(height: 12),
-                    Text(
-                      'No bookmarks yet',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onDoubleTap: () => setState(() => _revealed = !_revealed),
+        child: showList
+            ? ListView.builder(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 28),
+                itemCount: _items.length,
+                itemBuilder: (context, index) {
+                  final item = _items[index];
+                  return Dismissible(
+                    key: ValueKey<String>(item.url),
+                    direction: DismissDirection.endToStart,
+                    background: Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.only(right: 18),
+                      alignment: Alignment.centerRight,
+                      decoration: BoxDecoration(
+                        color: AppColors.danger,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: const Icon(
+                        Icons.delete_outline_rounded,
+                        size: 19,
+                        color: Colors.white,
                       ),
                     ),
-                    SizedBox(height: 5),
-                    Text(
-                      'Open a page, then Settings → Save to keep it here.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 10,
-                        height: 1.5,
-                        color: AppColors.muted,
-                      ),
+                    onDismissed: (_) {
+                      setState(() {
+                        _items.removeWhere((entry) => entry.url == item.url);
+                      });
+                      widget.onDelete(item.url);
+                    },
+                    child: _BookmarkRow(
+                      bookmark: item,
+                      onTap: () => widget.onOpen(item),
                     ),
-                  ],
+                  );
+                },
+              )
+            : const Center(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 40),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Icon(
+                        Icons.bookmarks_outlined,
+                        size: 30,
+                        color: AppColors.faint,
+                      ),
+                      SizedBox(height: 12),
+                      Text(
+                        'No bookmarks yet',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      SizedBox(height: 5),
+                      Text(
+                        'Open a page, then Settings → Save to keep it here.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 10,
+                          height: 1.5,
+                          color: AppColors.muted,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            )
-          : ListView.builder(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 28),
-              itemCount: _items.length,
-              itemBuilder: (context, index) {
-                final item = _items[index];
-                return Dismissible(
-                  key: ValueKey<String>(item.url),
-                  direction: DismissDirection.endToStart,
-                  background: Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.only(right: 18),
-                    alignment: Alignment.centerRight,
-                    decoration: BoxDecoration(
-                      color: AppColors.danger,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Icon(
-                      Icons.delete_outline_rounded,
-                      size: 19,
-                      color: Colors.white,
-                    ),
-                  ),
-                  onDismissed: (_) {
-                    setState(() {
-                      _items.removeWhere((entry) => entry.url == item.url);
-                    });
-                    widget.onDelete(item.url);
-                  },
-                  child: _BookmarkRow(
-                    bookmark: item,
-                    onTap: () => widget.onOpen(item),
-                  ),
-                );
-              },
-            ),
+      ),
     );
   }
 }
