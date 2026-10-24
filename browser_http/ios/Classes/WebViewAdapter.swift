@@ -1913,6 +1913,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       var lastTapX = 0, lastTapY = 0;
       var tapX = 0, tapY = 0, tapMoved = true;
       var frozenChild = null;  // top frame: dimensions reported by an iframe
+      var soloEl = null;       // the picture while the page is hidden
+      var hidden = [];         // [element, property, previous inline value]
+      var pausedOthers = [];   // videos stopped so nothing plays behind
 
       function report(message) {
         try {
@@ -2227,6 +2230,60 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         lifted = [];
       }
 
+      // The picture is the page's own <video>, so whatever else the page
+      // paints stays around it: recommendation rails, a second player, a
+      // panel that wins on stacking order. Hiding every element beside the
+      // path from the video to <body>, and blacking the page out, leaves
+      // exactly one picture on screen. Inline values are put back on exit.
+      function solo(el) {
+        restoreSolo();
+        soloEl = el;
+        var step = el;
+        while (step && step.nodeType === 1) {
+          var holder = step.parentNode;
+          if (holder && holder.children) {
+            for (var i = 0; i < holder.children.length; i += 1) {
+              var kid = holder.children[i];
+              if (kid === step) { continue; }
+              hidden.push([kid, 'visibility', kid.style.visibility]);
+              kid.style.setProperty('visibility', 'hidden', 'important');
+            }
+          }
+          step = step.parentElement ||
+                 (step.getRootNode && step.getRootNode().host);
+        }
+        var root = document.documentElement;
+        if (root) {
+          hidden.push([root, 'background', root.style.background]);
+          root.style.setProperty('background', '#000', 'important');
+        }
+        if (document.body) {
+          hidden.push([document.body, 'background',
+                       document.body.style.background]);
+          document.body.style.setProperty('background', '#000', 'important');
+        }
+        // A page can run a second, muted video behind the player; hidden or
+        // not, it must not keep drawing or sounding.
+        var list = allVideos();
+        for (var j = 0; j < list.length; j += 1) {
+          var other = list[j];
+          if (other === el || other.paused) { continue; }
+          pausedOthers.push(other);
+          try { other.pause(); } catch (e) {}
+        }
+      }
+
+      function restoreSolo() {
+        for (var i = 0; i < hidden.length; i += 1) {
+          var entry = hidden[i];
+          if (entry[2]) { entry[0].style.setProperty(entry[1], entry[2]); }
+          else { entry[0].style.removeProperty(entry[1]); }
+        }
+        hidden = [];
+        pausedOthers = [];
+        soloEl = null;
+      }
+
       function stretch(el) {
         if (!el || savedStyle !== null) { return; }
         savedStyle = el.getAttribute('style') || '';
@@ -2248,6 +2305,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           + '-webkit-user-select:none!important;'
           + '-webkit-touch-callout:none!important;');
         theater = el;
+        solo(el);
       }
 
       function release() {
@@ -2258,6 +2316,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         theater = null;
         savedStyle = null;
         releaseContainers();
+        restoreSolo();
       }
 
       function stop() {
