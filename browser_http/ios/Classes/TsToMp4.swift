@@ -527,7 +527,7 @@ enum TsToMp4 {
                 // the offset with '10', and treating it as an adaptation field
                 // would drop the payload it carries.
                 var from = start + 4
-                var to = start + body
+                let to = start + body
                 var discontinuity = false
                 if control == 3 {
                     let length = Int(buffer[start + 4])
