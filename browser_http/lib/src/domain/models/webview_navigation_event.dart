@@ -26,7 +26,7 @@ final class WebViewNavigationEvent {
   final String sessionId;
 
   /// One of `start`, `in-app`, `blocked`, `response`, `redirect`, `committed`,
-  /// `failed`, `state`, as reported by the native side.
+  /// `failed`, `certificate`, `state`, as reported by the native side.
   ///
   /// `state` is not a decision but a snapshot of the WebView's own chrome
   /// properties (progress, title, history flags); it is pushed by KVO so a
@@ -62,6 +62,10 @@ final class WebViewNavigationEvent {
   bool get isFailed => kind == 'failed';
   bool get isCommitted => kind == 'committed';
   bool get isState => kind == 'state';
+
+  /// The load was refused because the server's certificate is not trusted.
+  /// The host can offer the user a way past it for that host only.
+  bool get isCertificate => kind == 'certificate';
 
   /// A jump that would leave the app, cancelled on the way and waiting for the
   /// host's answer. [url] is the app URL (`bilibili://video/…`), not the wrapper

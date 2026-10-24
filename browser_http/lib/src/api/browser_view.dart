@@ -245,6 +245,17 @@ final class BrowserController extends ChangeNotifier {
     await refresh();
   }
 
+  /// Accepts [host]'s certificate after the user chose to keep visiting a page
+  /// the system does not trust (proxy software replaces TLS certificates) and
+  /// reloads the page that was refused. Only that host is remembered.
+  Future<void> trustCertificate(String host) async {
+    final webView = _webView;
+    if (webView == null) return;
+    _beginNavigation(_url);
+    await webView.trustCertificate(host);
+    await refresh();
+  }
+
   /// Cancels the load in flight. The WebView reports itself idle afterwards, so
   /// the chrome stops on its own.
   Future<void> stopLoading() async {

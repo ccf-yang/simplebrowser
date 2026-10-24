@@ -102,6 +102,11 @@ abstract interface class WebViewSession {
   Future<void> goForward();
   Future<void> reload();
 
+  /// Accepts [host]'s certificate after the user chose to continue past an
+  /// untrusted one (proxy software replaces TLS certificates), and reloads the
+  /// page that was refused. Only that host is affected.
+  Future<void> trustCertificate(String host);
+
   /// Cancels the load in flight, the way Safari's Stop button does. A page that
   /// never answers leaves the host (and its chrome) waiting otherwise.
   Future<void> stopLoading();

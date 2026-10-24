@@ -124,6 +124,12 @@ final class WebViewBridge {
             holder.loadInApp(request(for: url, headers: args["headers"]))
             result(nil)
 
+        case "trustCertificate":
+            guard let holder = session(args, result),
+                  let host = args["host"] as? String else { return }
+            holder.trustCertificate(host: host)
+            result(nil)
+
         case "setUserAgent":
             guard let holder = session(args, result) else { return }
             holder.webView.customUserAgent = args["userAgent"] as? String
@@ -133,8 +139,6 @@ final class WebViewBridge {
             guard let holder = session(args, result) else { return }
             holder.blockExternalNavigations = args["blockExternal"] as? Bool
                 ?? holder.blockExternalNavigations
-            holder.reissueUserTaps = args["reissueTaps"] as? Bool
-                ?? holder.reissueUserTaps
             holder.asksAboutExternalJumps = args["askExternal"] as? Bool
                 ?? holder.asksAboutExternalJumps
             if let allowed = args["allowSchemes"] as? [String] {
@@ -482,11 +486,6 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// `itms-apps://`, `tel:` …).
     var blockExternalNavigations = true
 
-    /// iOS opens the matching app when a *user tap* moves the main frame to a
-    /// URL registered as a Universal Link. Re-issuing the identical request
-    /// from code keeps the page inside this browser.
-    var reissueUserTaps = true
-
     /// Protocols the user chose to allow ("总是允许 bilibili") — they may leave
     /// the app without being asked again.
     var allowedExternalSchemes: Set<String> = []
@@ -505,9 +504,18 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// untouched or the re-issue would cancel itself forever.
     private var programmaticURLs: Set<String> = []
 
-    /// When a URL was cancelled and re-issued. Guards against a cancel/re-issue
-    /// loop when WebKit reports the reload with a normalised URL string.
-    private var reissuedAt: [String: Date] = [:]
+    /// The last http(s) document a main frame asked for. A failed provisional
+    /// navigation usually has no `webView.url` yet, and a certificate warning
+    /// must be able to name (and reload) the page it refused.
+    private var lastRequestedURL: URL?
+
+    /// Hosts the user chose to keep visiting after a certificate warning.
+    /// Proxy software (Clash/mihomo, Charles …) replaces the TLS certificate;
+    /// Safari offers the same "visit anyway" escape hatch, and this is that
+    /// answer, remembered per host.
+    private let trustedCertHostsKey = "so.trustedCertificateHosts"
+    private lazy var trustedCertHosts: Set<String> = Set(
+        UserDefaults.standard.stringArray(forKey: trustedCertHostsKey) ?? [])
 
     // -----------------------------------------------------------------------
     // Page state: pushed to the host, never polled
@@ -1442,26 +1450,6 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         }
     }
 
-    /// Makes sure a re-issued tap really starts. A load can be dropped while
-    /// the navigation that asked for it is being cancelled; if the page has
-    /// not started moving half a second later, the same request is handed to
-    /// the WebView again. It never fights a load that is already running, and
-    /// it gives up as soon as the page has moved anywhere.
-    private func confirmLoad(_ request: URLRequest, from source: URL?,
-                             attempt: Int = 0) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self, attempt < 2 else { return }
-            if self.webView.isLoading { return }
-            let current = self.webView.url?.absoluteString ?? ""
-            if let target = request.url?.absoluteString, current == target {
-                return
-            }
-            if let source, current != source.absoluteString { return }
-            self.loadInApp(request)
-            self.confirmLoad(request, from: source, attempt: attempt + 1)
-        }
-    }
-
     /// Loads a URL the way Safari's address bar does: from code, never as the
     /// continuation of a user gesture, so Universal Links stay in-app.
     ///
@@ -1470,38 +1458,22 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     func loadInApp(_ request: URLRequest) {
         if let url = request.url {
             programmaticURLs.insert(url.absoluteString)
-            markReissued(url)
         }
         webView.load(request)
     }
 
-    /// Rebuilds a tapped request the way the page itself would have made it.
-    ///
-    /// `WKNavigationAction.request` carries the destination, method and body,
-    /// but a programmatic `load` loses the referring document, and several
-    /// Chinese sites answer a referer-less main-frame request with a blank or a
-    /// different page. Re-adding it keeps a re-issued jump faithful.
-    private func reissueRequest(_ action: WKNavigationAction) -> URLRequest {
-        var request = action.request
-        guard request.value(forHTTPHeaderField: "Referer") == nil,
-              let from = webView.url?.absoluteString,
-              from.hasPrefix("http"),
-              action.sourceFrame != nil else {
-            return request
+    /// Remembers the user's answer to a certificate warning and reloads the
+    /// page that was refused. Only the named host is accepted afterwards.
+    func trustCertificate(host: String) {
+        let clean = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !clean.isEmpty else { return }
+        trustedCertHosts.insert(clean)
+        UserDefaults.standard.set(Array(trustedCertHosts),
+                                  forKey: trustedCertHostsKey)
+        if let url = lastRequestedURL ?? webView.url {
+            loadInApp(URLRequest(url: url))
         }
-        request.setValue(from, forHTTPHeaderField: "Referer")
-        return request
-    }
-
-    private func wasReissuedRecently(_ url: URL) -> Bool {
-        guard let at = reissuedAt[url.absoluteString] else { return false }
-        return Date().timeIntervalSince(at) < 2
-    }
-
-    private func markReissued(_ url: URL) {
-        // `programmaticURLs` is cleared on commit; keep this map small too.
-        if reissuedAt.count > 32 { reissuedAt.removeAll() }
-        reissuedAt[url.absoluteString] = Date()
     }
 
     func webView(_ webView: WKWebView,
@@ -1520,6 +1492,10 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         if targetsMainFrame || opensWindow {
             lastMethod = method
             lastNavigationType = type
+        }
+
+        if (targetsMainFrame || opensWindow), scheme == "http" || scheme == "https" {
+            lastRequestedURL = url
         }
 
         // A load this holder started itself (address bar, re-issue, back/forward
@@ -1563,85 +1539,15 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             return
         }
 
-        // A page jump must never leave the app, but only a *gesture-backed* one
-        // can actually be handed to another app: iOS fires the Universal Link
-        // association for a tap, a form submit or a `window.open` (which keeps
-        // the tap's gesture), never for a script navigation the user did not
-        // activate. So:
-        // - taps / GET form submits and script `window.open` are cancelled and
-        //   re-issued from code, which is what keeps them in this browser;
-        // - a plain in-main-frame `location =` is allowed through instead.
-        //   Cancelling one and reloading it costs a second request for the same
-        //   document *and* leaves the redirecting wrapper page in the
-        //   back/forward list, so the first swipe back showed a blank screen.
-        //   Allowed, WebKit does what Safari does: a redirect issued while the
-        //   document is still loading replaces that entry.
-        // Anything that is not http(s), and any URL whose query carries an app
-        // scheme, is already cancelled above, whatever triggered it.
-        // Back/forward and reload are left alone: those URLs are already inside
-        // this browser. POST bodies pass through untouched.
-        let trigger = navigationAction.navigationType
-        let isGesture = trigger == .linkActivated || trigger == .formSubmitted
-        let isScriptJump = trigger == .other
-        let isWebURL = scheme == "http" || scheme == "https"
-        let opensFromScript = isScriptJump && opensWindow
-        // A click handler that sets `location.href` reaches WebKit as `.other`,
-        // but iOS still holds that tap's gesture token, so it is exactly as able to
-        // hand a Universal Link to another app as a plain link tap. It is re-issued
-        // only once its document is on screen: re-issued *during* a load it doubles
-        // the request and leaves the wrapper entry that made the first swipe back
-        // show a blank screen.
-        let settledScriptJump = isScriptJump && targetsMainFrame && !webView.isLoading
-        // An app's "打开 App" button also lives inside a third-party iframe, and a
-        // subframe navigation does not satisfy the main-frame clause above. A tap
-        // aimed at another site belongs in this browser's main frame; same-origin
-        // frame browsing is left alone, or every paginated iframe would hijack the
-        // page it is embedded in.
-        let crossOriginFrameTap = isGesture && !targetsMainFrame && !opensWindow
-            && Self.isCrossOrigin(url, against: webView.url)
-        if blockExternalNavigations, reissueUserTaps, isWebURL,
-           method == "GET",
-           isGesture || opensFromScript || settledScriptJump || crossOriginFrameTap,
-           targetsMainFrame || opensWindow || crossOriginFrameTap,
-           navigationAction.request.httpBody == nil {
-            // The one-shot marker for a re-issued load can be consumed by a
-            // competing callback. That load carries no gesture, so it can
-            // never hand the URL to another app: let it through instead of
-            // cancelling it over and over and leaving the tap dead.
-            if wasReissuedRecently(url), trigger == .other, !webView.isLoading {
-                reportNavigation(kind: "start", url: url, method: method,
-                                 mainFrame: targetsMainFrame, type: type,
-                                 message: "in-app load continued")
-                decisionHandler(.allow)
-                return
-            }
-            // The identical request is already in flight (a page that fires both
-            // a tap and a `window.open`, or a double tap). Cancel it: allowing
-            // would hand the Universal Link over, and a second load would put a
-            // duplicate entry in the back/forward list. Once nothing is loading
-            // the previous attempt is over, so the tap is honoured again instead
-            // of silently doing nothing.
-            if wasReissuedRecently(url), webView.isLoading {
-                decisionHandler(.cancel)
-                reportNavigation(kind: "in-app", url: url, method: method,
-                                 mainFrame: targetsMainFrame, type: type,
-                                 message: "duplicate jump kept out")
-                return
-            }
-            markReissued(url)
-            decisionHandler(.cancel)
-            reportNavigation(kind: "in-app", url: url, method: method,
-                             mainFrame: targetsMainFrame, type: type,
-                             message: "reloaded in-app (no external app)")
-            // Start it now. A `target="_blank"` action is cancelled here
-            // before WebKit ever reaches `createWebViewWith`, and a load
-            // queued for the next run-loop turn was sometimes dropped as
-            // part of that cancellation: the tap then did nothing at all.
-            let reissued = reissueRequest(navigationAction)
-            loadInApp(reissued)
-            confirmLoad(reissued, from: webView.url)
-            return
-        }
+        // A plain web jump stays in this WebView. WebKit does not hand an
+        // http(s) URL to another app on its own — only `UIApplication.open` and
+        // a custom scheme do, and both are handled above — so cancelling a
+        // normal link and loading it again from code only added ways for the
+        // tap to die: a re-issue dropped with the cancelled navigation, a
+        // wrapper entry left in history, or a page firing two jumps that
+        // cancelled each other. Safari and every other browser simply allow
+        // it; this one does the same. `target="_blank"` is still kept in-app
+        // by `createWebViewWith` below.
 
         reportNavigation(kind: "start", url: url, method: method,
                          mainFrame: targetsMainFrame, type: type)
@@ -1705,9 +1611,8 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // A new window must also stay in-app. `decidePolicyFor` has usually
-        // already cancelled the request before WebKit gets here, so this is the
-        // second gate, not the first, and it decides the same way.
+        // A new window must also stay in-app: WebKit has no window to hand
+        // out here, so the request is loaded in the one the user is looking at.
         if navigationAction.targetFrame == nil,
            let url = navigationAction.request.url,
            !programmaticURLs.contains(url.absoluteString) {
@@ -1730,22 +1635,19 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                                      mainFrame: true, type: type,
                                      message: "external app jump blocked (new window)")
                 }
-            } else if !wasReissuedRecently(url) {
-                // The tap already re-issued this URL from `decidePolicyFor`
-                // when that callback ran first; this path is for the
-                // WebKit versions that only offer a new window. The load
-                // must not start inside the callback that is cancelling
-                // this window, or WebKit drops it and the tap does nothing.
+            } else {
+                // A `target="_blank"` link: WebKit has no window to give us,
+                // so the same request is loaded in this one. Doing it inside
+                // the callback that is cancelling the window makes WebKit
+                // drop it, hence the next run-loop turn.
                 let request = navigationAction.request
-                let source = webView.url
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     if let target = request.url?.absoluteString,
-                       self.programmaticURLs.contains(target) {
+                       self.webView.url?.absoluteString == target {
                         return
                     }
                     self.loadInApp(request)
-                    self.confirmLoad(request, from: source)
                 }
             }
         }
@@ -1830,10 +1732,48 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         programmaticURLs.removeAll()
-        reportFailure(url: webView.url, error: error)
+        if Self.isCertificateError(error),
+           let url = lastRequestedURL ?? webView.url {
+            // A proxy or a private server presented a certificate the system
+            // does not trust. Safari stops on a page that offers a way past;
+            // the host shows that same choice instead of a dead tap.
+            reportNavigation(kind: "certificate", url: url, method: lastMethod,
+                             mainFrame: true, type: lastNavigationType,
+                             message: "证书未通过系统校验")
+        } else {
+            reportFailure(url: webView.url, error: error)
+        }
         publishState()
         loadCompletion?(error)
         loadCompletion = nil
+    }
+
+    /// Whether a load died because the server's certificate was not trusted.
+    /// -1202 is the definitive code; older paths wrap a reason string instead.
+    private static func isCertificateError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        guard ns.domain == NSURLErrorDomain else { return false }
+        if ns.code == NSURLErrorServerCertificateUntrusted { return true }
+        let text = (ns.userInfo[NSLocalizedDescriptionKey] as? String) ?? ""
+        return text.localizedCaseInsensitiveContains("certificate")
+    }
+
+    /// Server trust: only a host the user explicitly continued past gets the
+    /// stored exception. Everything else keeps WebKit's own validation.
+    func webView(_ webView: WKWebView,
+                 didReceive challenge: URLAuthenticationChallenge,
+                 completionHandler: @escaping (URLSession.AuthChallengeDisposition,
+                                               URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod
+                == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust,
+              trustedCertHosts.contains(
+                challenge.protectionSpace.host.lowercased())
+        else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 
     /// A failed navigation often has no URL yet; `about:blank` keeps the row

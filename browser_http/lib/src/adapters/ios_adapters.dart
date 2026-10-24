@@ -551,6 +551,13 @@ final class _ChannelWebViewSession implements WebViewSession {
       _channel.invokeMethod<void>('reload', <String, Object?>{'id': _id});
 
   @override
+  Future<void> trustCertificate(String host) =>
+      _channel.invokeMethod<void>('trustCertificate', <String, Object?>{
+        'id': _id,
+        'host': host,
+      });
+
+  @override
   Future<void> stopLoading() =>
       _channel.invokeMethod<void>('stopLoading', <String, Object?>{'id': _id});
 

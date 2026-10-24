@@ -241,6 +241,11 @@ class _BrowserPageState extends State<BrowserPage>
   /// Null while a page is loading or after it succeeded.
   String? _navError;
 
+  /// The host whose certificate the last load refused. While it is set the
+  /// address bar offers "继续访问" instead of a plain reload: proxy software
+  /// replaces TLS certificates, and this is the way past its warning.
+  String? _certHost;
+
   /// Host of the main-frame load currently in flight. The WebView keeps
   /// reporting the previous URL until its new document commits, so without this
   /// the status line would name the page the user just left.
@@ -455,7 +460,10 @@ class _BrowserPageState extends State<BrowserPage>
     _seenResources = _browser.resourceTimings.length;
 
     // A new document means the previous failure no longer describes this one.
-    if (_navError != null && _browser.url != previousUrl) _navError = null;
+    if (_navError != null && _browser.url != previousUrl) {
+      _navError = null;
+      _certHost = null;
+    }
 
     final previous = previousUrl ?? '';
     setState(() {
@@ -1090,9 +1098,20 @@ class _BrowserPageState extends State<BrowserPage>
     // The address bar owns the outcome of the last main-frame load: a dead tap
     // must say so instead of looking like nothing was pressed.
     if (active) {
-      if (event.isFailed) {
+      if (event.kind == 'certificate') {
+        // The system refused this server's certificate. A proxy is the usual
+        // cause; the address bar offers a way through instead of a dead page.
+        final host = Uri.tryParse(event.url)?.host ?? '';
+        _certHost = host.isEmpty ? null : host;
+        _setNavError(
+          host.isEmpty
+              ? '证书未通过系统校验，可继续访问'
+              : '$host · 证书未通过系统校验，点右侧继续访问',
+        );
+      } else if (event.isFailed) {
         final host = Uri.tryParse(event.url)?.host ?? '';
         final reason = (event.message ?? '').trim();
+        _certHost = null;
         _setNavError(
           reason.isEmpty
               ? (host.isEmpty ? '页面打开失败' : '$host 打开失败')
@@ -1100,6 +1119,7 @@ class _BrowserPageState extends State<BrowserPage>
         );
       } else if (event.isCommitted || event.kind == 'response') {
         _setNavError(null);
+        _certHost = null;
       }
     }
 
@@ -1113,7 +1133,10 @@ class _BrowserPageState extends State<BrowserPage>
           setState(() => _openingHost = host);
         }
       } else if (_openingHost != null &&
-          (event.isCommitted || event.isFailed || event.isBlocked)) {
+          (event.isCommitted ||
+              event.isFailed ||
+              event.isBlocked ||
+              event.kind == 'certificate')) {
         setState(() => _openingHost = null);
       }
     }
@@ -1136,6 +1159,7 @@ class _BrowserPageState extends State<BrowserPage>
             '已交给外部应用 ${event.url} ${event.message ?? ''}',
           'in-app' => '点击链接改为站内加载 ${event.url}',
           'failed' => '加载失败 ${event.url} ${event.message ?? ''}',
+          'certificate' => '证书不受信任 ${event.url}（多为代理替换证书）',
           'redirect' => '${event.statusCode} 跳转 ${event.url}',
           'committed' =>
             '页面已打开 ${event.statusCode ?? ''} ${event.url}',
@@ -1166,6 +1190,7 @@ class _BrowserPageState extends State<BrowserPage>
         'blocked' => RequestLogPhase.cancelled,
         'ask' => RequestLogPhase.cancelled,
         'failed' => RequestLogPhase.error,
+        'certificate' => RequestLogPhase.error,
         'redirect' => RequestLogPhase.redirect,
         'response' => RequestLogPhase.response,
         'committed' => RequestLogPhase.response,
@@ -1176,6 +1201,7 @@ class _BrowserPageState extends State<BrowserPage>
         'blocked' => RequestLogLevel.warn,
         'ask' => RequestLogLevel.warn,
         'failed' => RequestLogLevel.error,
+        'certificate' => RequestLogLevel.error,
         _ => RequestLogLevel.info,
       },
       method: event.method,
@@ -1186,6 +1212,7 @@ class _BrowserPageState extends State<BrowserPage>
         'ask' => 'webview.externalAsk',
         'external-open' => 'webview.externalOpened',
         'failed' => 'webview.navigationFailed',
+        'certificate' => 'webview.certificateUntrusted',
         _ => null,
       },
       message: switch (event.kind) {
@@ -1328,6 +1355,27 @@ class _BrowserPageState extends State<BrowserPage>
       );
     } on Object catch (error) {
       if (mounted) _snack('Reload failed: $error');
+    }
+  }
+
+  /// "继续访问": remember this host's certificate exception and load the page
+  /// again. Only the host that failed is remembered; everything else keeps the
+  /// system's certificate validation.
+  Future<void> _trustCertificate() async {
+    final host = _certHost;
+    if (host == null) {
+      await _reload();
+      return;
+    }
+    try {
+      await _browser.trustCertificate(host);
+      if (!mounted) return;
+      setState(() {
+        _certHost = null;
+        _navError = null;
+      });
+    } on Object catch (error) {
+      if (mounted) _snack('继续访问失败: $error');
     }
   }
 
@@ -2331,11 +2379,17 @@ class _BrowserPageState extends State<BrowserPage>
                       '停止加载',
                       () => unawaited(_browser.stopLoading()),
                     )
-                  : _pillAction(
-                      Icons.refresh_rounded,
-                      _navError == null ? 'Reload' : '重新加载',
-                      () => unawaited(_reload()),
-                    ),
+                  : _certHost != null
+                      ? _pillAction(
+                          Icons.shield_outlined,
+                          '继续访问（证书不受信任）',
+                          () => unawaited(_trustCertificate()),
+                        )
+                      : _pillAction(
+                          Icons.refresh_rounded,
+                          _navError == null ? 'Reload' : '重新加载',
+                          () => unawaited(_reload()),
+                        ),
         ],
       ),
     );
