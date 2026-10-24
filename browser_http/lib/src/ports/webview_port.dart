@@ -167,6 +167,15 @@ abstract interface class WebViewSession {
   /// keeps the card for as long as that window is away.
   Future<Uint8List?> snapshot({int maxWidth = 360});
 
+  /// Saves the video picture currently on screen to Photos and returns `ok`,
+  /// `denied` (no add-only permission) or `error: …`.
+  ///
+  /// Only the picture is saved: the host's control layer is not page content,
+  /// so it is never in the frame, and the letterbox around an aspect-fitted
+  /// video is cropped away. **The caller must have its player window open**;
+  /// with no picture the call answers `error: …`.
+  Future<String> captureVideoFrame();
+
   /// Installs the persistent debug console (eruda) for every later document.
   ///
   /// The native side evaluates the cached bundle on every navigation commit,

@@ -365,6 +365,10 @@ final class WebViewBridge {
                 result(data == nil ? nil : FlutterStandardTypedData(bytes: data!))
             }
 
+        case "captureVideoFrame":
+            guard let holder = session(args, result) else { return }
+            holder.captureVideoFrame { status in result(status) }
+
         case "dispose":
             if let id = args["id"] as? String {
                 sessions.removeValue(forKey: id)
@@ -462,6 +466,12 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// Playback of the page's own video, reported from the video script: the
     /// player window opened or closed, and where the playhead is.
     private static let videoHandlerName = "browserHttpVideo"
+
+    /// Picture size last reported by the video script. A capture crops the
+    /// WebView snapshot to that aspect inside the viewport, which leaves the
+    /// black letterbox out of the saved frame.
+    private var videoWidth: CGFloat = 0
+    private var videoHeight: CGFloat = 0
 
     /// Cancels any navigation whose scheme is not http(s)/in-app, so a link can
     /// never hand the URL over to another app (`baidu://`, `weixin://`,
@@ -689,6 +699,49 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             let small = UIGraphicsImageRenderer(size: size, format: format)
                 .image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
             done(small.pngData())
+        }
+    }
+
+    /// Saves the frame the player is showing to Photos.
+    ///
+    /// The picture is the page's `<video>` stretched over the viewport with
+    /// `object-fit: contain`, so what the user sees is the aspect-fitted part
+    /// of the WebView. Cropping the snapshot to that rect keeps the letterbox
+    /// out, and the host's control layer was never in the snapshot at all —
+    /// it is Flutter, not page content.
+    func captureVideoFrame(_ done: @escaping (String) -> Void) {
+        let bounds = webView.bounds
+        guard bounds.width > 4, bounds.height > 4 else {
+            done("error: no view")
+            return
+        }
+        var rect = bounds
+        if videoWidth > 0, videoHeight > 0 {
+            let scale = min(bounds.width / videoWidth,
+                            bounds.height / videoHeight)
+            let size = CGSize(width: (videoWidth * scale).rounded(),
+                              height: (videoHeight * scale).rounded())
+            rect = CGRect(x: ((bounds.width - size.width) / 2).rounded(),
+                          y: ((bounds.height - size.height) / 2).rounded(),
+                          width: size.width, height: size.height)
+        }
+        rect = rect.intersection(bounds)
+        guard rect.width > 4, rect.height > 4 else {
+            done("error: no picture")
+            return
+        }
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = rect
+        webView.takeSnapshot(with: configuration) { image, error in
+            guard let image,
+                  let data = image.jpegData(compressionQuality: 0.95) else {
+                done("error: \(error?.localizedDescription ?? "snapshot failed")")
+                return
+            }
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let name = "so-frame-\(formatter.string(from: Date())).jpg"
+            MediaBridge.savePhotoData(data, filename: name, result: done)
         }
     }
 
@@ -1290,6 +1343,18 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         }
         if message.name == WebViewHolder.videoHandlerName {
             guard var body = message.body as? [String: Any] else { return }
+            if let width = (body["width"] as? NSNumber)?.doubleValue,
+               width > 0 {
+                videoWidth = CGFloat(width)
+            }
+            if let height = (body["height"] as? NSNumber)?.doubleValue,
+               height > 0 {
+                videoHeight = CGFloat(height)
+            }
+            if (body["kind"] as? String) == "exit" {
+                videoWidth = 0
+                videoHeight = 0
+            }
             body["sessionId"] = id
             onVideoEvent?(body)
             return
@@ -1543,6 +1608,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       var moved = false;
       var suppressUntil = 0;   // a swipe must not end as a tap
       var lastPreview = 0;
+      var lastUrl = '';        // the media source last reported
+      var speedTimer = null;   // long press: still counting down
+      var speedOn = false;     // 2x while the finger stays down
 
       function report(message) {
         try {
@@ -1550,14 +1618,43 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         } catch (e) {}
       }
 
+      // The element's own media URL. An MP4 has one; a blob-backed MSE player
+      // hands the element a blob that no downloader can open, so fall back to
+      // the newest manifest this frame fetched.
+      function mediaUrl() {
+        if (!video) { return ''; }
+        var direct = video.currentSrc || video.src || '';
+        if (direct && direct.indexOf('blob:') !== 0) { return direct; }
+        var entries = [];
+        try { entries = performance.getEntriesByType('resource') || []; }
+        catch (e) { entries = []; }
+        var file = '';
+        for (var i = entries.length - 1; i >= 0; i -= 1) {
+          var name = entries[i].name || '';
+          if (/\.m3u8(?:$|[?#])/i.test(name)) { return name; }
+          if (!file && /\.(?:mp4|m4v|webm|mov)(?:$|[?#])/i.test(name)) {
+            file = name;
+          }
+        }
+        return file;
+      }
+
       function state() {
         if (!video) { return; }
-        report({
+        var message = {
           kind: 'state',
           paused: !!video.paused,
           position: video.currentTime || 0,
-          duration: isFinite(video.duration) ? video.duration : 0
-        });
+          duration: isFinite(video.duration) ? video.duration : 0,
+          width: video.videoWidth || 0,
+          height: video.videoHeight || 0
+        };
+        var url = mediaUrl();
+        if (url && url !== lastUrl) {
+          lastUrl = url;
+          message.url = url;
+        }
+        report(message);
       }
 
       // The host shows where a horizontal drag is heading before it commits.
@@ -1656,7 +1753,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           + 'margin:0!important;padding:0!important;'
           + 'transform:none!important;object-fit:contain!important;'
           + 'background:#000!important;z-index:2147483647!important;'
-          + 'touch-action:none!important;');
+          + 'touch-action:none!important;'
+          + '-webkit-user-select:none!important;'
+          + '-webkit-touch-callout:none!important;');
         theater = el;
       }
 
@@ -1702,13 +1801,17 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         } catch (e) {}
         report({kind: 'enter', paused: !!el.paused,
                 position: el.currentTime || 0,
-                duration: isFinite(el.duration) ? el.duration : 0});
+                duration: isFinite(el.duration) ? el.duration : 0,
+                width: el.videoWidth || 0, height: el.videoHeight || 0,
+                url: mediaUrl()});
         play(el);
       }
 
       // Closes this frame's window. A frame under an iframe theater leaves the
       // reporting to the top document, which owns the iframe's style.
       function leave(reportExit) {
+        cancelSpeed();
+        endSpeed();
         stop();
         if (theater && savedControls !== null) {
           try { theater.controls = savedControls; } catch (e) {}
@@ -1717,6 +1820,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         zoom = 1;
         mode = '';
         moved = false;
+        lastUrl = '';
         release();
         if (reportExit !== false) { report({kind: 'exit'}); }
       }
@@ -1750,6 +1854,30 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       function toggle(el) {
         if (el.paused) { play(el); } else { try { el.pause(); } catch (e) {} }
         state();
+      }
+
+      // A long press while the picture is playing holds it at 2x. Every way
+      // out of the hold goes through endSpeed(), so the rate can never stay
+      // doubled after the finger is gone.
+      function cancelSpeed() {
+        if (speedTimer) { clearTimeout(speedTimer); speedTimer = null; }
+      }
+
+      function beginSpeed() {
+        speedTimer = null;
+        if (!video || video.paused) { return; }
+        speedOn = true;
+        moved = true;
+        suppressUntil = Date.now() + 600;
+        try { video.playbackRate = 2; } catch (e) {}
+        report({kind: 'speed', rate: 2});
+      }
+
+      function endSpeed() {
+        if (!speedOn) { return; }
+        speedOn = false;
+        if (video) { try { video.playbackRate = 1; } catch (e) {} }
+        report({kind: 'speed', rate: 1});
       }
 
       // Players built from custom elements keep the video behind a shadow
@@ -1801,6 +1929,11 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           savedControls = el.controls;
           el.controls = false;
         } catch (err) {}
+        report({kind: 'enter', paused: !!el.paused,
+                position: el.currentTime || 0,
+                duration: isFinite(el.duration) ? el.duration : 0,
+                width: el.videoWidth || 0, height: el.videoHeight || 0,
+                url: mediaUrl()});
         play(el);
         try { parent.postMessage({__soVideo: 'enter'}, '*'); } catch (err) {}
       }, true);
@@ -1841,6 +1974,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       document.addEventListener('touchstart', function (e) {
         if (!theater) { return; }
         if (e.touches.length >= 2) {
+          cancelSpeed();
           mode = 'pinch';
           pinchStart = distance(e.touches);
           pinchBase = zoom;
@@ -1854,10 +1988,18 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         startX = e.touches[0].clientX;
         startY = e.touches[0].clientY;
         startTime = video ? (video.currentTime || 0) : 0;
+        cancelSpeed();
+        if (video && !video.paused) {
+          speedTimer = setTimeout(beginSpeed, 420);
+        }
       }, {passive: true, capture: true});
 
       document.addEventListener('touchmove', function (e) {
         if (!theater) { return; }
+        if (speedOn) {
+          if (e.cancelable) { e.preventDefault(); }
+          return;
+        }
         if (e.touches.length >= 2) {
           if (e.cancelable) { e.preventDefault(); }
           moved = true;
@@ -1879,6 +2021,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         var dy = touch.clientY - startY;
         if (!moved && Math.abs(dx) < 10 && Math.abs(dy) < 10) { return; }
         moved = true;
+        cancelSpeed();
         if (mode === '') {
           if (Math.abs(dx) > Math.abs(dy)) { mode = 'seek'; }
           else if (dy > 0) { mode = 'exit'; }
@@ -1903,6 +2046,8 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
 
       document.addEventListener('touchend', function (e) {
         if (!theater) { return; }
+        cancelSpeed();
+        endSpeed();
         if (mode === 'pinch') {
           if (e.touches.length === 0) {
             mode = '';
@@ -1924,10 +2069,17 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       }, {passive: true, capture: true});
 
       document.addEventListener('touchcancel', function () {
+        cancelSpeed();
+        endSpeed();
         if (mode === 'pinch' || mode === 'exit') { snapBack(); }
         mode = '';
         moved = false;
       }, {passive: true, capture: true});
+
+      // A long hold must not raise WebKit's own menu over our picture.
+      document.addEventListener('contextmenu', function (e) {
+        if (theater) { e.preventDefault(); }
+      }, true);
 
       // The system player must stay out of reach even if a page asks for it
       // directly: it is the thing that reappears over the page on its own.

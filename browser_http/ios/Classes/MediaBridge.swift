@@ -84,6 +84,46 @@ final class MediaBridge {
         }
     }
 
+    /// One in-memory frame (a player screenshot) saved as one photo.
+    ///
+    /// Photos takes a file URL, so the bytes go through a temporary file that
+    /// is removed whether the save worked or not.
+    static func savePhotoData(_ data: Data,
+                              filename: String,
+                              result: @escaping (String) -> Void) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async { result("denied") }
+                return
+            }
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(filename)
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                DispatchQueue.main.async {
+                    result("error: \(error.localizedDescription)")
+                }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                let request = PHAssetCreationRequest.forAsset()
+                let options = PHAssetResourceCreationOptions()
+                options.originalFilename = filename
+                request.addResource(with: .photo, fileURL: url, options: options)
+            } completionHandler: { success, error in
+                try? FileManager.default.removeItem(at: url)
+                DispatchQueue.main.async {
+                    if success {
+                        result("ok")
+                    } else {
+                        result("error: \(error?.localizedDescription ?? "save failed")")
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - HLS
 
     /// Decrypts one AES-128-CBC segment from an `#EXT-X-KEY` playlist.

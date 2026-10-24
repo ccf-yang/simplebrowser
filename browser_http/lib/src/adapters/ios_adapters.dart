@@ -458,6 +458,21 @@ final class _ChannelWebViewSession implements WebViewSession {
   }
 
   @override
+  Future<String> captureVideoFrame() async {
+    try {
+      return await _channel.invokeMethod<String>(
+            'captureVideoFrame',
+            <String, Object?>{'id': _id},
+          ) ??
+          'error: no result';
+    } on PlatformException catch (error) {
+      return 'error: ${error.message ?? error.code}';
+    } on MissingPluginException {
+      return 'error: unavailable';
+    }
+  }
+
+  @override
   Future<WebViewLoadResult> load(
     Uri uri, {
     Duration? timeout,

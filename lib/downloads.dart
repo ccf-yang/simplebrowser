@@ -74,6 +74,7 @@ final class DownloadItem {
     this.photoError,
     this.savedToPhotos = false,
     this.webdav = false,
+    this.libraryOnly = false,
     this.webdavPath,
     this.webdavError,
   });
@@ -107,6 +108,13 @@ final class DownloadItem {
 
   /// Send this to WebDAV once it is on local disk, then delete the local copy.
   final bool webdav;
+
+  /// Keep the file in the offline library instead of copying it to Photos.
+  ///
+  /// This is what the player's download button asks for: a page video is
+  /// something the user collects for later, not a camera-roll item.
+  final bool libraryOnly;
+
   String? webdavPath;
   String? webdavError;
 
@@ -197,6 +205,7 @@ final class DownloadItem {
     'photoError': photoError,
     'savedToPhotos': savedToPhotos,
     'webdav': webdav,
+    'libraryOnly': libraryOnly,
     'webdavPath': webdavPath,
     'webdavError': webdavError,
     'hls': hls,
@@ -236,6 +245,7 @@ final class DownloadItem {
       photoError: json['photoError']?.toString(),
       savedToPhotos: json['savedToPhotos'] == true,
       webdav: json['webdav'] == true,
+      libraryOnly: json['libraryOnly'] == true,
       webdavPath: json['webdavPath']?.toString(),
       webdavError: json['webdavError']?.toString(),
     );
@@ -429,6 +439,7 @@ final class DownloadManager extends ChangeNotifier {
     Iterable<SniffedResource> resources, {
     String? userAgent,
     bool webdav = false,
+    bool libraryOnly = false,
   }) {
     var added = 0;
     for (final resource in resources) {
@@ -444,6 +455,7 @@ final class DownloadManager extends ChangeNotifier {
         hlsVariant: resource.hlsVariantUrl,
         hlsVariantLabel: resource.hlsVariantLabel,
         webdav: webdav,
+        libraryOnly: libraryOnly,
       );
       items.insert(0, item);
       _queue.add(item);
@@ -919,6 +931,14 @@ final class DownloadManager extends ChangeNotifier {
   ) async {
     item.status = DownloadStatus.saving;
     _notify(force: true);
+    // The player's own downloads belong to the offline library only. The file
+    // already sits in Documents/Downloads, so there is nothing left to do.
+    if (item.libraryOnly) {
+      item
+        ..status = DownloadStatus.downloaded
+        ..photoError = null;
+      return;
+    }
     if (hlsResult != null && !hlsResult.saveable) {
       item
         ..status = DownloadStatus.downloaded

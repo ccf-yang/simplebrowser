@@ -177,6 +177,13 @@ class _BrowserPageState extends State<BrowserPage>
   double _videoPosition = 0;
   double _videoDuration = 0;
 
+  /// 2 while a long press is holding the picture fast, 1 otherwise.
+  double _videoRate = 1;
+
+  /// Where the picture came from: the element's own URL, or the manifest a
+  /// blob-backed player fetched. Empty while the page has not reported one.
+  String _videoSrc = '';
+
   /// A position the finger is aiming at, from the progress bar or a horizontal
   /// swipe. Non-null only while the gesture is in flight.
   double? _videoSeek;
@@ -527,9 +534,11 @@ class _BrowserPageState extends State<BrowserPage>
         _videoPaused = false;
         _videoPosition = 0;
         _videoDuration = 0;
+        _videoRate = 1;
         _videoDrag = 0;
         _videoSeek = null;
         _videoSeekPreview = null;
+        if (event.url.isNotEmpty) _videoSrc = event.url;
       });
       if (_consoleOpen) _pushToConsole('视频窗口打开 ${window.host}');
       return;
@@ -553,12 +562,17 @@ class _BrowserPageState extends State<BrowserPage>
       });
       return;
     }
+    if (event.isSpeed) {
+      setState(() => _videoRate = event.rate);
+      return;
+    }
     if (event.isState) {
       setState(() {
         _videoPaused = event.paused;
         _videoPosition = event.position;
         _videoDuration = event.duration;
         _videoSeekPreview = null;
+        if (event.url.isNotEmpty) _videoSrc = event.url;
       });
     }
   }
@@ -576,6 +590,8 @@ class _BrowserPageState extends State<BrowserPage>
       _videoPaused = true;
       _videoPosition = 0;
       _videoDuration = 0;
+      _videoRate = 1;
+      _videoSrc = '';
       _videoDrag = 0;
       _videoSeek = null;
       _videoSeekPreview = null;
@@ -648,6 +664,65 @@ class _BrowserPageState extends State<BrowserPage>
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
     _orientationTouched = true;
+  }
+
+  /// Saves the frame the player is showing — the picture only, with no
+  /// controls and no letterbox — to Photos.
+  Future<void> _captureVideoFrame() async {
+    if (!_videoOpen) return;
+    final webView = _browser.webView;
+    final status = webView == null
+        ? 'error: no webview'
+        : await webView.captureVideoFrame();
+    if (!mounted) return;
+    switch (status) {
+      case 'ok':
+        _snack('已把这一帧存入相册');
+      case 'denied':
+        _snack('相册权限未开启，不能保存截图');
+      default:
+        _snack('截图失败：${status.replaceFirst('error: ', '')}');
+    }
+  }
+
+  /// Queues the video the player is showing for the offline library.
+  ///
+  /// This is a normal download from the media URL, so it runs alongside
+  /// playback: the user does not have to watch to the end first. It never
+  /// goes to Photos — a page video is collected into the library.
+  void _downloadPlayerVideo() {
+    final source = _videoSrc.trim();
+    if (source.isEmpty) {
+      _snack('还没拿到视频地址，稍等一下再试');
+      return;
+    }
+    final uri = Uri.tryParse(source);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      _snack('这个视频只有播放器内部地址，暂时不能下载');
+      return;
+    }
+    final active = _downloads.items.any(
+      (item) => item.url == source && item.status.active,
+    );
+    if (active) {
+      _snack('这个视频已经在下载队列里');
+      return;
+    }
+    final hls = uri.path.toLowerCase().endsWith('.m3u8');
+    _downloads.enqueueAll(
+      <SniffedResource>[
+        SniffedResource(
+          url: source,
+          pageUrl: _browser.url ?? '',
+          kind: ResourceKind.video,
+          title: _browser.title ?? '',
+          hls: hls,
+        ),
+      ],
+      userAgent: _effectiveUserAgent,
+      libraryOnly: true,
+    );
+    _snack('已开始下载，可继续观看，完成后在离线库');
   }
 
   /// `m:ss`, or `h:mm:ss` past the hour. A zero or missing length is `0:00`.
@@ -796,6 +871,8 @@ class _BrowserPageState extends State<BrowserPage>
       _videoPaused = true;
       _videoPosition = 0;
       _videoDuration = 0;
+      _videoRate = 1;
+      _videoSrc = '';
       _videoDrag = 0;
       _videoSeek = null;
       _videoSeekPreview = null;
@@ -1597,9 +1674,11 @@ class _BrowserPageState extends State<BrowserPage>
       case DownloadStatus.failed:
         _snack('下载失败：${item.displayName}');
       case DownloadStatus.downloaded:
-        _snack(item.webdavError == null
-            ? '已下载，但未存入相册：${item.displayName}'
-            : 'WebDAV 未完成：${item.webdavError}');
+        _snack(item.libraryOnly
+            ? '已存入离线库：${item.displayName}'
+            : item.webdavError == null
+                ? '已下载，但未存入相册：${item.displayName}'
+                : 'WebDAV 未完成：${item.webdavError}');
       default:
         break;
     }
@@ -2508,7 +2587,10 @@ class _BrowserPageState extends State<BrowserPage>
   /// screen belongs to the video again.
   Widget _buildVideoOverlay() {
     final bubble = _videoSeekPreview;
-    if (!_videoControls && bubble == null) return const SizedBox.shrink();
+    final speed = _videoRate > 1;
+    if (!_videoControls && bubble == null && !speed) {
+      return const SizedBox.shrink();
+    }
     return Positioned.fill(
       child: Stack(
         children: <Widget>[
@@ -2525,6 +2607,21 @@ class _BrowserPageState extends State<BrowserPage>
               left: 0,
               right: 0,
               child: _buildVideoPanel(),
+            ),
+          if (speed)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: IgnorePointer(
+                child: SafeArea(
+                  bottom: false,
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 10),
+                    child: Center(child: _buildVideoSpeedBadge()),
+                  ),
+                ),
+              ),
             ),
           if (bubble != null)
             Positioned.fill(
@@ -2556,6 +2653,7 @@ class _BrowserPageState extends State<BrowserPage>
             Icons.close_rounded,
             '关闭视频窗口',
             _closeVideoWindow,
+            compact: true,
             background: const Color(0x66000000),
           ),
         ),
@@ -2563,15 +2661,60 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  /// Progress on top (elapsed left, remaining right), transport under it, and
-  /// the landscape switch in the bottom-left corner. Pulling the panel down
-  /// closes the window.
+  /// Progress on top (elapsed left, remaining right), then the controls.
+  ///
+  /// Six buttons at this size do not fit across a phone in portrait, so the
+  /// left group (landscape / screenshot / download) gets its own row and the
+  /// transport sits centred beneath it. Landscape has the width for one row,
+  /// with the two groups at opposite ends; pull the panel down to close.
   Widget _buildVideoPanel() {
     final duration = _videoDuration;
     final shown = _videoSeek ?? _videoSeekPreview ?? _videoPosition;
     final sliderMax = duration > 0 ? duration : 1.0;
     final sliderValue = shown.clamp(0.0, sliderMax).toDouble();
     final remaining = duration > 0 ? math.max(0.0, duration - shown) : 0.0;
+
+    final landscape = _videoControl(
+      _videoLandscape
+          ? Icons.fullscreen_exit_rounded
+          : Icons.fullscreen_rounded,
+      _videoLandscape ? '退出横屏' : '横屏播放',
+      _toggleVideoLandscape,
+    );
+    final shot = _videoControl(
+      Icons.photo_camera_outlined,
+      '截图保存到相册',
+      () => unawaited(_captureVideoFrame()),
+    );
+    final download = _videoControl(
+      Icons.download_rounded,
+      '下载到离线库',
+      _downloadPlayerVideo,
+    );
+    final transport = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        _videoControl(
+          Icons.replay_10_rounded,
+          '后退 10 秒',
+          () => _videoCommand('seekBy(-10)'),
+        ),
+        const SizedBox(width: 4),
+        _videoControl(
+          _videoPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+          _videoPaused ? '播放' : '暂停',
+          () => _videoCommand('toggle()'),
+          primary: true,
+        ),
+        const SizedBox(width: 4),
+        _videoControl(
+          Icons.forward_10_rounded,
+          '前进 10 秒',
+          () => _videoCommand('seekBy(10)'),
+        ),
+      ],
+    );
+
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onVerticalDragUpdate: (details) {
@@ -2589,7 +2732,7 @@ class _BrowserPageState extends State<BrowserPage>
         child: Opacity(
           opacity: (1 - _videoDrag / 240).clamp(0.45, 1.0).toDouble(),
           child: Container(
-            padding: const EdgeInsets.fromLTRB(12, 46, 12, 2),
+            padding: const EdgeInsets.fromLTRB(12, 44, 12, 4),
             decoration: const BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
@@ -2604,98 +2747,116 @@ class _BrowserPageState extends State<BrowserPage>
             ),
             child: SafeArea(
               top: false,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  Row(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final wide = constraints.maxWidth >= 600;
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
                     children: <Widget>[
-                      Text(_videoClock(shown), style: _videoTimeStyle(true)),
-                      Expanded(
-                        child: SliderTheme(
-                          data: SliderThemeData(
-                            trackHeight: 2.5,
-                            activeTrackColor: AppColors.signal,
-                            inactiveTrackColor: Colors.white.withAlpha(64),
-                            thumbColor: Colors.white,
-                            overlayColor: const Color(0x33FFFFFF),
-                            thumbShape: const RoundSliderThumbShape(
-                              enabledThumbRadius: 6,
-                            ),
-                            overlayShape: const RoundSliderOverlayShape(
-                              overlayRadius: 14,
+                      Row(
+                        children: <Widget>[
+                          Text(
+                            _videoClock(shown),
+                            style: _videoTimeStyle(true),
+                          ),
+                          Expanded(
+                            child: SliderTheme(
+                              data: SliderThemeData(
+                                trackHeight: 3,
+                                activeTrackColor: AppColors.signal,
+                                inactiveTrackColor: Colors.white.withAlpha(64),
+                                thumbColor: Colors.white,
+                                overlayColor: const Color(0x33FFFFFF),
+                                thumbShape: const RoundSliderThumbShape(
+                                  enabledThumbRadius: 7,
+                                ),
+                                overlayShape: const RoundSliderOverlayShape(
+                                  overlayRadius: 16,
+                                ),
+                              ),
+                              child: Slider(
+                                value: sliderValue,
+                                max: sliderMax,
+                                onChanged: duration > 0
+                                    ? (value) =>
+                                        setState(() => _videoSeek = value)
+                                    : null,
+                                onChangeEnd: duration > 0
+                                    ? (value) {
+                                        _videoCommand(
+                                          'seekTo(${value.toStringAsFixed(2)})',
+                                        );
+                                        setState(() {
+                                          _videoPosition = value;
+                                          _videoSeek = null;
+                                          _videoSeekPreview = null;
+                                        });
+                                      }
+                                    : null,
+                              ),
                             ),
                           ),
-                          child: Slider(
-                            value: sliderValue,
-                            max: sliderMax,
-                            onChanged: duration > 0
-                                ? (value) =>
-                                    setState(() => _videoSeek = value)
-                                : null,
-                            onChangeEnd: duration > 0
-                                ? (value) {
-                                    _videoCommand(
-                                      'seekTo(${value.toStringAsFixed(2)})',
-                                    );
-                                    setState(() {
-                                      _videoPosition = value;
-                                      _videoSeek = null;
-                                      _videoSeekPreview = null;
-                                    });
-                                  }
-                                : null,
+                          Text(
+                            duration > 0
+                                ? '-${_videoClock(remaining)}'
+                                : '--:--',
+                            style: _videoTimeStyle(false),
                           ),
-                        ),
+                        ],
                       ),
-                      Text(
-                        duration > 0 ? '-${_videoClock(remaining)}' : '--:--',
-                        style: _videoTimeStyle(false),
-                      ),
-                    ],
-                  ),
-                  Row(
-                    children: <Widget>[
-                      _videoControl(
-                        _videoLandscape
-                            ? Icons.fullscreen_exit_rounded
-                            : Icons.fullscreen_rounded,
-                        _videoLandscape ? '退出横屏' : '横屏播放',
-                        _toggleVideoLandscape,
-                      ),
-                      Expanded(
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
+                      const SizedBox(height: 2),
+                      if (wide)
+                        Row(
                           children: <Widget>[
-                            _videoControl(
-                              Icons.replay_10_rounded,
-                              '后退 10 秒',
-                              () => _videoCommand('seekBy(-10)'),
-                            ),
-                            _videoControl(
-                              _videoPaused
-                                  ? Icons.play_arrow_rounded
-                                  : Icons.pause_rounded,
-                              _videoPaused ? '播放' : '暂停',
-                              () => _videoCommand('toggle()'),
-                              primary: true,
-                            ),
-                            _videoControl(
-                              Icons.forward_10_rounded,
-                              '前进 10 秒',
-                              () => _videoCommand('seekBy(10)'),
-                            ),
+                            landscape,
+                            const SizedBox(width: 2),
+                            shot,
+                            const SizedBox(width: 2),
+                            download,
+                            const Spacer(),
+                            transport,
+                          ],
+                        )
+                      else ...<Widget>[
+                        Row(
+                          children: <Widget>[
+                            landscape,
+                            const SizedBox(width: 2),
+                            shot,
+                            const SizedBox(width: 2),
+                            download,
+                            const Spacer(),
                           ],
                         ),
-                      ),
-                      // Balances the landscape button so the transport group
-                      // stays optically centred in both orientations.
-                      const SizedBox(width: 40),
+                        const SizedBox(height: 2),
+                        Center(child: transport),
+                      ],
                     ],
-                  ),
-                ],
+                  );
+                },
               ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  /// The hold is invisible while it is happening unless the rate is shown;
+  /// a small pill says the gesture was understood.
+  Widget _buildVideoSpeedBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xD9000000),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: const Text(
+        '2× 倍速',
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: 14,
+          fontWeight: FontWeight.w700,
         ),
       ),
     );
@@ -2725,37 +2886,36 @@ class _BrowserPageState extends State<BrowserPage>
 
   TextStyle _videoTimeStyle(bool strong) => TextStyle(
         color: strong ? Colors.white : AppColors.darkMuted,
-        fontSize: 11.5,
+        fontSize: 12.5,
         fontWeight: strong ? FontWeight.w600 : FontWeight.w400,
       );
 
+  /// One control. The play button is white like the rest: the accent belongs
+  /// to live state in the browser chrome, not to a paused player. [primary]
+  /// only makes it bigger, and [compact] is for the close button up top.
   Widget _videoControl(
     IconData icon,
     String label,
     VoidCallback onTap, {
     bool primary = false,
+    bool compact = false,
     Color? background,
   }) {
+    final size = compact ? 44.0 : (primary ? 72.0 : 58.0);
+    final glyph = compact ? 24.0 : (primary ? 46.0 : 34.0);
     return Semantics(
       button: true,
       label: label,
-      child: Padding(
-        padding: const EdgeInsets.only(left: 2),
-        child: Material(
-          color: primary ? AppColors.signal : (background ?? Colors.transparent),
-          shape: const CircleBorder(),
-          child: InkWell(
-            customBorder: const CircleBorder(),
-            onTap: onTap,
-            child: SizedBox(
-              width: primary ? 44 : 38,
-              height: primary ? 44 : 38,
-              child: Icon(
-                icon,
-                size: primary ? 26 : 22,
-                color: primary ? AppColors.signalInk : Colors.white,
-              ),
-            ),
+      child: Material(
+        color: background ?? Colors.transparent,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onTap,
+          child: SizedBox(
+            width: size,
+            height: size,
+            child: Icon(icon, size: glyph, color: Colors.white),
           ),
         ),
       ),

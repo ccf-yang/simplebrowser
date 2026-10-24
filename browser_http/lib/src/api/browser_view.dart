@@ -340,6 +340,14 @@ final class BrowserController extends ChangeNotifier {
     return webView.snapshot(maxWidth: maxWidth);
   }
 
+  /// Saves the video picture the player is showing to Photos. See
+  /// [WebViewSession.captureVideoFrame] for what the returned statuses mean.
+  Future<String> captureVideoFrame() async {
+    final webView = _webView;
+    if (webView == null) return 'error: no webview';
+    return webView.captureVideoFrame();
+  }
+
   /// Whether the page-script hooks are installed. Off means the Page tab is
   /// closed and nothing from the page is collected.
   bool _pageNetwork = true;
