@@ -677,7 +677,7 @@ class _BrowserPageState extends State<BrowserPage>
     if (!mounted) return;
     switch (status) {
       case 'ok':
-        _snack('已把这一帧存入相册');
+        _snack('已保存视频画面到相册');
       case 'denied':
         _snack('相册权限未开启，不能保存截图');
       default:

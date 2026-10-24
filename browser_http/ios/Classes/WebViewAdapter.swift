@@ -708,23 +708,53 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
 
     /// Saves the frame the player is showing to Photos.
     ///
-    /// The video is composited by the system outside the WebView's own
-    /// drawing, so `takeSnapshot` photographs a black hole where the picture
-    /// is. The page element itself can be read instead: drawing it into a
-    /// canvas yields exactly the frame on screen, without the host's control
-    /// layer, because that layer is Flutter and never part of the page.
+    /// Three ways, tried in order: read the page's `<video>` through a canvas
+    /// (full resolution); draw that frame onto a full-screen page canvas and
+    /// photograph the page (a cross-origin picture taints the canvas, so it
+    /// cannot be read back, but it can still be seen); decode the media file
+    /// itself around the playhead, sampling twenty moments, and keep the first
+    /// picture that is not black.
     ///
-    /// Cross-origin media taints the canvas, and then the same stream is
-    /// decoded natively at the playhead with the page's user agent and
-    /// referer. HLS playlists and progressive files both work this way; a
-    /// stream the page assembles itself (MSE) normally takes the canvas path.
+    /// A snapshot of the bare video element is never useful: the video layer
+    /// is composited outside the page's drawing and comes back black.
     func captureVideoFrame(_ done: @escaping (String) -> Void) {
+        evaluatePageFrame { [weak self] info in
+            guard let self else { done("error: no view"); return }
+            if let data = Self.imageData(fromDataURL: info.frame),
+               !Self.isNearlyBlack(data) {
+                self.saveFramePhoto(data, done)
+                return
+            }
+            self.freezeAndSnapshot { [weak self] frozen in
+                guard let self else { done("error: no view"); return }
+                if let frozen, !Self.isNearlyBlack(frozen) {
+                    self.saveFramePhoto(frozen, done)
+                    return
+                }
+                self.captureVideoFrameRemotely(
+                    userAgent: info.userAgent, page: info.page,
+                    cookie: info.cookie, origin: info.origin, done)
+            }
+        }
+    }
+
+    private struct CaptureInfo {
+        var frame = ""
+        var userAgent = ""
+        var page = ""
+        var cookie = ""
+        var origin = ""
+    }
+
+    private func evaluatePageFrame(_ done: @escaping (CaptureInfo) -> Void) {
         let script = """
         (function () {
           var out = {
             frame: '',
             ua: navigator.userAgent || '',
-            page: location.href || ''
+            page: location.href || '',
+            cookie: document.cookie || '',
+            origin: location.origin || ''
           };
           try {
             if (typeof window.__soCaptureFrame === 'function') {
@@ -734,26 +764,170 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           return JSON.stringify(out);
         })()
         """
-        webView.evaluateJavaScript(script) { [weak self] value, _ in
-            guard let self else { done("error: no view"); return }
-            var frame = ""
-            var userAgent = ""
-            var page = ""
+        webView.evaluateJavaScript(script) { value, _ in
+            var info = CaptureInfo()
             if let text = value as? String,
                let data = text.data(using: .utf8),
                let parsed = try? JSONSerialization.jsonObject(with: data),
                let body = parsed as? [String: Any] {
-                frame = body["frame"] as? String ?? ""
-                userAgent = body["ua"] as? String ?? ""
-                page = body["page"] as? String ?? ""
+                info.frame = body["frame"] as? String ?? ""
+                info.userAgent = body["ua"] as? String ?? ""
+                info.page = body["page"] as? String ?? ""
+                info.cookie = body["cookie"] as? String ?? ""
+                info.origin = body["origin"] as? String ?? ""
             }
-            if let picture = WebViewHolder.imageData(fromDataURL: frame) {
-                self.saveFramePhoto(picture, done)
+            done(info)
+        }
+    }
+
+    /// Draws the current picture over the whole page and photographs that.
+    /// The overlay is page content, so the compositor includes it. Returns nil
+    /// when this frame has no picture to freeze (for example, a player inside
+    /// an iframe), so bare page text is never saved as a screenshot.
+    private func freezeAndSnapshot(_ done: @escaping (Data?) -> Void) {
+        let script = """
+        (function () {
+          if (typeof window.__soFreezeFrame !== 'function') { return ''; }
+          return window.__soFreezeFrame() || '';
+        })()
+        """
+        webView.evaluateJavaScript(script) { [weak self] value, _ in
+            guard let self else { done(nil); return }
+            let text = value as? String ?? ""
+            if let size = Self.parseSize(text) {
+                self.snapshotFrozen(size, done)
                 return
             }
-            self.captureVideoFrameRemotely(userAgent: userAgent, page: page,
-                                           done)
+            guard text == "pending" else {
+                done(nil)
+                return
+            }
+            self.pollFrozenSize(attempt: 0, done)
         }
+    }
+
+    /// Polls the top document for the size an iframe reported after being
+    /// asked to freeze. The frame draws its own picture; the top only stretches
+    /// it, so the host has to wait for the answer before photographing.
+    private func pollFrozenSize(attempt: Int,
+                                _ done: @escaping (Data?) -> Void) {
+        let script = "window.__soFrozenSize ? window.__soFrozenSize() : ''"
+        webView.evaluateJavaScript(script) { [weak self] value, _ in
+            guard let self else { done(nil); return }
+            if let size = Self.parseSize(value as? String ?? "") {
+                self.snapshotFrozen(size, done)
+                return
+            }
+            if attempt >= 12 {
+                self.unfreezeFrame()
+                done(nil)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                self.pollFrozenSize(attempt: attempt + 1, done)
+            }
+        }
+    }
+
+    private static func parseSize(_ text: String) -> CGSize? {
+        guard !text.isEmpty, text != "pending" else { return nil }
+        if let data = text.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data),
+           let body = parsed as? [String: Any],
+           let width = (body["width"] as? NSNumber)?.doubleValue,
+           let height = (body["height"] as? NSNumber)?.doubleValue,
+           width > 0, height > 0 {
+            return CGSize(width: width, height: height)
+        }
+        let parts = text.split(separator: ",")
+        if parts.count == 2,
+           let width = Double(parts[0]), let height = Double(parts[1]),
+           width > 0, height > 0 {
+            return CGSize(width: width, height: height)
+        }
+        return nil
+    }
+
+    private func snapshotFrozen(_ size: CGSize,
+                                _ done: @escaping (Data?) -> Void) {
+        // Give the compositor a frame to pick the canvas up.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { done(nil); return }
+            let configuration = WKSnapshotConfiguration()
+            if !self.webView.bounds.isEmpty {
+                configuration.rect = self.webView.bounds
+            }
+            self.webView.takeSnapshot(with: configuration) {
+                [weak self] image, _ in
+                guard let self else { done(nil); return }
+                self.unfreezeFrame()
+                guard let image else { done(nil); return }
+                let picture = Self.cropped(
+                    image, aspect: size.width / size.height)
+                done(picture.jpegData(compressionQuality: 0.95))
+            }
+        }
+    }
+
+    private func unfreezeFrame() {
+        webView.evaluateJavaScript(
+            "window.__soUnfreezeFrame && window.__soUnfreezeFrame()",
+            completionHandler: nil)
+    }
+
+    /// Cuts the letterbox off a frozen page photograph. The overlay centres
+    /// the canvas, so the picture is the aspect-fitted rectangle in the middle.
+    private static func cropped(_ image: UIImage, aspect: Double) -> UIImage {
+        guard aspect > 0, let source = image.cgImage,
+              source.width > 8, source.height > 8 else { return image }
+        let width = CGFloat(source.width)
+        let height = CGFloat(source.height)
+        let imageAspect = Double(width / height)
+        var rect = CGRect(x: 0, y: 0, width: width, height: height)
+        if aspect > imageAspect {
+            let fitted = (width / CGFloat(aspect)).rounded()
+            rect = CGRect(x: 0, y: ((height - fitted) / 2).rounded(),
+                          width: width, height: fitted)
+        } else {
+            let fitted = (height * CGFloat(aspect)).rounded()
+            rect = CGRect(x: ((width - fitted) / 2).rounded(), y: 0,
+                          width: fitted, height: height)
+        }
+        guard rect.width > 8, rect.height > 8,
+              let piece = source.cropping(to: rect) else { return image }
+        return UIImage(cgImage: piece, scale: image.scale,
+                       orientation: image.imageOrientation)
+    }
+
+    /// An all-black frame tells the host nothing; it can mean the decoder has
+    /// not produced this instant yet. Neighbours are sampled instead.
+    private static func isNearlyBlack(_ data: Data) -> Bool {
+        guard let image = UIImage(data: data), let source = image.cgImage else {
+            return true
+        }
+        let width = 24, height = 24
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        var maximum = 0
+        var total = 0
+        pixels.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress,
+                  let space = CGColorSpace(name: CGColorSpace.sRGB),
+                  let context = CGContext(
+                    data: base, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: width * 4,
+                    space: space,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return }
+            context.draw(source, in: CGRect(x: 0, y: 0,
+                                            width: width, height: height))
+        }
+        for index in stride(from: 0, to: pixels.count, by: 4) {
+            let value = (Int(pixels[index]) + Int(pixels[index + 1]) +
+                         Int(pixels[index + 2])) / 3
+            total += value
+            if value > maximum { maximum = value }
+        }
+        return maximum < 24 && total / (width * height) < 12
     }
 
     private static func imageData(fromDataURL value: String) -> Data? {
@@ -770,12 +944,15 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         MediaBridge.savePhotoData(data, filename: name, result: done)
     }
 
-    /// Reads a frame out of the media file itself when the page's canvas is
-    /// not allowed to (cross-origin picture). The request carries the page's
-    /// user agent, referer and cookies, or the host will serve nothing.
+    /// Last resort: decode the media file itself around the playhead. The
+    /// request carries the page's user agent, referer, cookies and origin, or
+    /// the host will serve nothing. Twenty moments are sampled because one
+    /// seek can land on a keyframe boundary or before the first picture.
     private func captureVideoFrameRemotely(
         userAgent: String,
         page: String,
+        cookie: String,
+        origin: String,
         _ done: @escaping (String) -> Void
     ) {
         guard let url = URL(string: videoUrl),
@@ -784,42 +961,70 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             done("error: 页面没有给出可以直接读取的视频地址")
             return
         }
-        var headers: [String: String] = [:]
+        var headers: [String: String] = ["Accept": "*/*"]
         if !userAgent.isEmpty { headers["User-Agent"] = userAgent }
         let referer = videoReferer.isEmpty ? page : videoReferer
         if !referer.isEmpty { headers["Referer"] = referer }
-        if let cookies = HTTPCookieStorage.shared.cookies(for: url),
-           !cookies.isEmpty {
-            let fields = HTTPCookie.requestHeaderFields(with: cookies)
-            for (key, value) in fields { headers[key] = value }
+        if !origin.isEmpty { headers["Origin"] = origin }
+        var cookies = cookie
+        if let stored = HTTPCookieStorage.shared.cookies(for: url),
+           !stored.isEmpty {
+            let found = HTTPCookie.requestHeaderFields(with: stored)["Cookie"]
+            if let found, !found.isEmpty {
+                cookies = cookies.isEmpty ? found : cookies + "; " + found
+            }
         }
-        let seconds = max(0, videoPosition)
+        if !cookies.isEmpty { headers["Cookie"] = cookies }
+
+        let base = max(0, videoPosition)
+        let offsets: [Double] = [
+            0, 0.15, -0.15, 0.3, -0.3, 0.5, -0.5, 0.75, -0.75, 1.0,
+            -1.0, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0
+        ]
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let asset = AVURLAsset(
                 url: url,
                 options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
             let generator = AVAssetImageGenerator(asset: asset)
             generator.appliesPreferredTrackTransform = true
-            let tolerance = CMTime(seconds: 0.5, preferredTimescale: 600)
+            let tolerance = CMTime(seconds: 0.15, preferredTimescale: 600)
             generator.requestedTimeToleranceBefore = tolerance
             generator.requestedTimeToleranceAfter = tolerance
-            do {
-                let image = try generator.copyCGImage(
-                    at: CMTime(seconds: seconds, preferredTimescale: 600),
-                    actualTime: nil)
-                guard let data = UIImage(cgImage: image)
-                    .jpegData(compressionQuality: 0.95) else {
-                    DispatchQueue.main.async { done("error: 无法编码这一帧") }
+            var fallback: Data?
+            var lastError: Error?
+            var failures = 0
+            for offset in offsets {
+                let seconds = max(0, base + offset)
+                do {
+                    let image = try generator.copyCGImage(
+                        at: CMTime(seconds: seconds, preferredTimescale: 600),
+                        actualTime: nil)
+                    guard let data = UIImage(cgImage: image)
+                        .jpegData(compressionQuality: 0.95) else { continue }
+                    if fallback == nil { fallback = data }
+                    if !Self.isNearlyBlack(data) {
+                        DispatchQueue.main.async {
+                            guard let self else {
+                                done("error: no view")
+                                return
+                            }
+                            self.saveFramePhoto(data, done)
+                        }
+                        return
+                    }
+                } catch {
+                    lastError = error
+                    failures += 1
+                    if failures >= 5 && fallback == nil { break }
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { done("error: no view"); return }
+                if let fallback {
+                    self.saveFramePhoto(fallback, done)
                     return
                 }
-                DispatchQueue.main.async {
-                    guard let self else { done("error: no view"); return }
-                    self.saveFramePhoto(data, done)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    done("error: \(error.localizedDescription)")
-                }
+                done("error: \(lastError?.localizedDescription ?? "无法读取这一帧")")
             }
         }
     }
@@ -1703,7 +1908,11 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       var speedTimer = null;   // long press: still counting down
       var speedOn = false;     // 2x while the finger stays down
       var armedUntil = 0;      // a tap just asked a player to start
+      var armedStrict = false; // the tap was not on a player: only a new play counts
       var armTimer = null;     // polling for the video that tap started
+      var lastTapX = 0, lastTapY = 0;
+      var tapX = 0, tapY = 0, tapMoved = true;
+      var frozenChild = null;  // top frame: dimensions reported by an iframe
 
       function report(message) {
         try {
@@ -1835,25 +2044,17 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         return false;
       }
 
-      // A muted (or looping) picture with no player around it is a decorative
-      // background, not something the user meant to watch full screen.
-      function backgroundish(el, node) {
-        return !el.controls && !playerish(el) && !playerish(node) &&
-               (el.muted || el.loop);
-      }
-
-      // Whether a video the tap did not land on directly is still the thing the
-      // user meant. A tap inside the picture claims it outright; a pick from
-      // the same player box has to look like a player or fill the screen.
+      // Whether a video is the one the user meant. A tap inside the picture
+      // claims it outright — muted or not; a pick from the same player box has
+      // to look like a player, be playing, or fill the screen.
       function worthTaking(el, node, direct) {
         if (!el || el.tagName !== 'VIDEO') { return false; }
-        if (backgroundish(el, node)) { return false; }
         if (direct) { return true; }
         if (!el.paused || el.controls) { return true; }
         if (playerish(el) || playerish(node)) { return true; }
         var rect = el.getBoundingClientRect();
         return rect.width * rect.height >=
-               window.innerWidth * window.innerHeight * 0.35;
+               window.innerWidth * window.innerHeight * 0.2;
       }
 
       // Adopts a video found through something other than a direct hit. Inside
@@ -1890,21 +2091,42 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       // has no tap behind it and never gets here.
       function checkArmed() {
         armTimer = null;
+        if (theater && document.contains(theater)) { armedUntil = 0; return; }
         if (Date.now() > armedUntil) { return; }
+        var tapped = videoAt(lastTapX, lastTapY);
+        if (armedStrict && tapped && tapped.__soPlaying) { tapped = null; }
+        if (tapped && tapped !== video && !tapped.paused && onScreen(tapped)) {
+          armedUntil = 0;
+          handOver(tapped);
+          return;
+        }
         var list = allVideos();
+        var best = null, bestArea = 0;
         for (var i = 0; i < list.length; i += 1) {
           var el = list[i];
           if (el === video || el.paused || !onScreen(el)) { continue; }
-          if (!worthTaking(el, el, false)) { continue; }
+          if (armedStrict && el.__soPlaying) { continue; }
+          var rect = el.getBoundingClientRect();
+          var area = rect.width * rect.height;
+          if (area > bestArea) { best = el; bestArea = area; }
+        }
+        if (best) {
           armedUntil = 0;
-          handOver(el);
+          handOver(best);
           return;
         }
         armTimer = setTimeout(checkArmed, 120);
       }
 
-      function armForPlay() {
-        armedUntil = Date.now() + 1800;
+      function armForPlay(strict) {
+        armedStrict = !!strict;
+        armedUntil = Date.now() + 3000;
+        if (armedStrict) {
+          var list = allVideos();
+          for (var i = 0; i < list.length; i += 1) {
+            list[i].__soPlaying = !list[i].paused;
+          }
+        }
         if (!armTimer) { armTimer = setTimeout(checkArmed, 120); }
       }
 
@@ -2203,9 +2425,12 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             }
           }
           // The player has not built its <video> yet, or will start it on the
-          // next tick. Watch for it briefly instead of giving up on this tap;
-          // a tap on unrelated page furniture does not arm the watch.
-          if (playerish(e.target) || picked) { armForPlay(); }
+          // next tick. Every tap arms the watch, but a tap outside a player
+          // only reacts to a video that starts playing after it — a muted
+          // background loop that was already running can never pop up.
+          lastTapX = e.clientX;
+          lastTapY = e.clientY;
+          armForPlay(!(playerish(e.target) || picked || videoNear(e.target)));
           return;
         }
         // The tap means "play this here". Letting the page see the same click
@@ -2257,7 +2482,14 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                   url: data.url || '', referer: data.referer || ''});
           return;
         }
+        if (data.__soVideo === 'frozen') {
+          if (isTop) {
+            frozenChild = {width: data.width || 0, height: data.height || 0};
+          }
+          return;
+        }
         if (data.__soVideo === 'exit') {
+          frozenChild = null;
           if (isTop) {
             child = null;
             release();
@@ -2267,12 +2499,70 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
           }
           return;
         }
+        if (!isTop && data.__soVideo === 'capture') {
+          var size = null;
+          try { size = window.__soFreezeFrame ? window.__soFreezeFrame() : ''; }
+          catch (e) { size = ''; }
+          if (size) {
+            var dims = null;
+            try { dims = JSON.parse(size); } catch (e) { dims = null; }
+            if (dims) {
+              try {
+                parent.postMessage({__soVideo: 'frozen',
+                                    width: dims.width || 0,
+                                    height: dims.height || 0}, '*');
+              } catch (e) {}
+            }
+          }
+          return;
+        }
+        if (!isTop && data.__soVideo === 'unfreeze') {
+          if (window.__soUnfreezeFrame) { window.__soUnfreezeFrame(); }
+          return;
+        }
         if (!isTop && video) {
           if (data.__soVideo === 'seekBy') { seek(video, data.by || 0); }
           else if (data.__soVideo === 'seekTo') { seekTo(video, data.to || 0); }
           else if (data.__soVideo === 'toggle') { toggle(video); }
         }
       }, false);
+
+      // A player's native control bar may start playback without dispatching
+      // a click to the page. A short tap that lands on a picture (or on a
+      // player box) arms the same watcher; a scroll never does, so dragging
+      // the page cannot pop the window open.
+      document.addEventListener('touchstart', function (e) {
+        if (theater || e.touches.length !== 1) { return; }
+        tapX = e.touches[0].clientX;
+        tapY = e.touches[0].clientY;
+        tapMoved = false;
+      }, {passive: true, capture: true});
+
+      document.addEventListener('touchmove', function (e) {
+        if (theater || e.touches.length !== 1) { return; }
+        var touch = e.touches[0];
+        if (Math.abs(touch.clientX - tapX) > 12 ||
+            Math.abs(touch.clientY - tapY) > 12) { tapMoved = true; }
+      }, {passive: true, capture: true});
+
+      document.addEventListener('touchend', function (e) {
+        if (theater || tapMoved) { return; }
+        lastTapX = tapX;
+        lastTapY = tapY;
+        armForPlay(!(videoAt(tapX, tapY) || playerish(e.target) ||
+                     videoNear(e.target)));
+      }, {passive: true, capture: true});
+
+      // Some players start the video from a touch handler and swallow the
+      // click. A play event inside the armed window still opens the window.
+      document.addEventListener('play', function (e) {
+        if (theater && document.contains(theater)) { return; }
+        if (Date.now() > armedUntil) { return; }
+        var el = videoOf(null, e);
+        if (!el || !onScreen(el)) { return; }
+        armedUntil = 0;
+        handOver(el);
+      }, true);
 
       document.addEventListener('touchstart', function (e) {
         if (!theater) { return; }
@@ -2391,6 +2681,18 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         HTMLVideoElement.prototype.webkitExitFullscreen = function () {};
         HTMLVideoElement.prototype.webkitSetPresentationMode = function () {};
       } catch (e) {}
+      // A page that takes its container full screen on its own would leave the
+      // host's controls underneath the system player. The window it gets here
+      // is the app's player, so these entry points do nothing.
+      try {
+        Element.prototype.requestFullscreen = function () {
+          return Promise.reject(new Error('handled by host'));
+        };
+        Element.prototype.webkitRequestFullscreen = function () {};
+        HTMLVideoElement.prototype.requestFullscreen = function () {
+          return Promise.reject(new Error('handled by host'));
+        };
+      } catch (e) {}
 
       window.addEventListener('pagehide', function () {
         if (!theater) { return; }
@@ -2402,10 +2704,87 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         }
       });
 
+      // When the canvas cannot be read back (a cross-origin stream taints it),
+      // the frame is still drawn into a full-screen canvas and left on the
+      // page: the host photographs the page, where the picture is now ordinary
+      // page content, and the video layer is not involved. The host removes
+      // the overlay as soon as the snapshot is taken.
+      window.__soFreezeFrame = function () {
+        if (child) {
+          // The picture lives in a cross-origin frame: only that frame can
+          // draw it. Ask it to freeze and let the host poll for the answer.
+          frozenChild = null;
+          try { child.postMessage({__soVideo: 'capture'}, '*'); } catch (e) {}
+          return 'pending';
+        }
+        if (!video || !video.videoWidth || !video.videoHeight) { return ''; }
+        if (video.readyState < 2) { return ''; }
+        var width = video.videoWidth, height = video.videoHeight;
+        var canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        var context = null;
+        try { context = canvas.getContext('2d', {willReadFrequently: true}); }
+        catch (e) {}
+        if (!context) {
+          try { context = canvas.getContext('2d'); } catch (e) {}
+        }
+        if (!context) { return ''; }
+        try { context.drawImage(video, 0, 0, width, height); }
+        catch (e) { return ''; }
+        var old = document.getElementById('__soFrozenFrame');
+        if (old && old.parentNode) {
+          try { if (old.close) { old.close(); } } catch (e) {}
+          old.parentNode.removeChild(old);
+        }
+        var holder = null;
+        try { holder = document.createElement('dialog'); } catch (e) {}
+        if (!holder) { holder = document.createElement('div'); }
+        holder.id = '__soFrozenFrame';
+        holder.setAttribute('style',
+          'position:fixed!important;top:0!important;left:0!important;' +
+          'right:0!important;bottom:0!important;width:100vw!important;' +
+          'height:100vh!important;max-width:none!important;' +
+          'max-height:none!important;margin:0!important;padding:0!important;' +
+          'border:0!important;border-radius:0!important;' +
+          'background:#000!important;z-index:2147483647!important;' +
+          'display:flex!important;align-items:center!important;' +
+          'justify-content:center!important;overflow:hidden!important;' +
+          'pointer-events:none!important;');
+        canvas.setAttribute('style',
+          'max-width:100%!important;max-height:100%!important;' +
+          'width:auto!important;height:auto!important;' +
+          'margin:0!important;padding:0!important;display:block!important;');
+        holder.appendChild(canvas);
+        document.documentElement.appendChild(holder);
+        if (holder.showModal) {
+          try { holder.showModal(); } catch (e) {}
+        }
+        return JSON.stringify({width: width, height: height});
+      };
+
+      window.__soUnfreezeFrame = function () {
+        var holder = document.getElementById('__soFrozenFrame');
+        if (holder && holder.close) { try { holder.close(); } catch (e) {} }
+        if (holder && holder.parentNode) { holder.parentNode.removeChild(holder); }
+        if (child) {
+          try { child.postMessage({__soVideo: 'unfreeze'}, '*'); } catch (e) {}
+        }
+        frozenChild = null;
+      };
+
+      // The host polls this after asking an iframe to freeze: '' until the
+      // frame says its picture is ready, then "width,height".
+      window.__soFrozenSize = function () {
+        if (!frozenChild) { return ''; }
+        return frozenChild.width + ',' + frozenChild.height;
+      };
+
       // Reading a frame from the element is the only way to get the picture
       // itself: a WebView snapshot sees the composited layers, and the video
       // layer is not one of them. A cross-origin file taints the canvas, so
-      // this returns nothing and the host decodes the stream instead.
+      // this returns nothing and the host freezes the page or decodes the
+      // stream instead.
       window.__soCaptureFrame = function () {
         if (!video || !video.videoWidth || !video.videoHeight) { return ''; }
         if (video.readyState < 2) { return ''; }
