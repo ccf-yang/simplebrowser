@@ -517,6 +517,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     private lazy var trustedCertHosts: Set<String> = Set(
         UserDefaults.standard.stringArray(forKey: trustedCertHostsKey) ?? [])
 
+    /// Roots (base64 of the DER) learned from a host the user continued past.
+    /// A proxy signs every site with the same CA, so trusting one host and then
+    /// rejecting its own subresources on another host would leave the page
+    /// half-broken. Only the root that the user already accepted is extended.
+    /// Session-only: the explicit per-host answer is what survives a launch.
+    private var trustedCertRoots: Set<String> = []
+
     // -----------------------------------------------------------------------
     // Page state: pushed to the host, never polled
     // -----------------------------------------------------------------------
@@ -1766,14 +1773,32 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                                                URLCredential?) -> Void) {
         guard challenge.protectionSpace.authenticationMethod
                 == NSURLAuthenticationMethodServerTrust,
-              let trust = challenge.protectionSpace.serverTrust,
-              trustedCertHosts.contains(
-                challenge.protectionSpace.host.lowercased())
+              let trust = challenge.protectionSpace.serverTrust
         else {
             completionHandler(.performDefaultHandling, nil)
             return
         }
-        completionHandler(.useCredential, URLCredential(trust: trust))
+        let host = challenge.protectionSpace.host.lowercased()
+        if trustedCertHosts.contains(host) {
+            if let root = Self.rootKey(of: trust) { trustedCertRoots.insert(root) }
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        if let root = Self.rootKey(of: trust), trustedCertRoots.contains(root) {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
+    }
+
+    /// A stable identity for the root certificate in [trust]. The last
+    /// certificate in the chain is the anchor the proxy installed.
+    private static func rootKey(of trust: SecTrust) -> String? {
+        let count = SecTrustGetCertificateCount(trust)
+        guard count > 0,
+              let root = SecTrustGetCertificateAtIndex(trust, count - 1)
+        else { return nil }
+        return (SecCertificateCopyData(root) as Data).base64EncodedString()
     }
 
     /// A failed navigation often has no URL yet; `about:blank` keeps the row
