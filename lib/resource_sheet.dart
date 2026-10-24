@@ -65,6 +65,8 @@ class _ResourceSheetState extends State<ResourceSheet> {
   bool _loading = true;
   String? _error;
   int _filter = 0; // all / images / videos
+  /// Smallest side an image must have, in pixels. Null keeps every image.
+  int? _minImageSide;
   late bool _toWebDav =
       widget.webdavReady && widget.initialToWebDav;
 
@@ -115,10 +117,53 @@ class _ResourceSheetState extends State<ResourceSheet> {
     unawaited(_scan());
   }
 
+  /// Applies the image-size filter. Selections the filter hides are dropped, so
+  /// "Select all" and the download list always describe what is on screen.
+  void _setImageFilter(int? value) {
+    setState(() {
+      _minImageSide = value;
+      final present = _visible.map((item) => item.url).toSet();
+      _selected.removeWhere((url) => !present.contains(url));
+    });
+  }
+
+  /// Steps the picker offers, largest first. Only steps the page can actually
+  /// satisfy are listed: a dropdown full of sizes no image reaches is noise,
+  /// and the top entry shows how large the real images are.
+  static const List<int> _imageSteps = <int>[
+    720, 480, 360, 300, 240, 200, 150, 120, 100, 70, 50,
+  ];
+
+  List<int> get _imageOptions {
+    var largest = 0;
+    for (final item in _items) {
+      if (item.kind != ResourceKind.image) continue;
+      final w = item.width ?? 0;
+      final h = item.height ?? 0;
+      if (w <= 0 || h <= 0) continue;
+      final side = w < h ? w : h;
+      if (side > largest) largest = side;
+    }
+    return _imageSteps.where((step) => step <= largest).toList();
+  }
+
+  bool _passesImageFilter(SniffedResource item) {
+    final min = _minImageSide;
+    if (min == null || item.kind != ResourceKind.image) return true;
+    final w = item.width ?? 0;
+    final h = item.height ?? 0;
+    // A resource the page never measured cannot prove it is a large picture.
+    if (w <= 0 || h <= 0) return false;
+    return (w < h ? w : h) >= min;
+  }
+
   List<SniffedResource> get _visible => switch (_filter) {
-    1 => _items.where((item) => item.kind == ResourceKind.image).toList(),
+    1 => _items
+        .where((item) => item.kind == ResourceKind.image)
+        .where(_passesImageFilter)
+        .toList(),
     2 => _items.where((item) => item.kind == ResourceKind.video).toList(),
-    _ => _items,
+    _ => _items.where(_passesImageFilter).toList(),
   };
 
   List<SniffedResource> get _chosen => _items
@@ -348,6 +393,33 @@ class _ResourceSheetState extends State<ResourceSheet> {
                 ],
               ),
             ),
+            if (_imageOptions.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 0, 18, 8),
+                child: Row(
+                  children: <Widget>[
+                    const Text(
+                      '图片筛选',
+                      style: TextStyle(fontSize: 10, color: AppColors.muted),
+                    ),
+                    const SizedBox(width: 8),
+                    _ImageFilterMenu(
+                      value: _minImageSide,
+                      options: _imageOptions,
+                      onChanged: _setImageFilter,
+                    ),
+                    const SizedBox(width: 6),
+                    if (_minImageSide != null)
+                      Text(
+                        '${_items.where((item) => item.kind == ResourceKind.image).where(_passesImageFilter).length} 张',
+                        style: const TextStyle(
+                          fontSize: 9.5,
+                          color: AppColors.faint,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             if (_loading) const LinearProgressIndicator(
               minHeight: 2,
               color: AppColors.ink,
@@ -489,8 +561,72 @@ class _ResourceSheetState extends State<ResourceSheet> {
   }
 }
 
+/// Image-size dropdown: "全部图片", then the sizes the page actually reaches,
+/// largest first. Small icons are what most album pages are full of, so the
+/// cutoff lives right under the history switch.
+class _ImageFilterMenu extends StatelessWidget {
+  const _ImageFilterMenu({
+    required this.value,
+    required this.options,
+    required this.onChanged,
+  });
+
+  final int? value;
+  final List<int> options;
+  final ValueChanged<int?> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final on = value != null;
+    return PopupMenuButton<int>(
+      initialValue: value ?? 0,
+      onSelected: (picked) => onChanged(picked == 0 ? null : picked),
+      itemBuilder: (_) => <PopupMenuEntry<int>>[
+        const PopupMenuItem<int>(value: 0, child: Text('全部图片')),
+        for (final step in options)
+          PopupMenuItem<int>(value: step, child: Text('≥ $step×$step')),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: on ? AppColors.signalWash : AppColors.card,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(
+            color: on ? AppColors.signalLine : AppColors.line2,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(
+              Icons.filter_alt_outlined,
+              size: 12,
+              color: on ? AppColors.ink : AppColors.muted,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              on ? '≥ $value×$value' : '全部图片',
+              style: TextStyle(
+                fontSize: 10.5,
+                fontWeight: on ? FontWeight.w700 : FontWeight.w500,
+                color: AppColors.ink2,
+              ),
+            ),
+            const Icon(
+              Icons.arrow_drop_down_rounded,
+              size: 14,
+              color: AppColors.muted,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// Small on/off chip in the resource sheet's option row.
 class _TogglePill extends StatelessWidget {
+
   const _TogglePill({
     required this.icon,
     required this.label,

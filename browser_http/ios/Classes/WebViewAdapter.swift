@@ -468,6 +468,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
 
     private static let networkHandlerName = "browserHttpNet"
     private static let tapHandlerName = "browserHttpTap"
+    /// A link or `window.open` that asks for another window. The host loads it
+    /// in the window the user is already looking at.
+    private static let openHandlerName = "browserHttpOpen"
     /// Playback of the page's own video, reported from the video script: the
     /// player window opened or closed, and where the playhead is.
     private static let videoHandlerName = "browserHttpVideo"
@@ -503,6 +506,12 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// Requests this holder re-issued itself; their policy call must be allowed
     /// untouched or the re-issue would cancel itself forever.
     private var programmaticURLs: Set<String> = []
+
+    /// The last link the page asked to open in a new window, and when. A page
+    /// often fires both a click and a `window.open` for one tap; only the
+    /// first report may start a load.
+    private var lastOpenURL = ""
+    private var lastOpenAt = Date.distantPast
 
     /// The last http(s) document a main frame asked for. A failed provisional
     /// navigation usually has no `webView.url` yet, and a certificate warning
@@ -651,6 +660,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         webView.configuration.userContentController.add(
             WeakScriptMessageHandler(delegate: self),
             name: WebViewHolder.tapHandlerName)
+        webView.configuration.userContentController.add(
+            WeakScriptMessageHandler(delegate: self),
+            name: WebViewHolder.openHandlerName)
         webView.configuration.userContentController.add(
             WeakScriptMessageHandler(delegate: self),
             name: WebViewHolder.videoHandlerName)
@@ -1469,6 +1481,28 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         webView.load(request)
     }
 
+    /// Loads a link the page wanted to open in a new window into this one.
+    /// One request per tap: the page may report the same URL twice (a click
+    /// and its own `window.open`).
+    private func openInPlace(_ url: URL) {
+        let target = url.absoluteString
+        let now = Date()
+        if lastOpenURL == target, now.timeIntervalSince(lastOpenAt) < 1.2 {
+            return
+        }
+        lastOpenURL = target
+        lastOpenAt = now
+        if webView.url?.absoluteString == target { return }
+        var request = URLRequest(url: url)
+        if let from = webView.url?.absoluteString, from.hasPrefix("http") {
+            request.setValue(from, forHTTPHeaderField: "Referer")
+        }
+        loadInApp(request)
+        reportNavigation(kind: "in-app", url: url, method: "GET",
+                         mainFrame: true, type: "other",
+                         message: "new-window link opened in place")
+    }
+
     /// Remembers the user's answer to a certificate warning and reloads the
     /// page that was refused. Only the named host is accepted afterwards.
     func trustCertificate(host: String) {
@@ -1564,6 +1598,15 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     /// page -> Dart bridge. WebKit calls this on the main thread.
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
+        if message.name == WebViewHolder.openHandlerName {
+            guard let body = message.body as? [String: Any],
+                  let raw = body["url"] as? String,
+                  let url = URL(string: raw),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { return }
+            openInPlace(url)
+            return
+        }
         if message.name == WebViewHolder.tapHandlerName {
             guard var body = message.body as? [String: Any],
                   let url = body["url"] as? String, !url.isEmpty else { return }
@@ -1647,14 +1690,9 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                 // so the same request is loaded in this one. Doing it inside
                 // the callback that is cancelling the window makes WebKit
                 // drop it, hence the next run-loop turn.
-                let request = navigationAction.request
+                let url = url
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    if let target = request.url?.absoluteString,
-                       self.webView.url?.absoluteString == target {
-                        return
-                    }
-                    self.loadInApp(request)
+                    self?.openInPlace(url)
                 }
             }
         }
@@ -1877,6 +1915,37 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       document.addEventListener('contextmenu', function (e) {
         if (linkOf(e.target)) { e.preventDefault(); }
       }, false);
+
+      // A link that asks for another window has nowhere to go: WebKit's popup
+      // bridge is unreliable in this browser, and a `window.open` that returns
+      // null makes the page's own handler throw before it does anything. The
+      // long-press menu already proved `href` is the right destination, so the
+      // tap is handed to the host, which loads it in the current window.
+      function openInPlace(url) {
+        if (!url || !/^https?:/i.test(url)) { return false; }
+        try {
+          window.webkit.messageHandlers.browserHttpOpen.postMessage(
+            {url: url});
+          return true;
+        } catch (e) { return false; }
+      }
+      document.addEventListener('click', function (e) {
+        if (e.defaultPrevented) { return; }
+        var a = linkOf(e.target);
+        if (!a) { return; }
+        var target = (a.getAttribute('target') || '').toLowerCase();
+        if (target !== '_blank' && target !== '_new') { return; }
+        if (openInPlace(a.href)) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }, true);
+      var nativeOpen = window.open;
+      window.open = function (url) {
+        var href = typeof url === 'string' ? url : '';
+        if (href && openInPlace(href)) { return null; }
+        return nativeOpen.apply(window, arguments);
+      };
     })();
     """#
 

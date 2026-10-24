@@ -276,6 +276,9 @@ class _BrowserPageState extends State<BrowserPage>
 
   Timer? _consoleRefreshTimer;
   Timer? _resourceTimer;
+  Timer? _sniffRecordTimer;
+  Timer? _sniffRecordLate;
+  Timer? _sniffRecordLoop;
 
   // Bookmarks live in the app container, not in the WebView profile.
   final List<_Bookmark> _bookmarks = <_Bookmark>[];
@@ -375,12 +378,52 @@ class _BrowserPageState extends State<BrowserPage>
       _sniffToWebDav = prefs['sniffToWebDav'] == true;
       _sniff.record = prefs['recordSniffHistory'] == true;
     });
+    _syncSniffRecordLoop();
   }
 
   void _persistSniffHistory() {
     unawaited(_setPrefs(<String, Object?>{
       'recordSniffHistory': _sniff.record ? true : null,
     }));
+    _syncSniffRecordLoop();
+  }
+
+  /// A slow scan while recording is on: endless-scroll pages add images without
+  /// navigating, and the sheet should already have them when it opens.
+  void _syncSniffRecordLoop() {
+    if (!mounted) return;
+    _sniffRecordLoop?.cancel();
+    _sniffRecordLoop = null;
+    if (!_sniff.record) return;
+    _sniffRecordLoop = Timer.periodic(const Duration(seconds: 6), (_) {
+      unawaited(_recordSniffPage());
+    });
+  }
+
+  /// With the sniff sheet's history switch on, every page the user opens is
+  /// recorded without opening the sheet again: a scan once the document is on
+  /// screen, and a second one after lazy images have had time to appear.
+  void _scheduleSniffRecord() {
+    if (!_sniff.record) return;
+    _sniffRecordTimer?.cancel();
+    _sniffRecordLate?.cancel();
+    _sniffRecordTimer = Timer(const Duration(milliseconds: 1200), () {
+      unawaited(_recordSniffPage());
+    });
+    _sniffRecordLate = Timer(const Duration(seconds: 4), () {
+      unawaited(_recordSniffPage());
+    });
+  }
+
+  Future<void> _recordSniffPage() async {
+    if (!mounted || !_sniff.record) return;
+    try {
+      final scanned = await SniffedResource.scan(_browser);
+      if (!mounted || !_sniff.record) return;
+      _sniff.merge(scanned);
+    } on Object {
+      // A document replaced mid-scan has nothing to record.
+    }
   }
 
   Future<void> _openWebDavSettings() async {
@@ -1121,6 +1164,12 @@ class _BrowserPageState extends State<BrowserPage>
         _setNavError(null);
         _certHost = null;
       }
+    }
+
+    // Recording history is a standing instruction: a page the user opens is
+    // added whether or not the sniff sheet is open at the time.
+    if (active && event.isCommitted && _sniff.record) {
+      _scheduleSniffRecord();
     }
 
     // Which page is on its way: the WebView names the new URL only when its
@@ -2138,6 +2187,9 @@ class _BrowserPageState extends State<BrowserPage>
     }
     _consoleRefreshTimer?.cancel();
     _resourceTimer?.cancel();
+    _sniffRecordTimer?.cancel();
+    _sniffRecordLate?.cancel();
+    _sniffRecordLoop?.cancel();
     _jsInput.dispose();
     _urlFocus.removeListener(_onUrlFocusChanged);
     unawaited(_logSubscription.cancel());
