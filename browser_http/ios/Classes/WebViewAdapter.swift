@@ -1719,6 +1719,11 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         if (theater) { leave(false); }
         var el = videoOf(e.target, e);
         if (!el) { return; }
+        // The tap means "play this here". Letting the page see the same click
+        // would let a click-to-toggle player undo the play() below inside the
+        // same event, leaving the window open and paused.
+        if (e.cancelable) { e.preventDefault(); }
+        e.stopPropagation();
         if (isTop) {
           enter(el);
           return;
