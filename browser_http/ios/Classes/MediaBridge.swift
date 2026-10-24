@@ -200,6 +200,54 @@ final class MediaBridge {
     private static func remux(source: URL,
                               destination: URL,
                               reply: @escaping (String) -> Void) {
+        // Our own muxer first. iOS has no MPEG-TS file importer for a
+        // standalone .ts at all — every stream this button exists for is one
+        // Apple's demuxer already refused — and reading the packets directly
+        // also keeps the audio and the timestamps of a stream whose program
+        // map is only in the first packet group.
+        do {
+            let summary = try TsToMp4.convert(source: source,
+                                              destination: destination)
+            let note = "逐包合流 " + String(format: "%.1f 秒", summary.seconds)
+                + "，视频 \(summary.videoSamples) 帧"
+                + (summary.audioSamples > 0
+                    ? "、音频 \(summary.audioSamples) 帧" : "")
+                + (summary.skippedBytes > 0
+                    ? "，丢弃失步数据 " + megabytes(summary.skippedBytes) : "")
+            Self.verify(destination: destination) { check in
+                guard let check = check else {
+                    reply("ok: " + [note, summary.trackNote]
+                        .filter { !$0.isEmpty }
+                        .joined(separator: "；"))
+                    return
+                }
+                // A file our writer produced that MediaToolbox still cannot
+                // read is worth one more try through the importer.
+                try? FileManager.default.removeItem(at: destination)
+                Self.remuxWithImporter(source: source,
+                                       destination: destination,
+                                       reply: reply,
+                                       why: check)
+            }
+            return
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            let why = (error as? TsToMp4.Failure)?.message
+                ?? Self.describe(error)
+            Self.remuxWithImporter(source: source,
+                                   destination: destination,
+                                   reply: reply,
+                                   why: why)
+        }
+    }
+
+    /// The importer route, kept for the streams the parser will not claim:
+    /// MP3 or LATM audio, MPEG-2 video, and the fMP4 some CDNs ship inside a
+    /// .ts name.
+    private static func remuxWithImporter(source: URL,
+                                          destination: URL,
+                                          reply: @escaping (String) -> Void,
+                                          why: String) {
         let probe = Self.probeTs(url: source)
         Self.openAndExport(source: source, destination: destination) { first in
             switch first {
@@ -234,11 +282,13 @@ final class MediaBridge {
                             }
                         case .failed(let retryReason):
                             try? FileManager.default.removeItem(at: staging)
-                            reply("error: \(retryReason)（\(probe.summary)）")
+                            reply("error: \(retryReason)（\(probe.summary)）"
+                                + "（合流器：\(why)）")
                         }
                     }
-                case .refused(let why):
-                    reply("error: \(reason)（\(probe.summary)；修复：\(why)）")
+                case .refused(let fix):
+                    reply("error: \(reason)（\(probe.summary)；修复：\(fix)）"
+                        + "（合流器：\(why)）")
                 }
             }
         }
@@ -469,11 +519,15 @@ final class MediaBridge {
         }
 
         var payload = off + 4
-        if adaptation >= 2 {
+        // '11' declares an adaptation field whose first byte is its length. '10'
+        // is payload only, and so is the reserved '01' that ffmpeg and the CDNs
+        // using its layout write: their payload starts in the fourth byte, so
+        // reading a length out of it would skip elementary data.
+        if adaptation == 3 {
             let length = Int(buffer[payload])
             if length > 0 {
                 let flags = buffer[payload + 1]
-                if (flags & 0x40) != 0 { probe.pcrPackets += 1 }
+                if (flags & 0x10) != 0 { probe.pcrPackets += 1 }
             }
             payload += 1 + length
         }
