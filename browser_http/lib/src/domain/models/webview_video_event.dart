@@ -17,7 +17,9 @@ final class WebViewVideoEvent {
   /// windows knows which page is playing.
   final String sessionId;
 
-  /// One of `enter` (a tapped video now owns the screen), `state` (position or
+  /// One of `enter` (a tapped video now owns the screen), `tap` (the user
+  /// touched the picture, so the host should show or hide its controls),
+  /// `seeking` (a horizontal drag is previewing a target), `state` (position or
   /// pause changed) or `exit` (the window was closed).
   final String kind;
 
@@ -32,6 +34,12 @@ final class WebViewVideoEvent {
   bool get isEnter => kind == 'enter';
   bool get isExit => kind == 'exit';
   bool get isState => kind == 'state';
+
+  /// A tap on the picture — the host's show/hide switch for its control layer.
+  bool get isTap => kind == 'tap';
+
+  /// Where a horizontal drag would land if the finger lifted now.
+  bool get isSeeking => kind == 'seeking';
 
   factory WebViewVideoEvent.fromJson(Map<String, Object?> json) =>
       WebViewVideoEvent(

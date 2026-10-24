@@ -149,10 +149,14 @@ abstract interface class WebViewSession {
   /// The page's video, for a host that draws its own player window.
   ///
   /// The page keeps the picture — WebKit stays the player — and this stream
-  /// says when the user tapped a video, where the playhead is, and when the
-  /// window was closed. Drive it with
+  /// says when the user tapped a video (`enter`), tapped the picture again so
+  /// the control layer should toggle (`tap`), where a horizontal drag is
+  /// heading (`seeking`), where the playhead is (`state`), and when the window
+  /// was closed (`exit`). Drive it with
   /// `evaluate('window.__soVideo.seekBy(seconds)')`,
-  /// `window.__soVideo.toggle()` and `window.__soVideo.close()`.
+  /// `window.__soVideo.seekTo(seconds)`, `window.__soVideo.toggle()` and
+  /// `window.__soVideo.close()`. The script owns the gestures: pinch zooms the
+  /// picture, a horizontal drag seeks, a pull-down leaves.
   Stream<WebViewVideoEvent> get videoEvents;
 
   /// PNG of what the WebView is showing, scaled down to at most [maxWidth]

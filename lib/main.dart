@@ -8,7 +8,14 @@ import 'package:browser_http/browser_http.dart';
 import 'package:flutter/cupertino.dart' show CupertinoPageRoute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'
-    show Clipboard, ClipboardData, rootBundle;
+    show
+        Clipboard,
+        ClipboardData,
+        DeviceOrientation,
+        SystemChrome,
+        SystemUiMode,
+        SystemUiOverlay,
+        rootBundle;
 
 import 'downloads.dart';
 import 'downloads_sheet.dart';
@@ -158,12 +165,32 @@ class _BrowserPageState extends State<BrowserPage>
   bool _started = false;
 
   // Web video player. The page keeps its own <video>; the injected script
-  // stretches it over the page and this bar puts the controls around it. Only a
-  // tap on the page opens it, and closing pauses — nothing resumes on scroll.
+  // stretches it over the page and the host draws the control layer above it.
+  // Only a tap on the page opens it, and closing pauses — nothing resumes on
+  // scroll.
   bool _videoOpen = false;
+
+  /// The control layer follows the picture: a tap on the video shows or hides
+  /// it, the way every video app does.
+  bool _videoControls = true;
   bool _videoPaused = true;
   double _videoPosition = 0;
   double _videoDuration = 0;
+
+  /// A position the finger is aiming at, from the progress bar or a horizontal
+  /// swipe. Non-null only while the gesture is in flight.
+  double? _videoSeek;
+  double? _videoSeekPreview;
+
+  /// The player is filling the screen in landscape: the browser chrome is
+  /// out of the way until the user leaves.
+  bool _videoLandscape = false;
+
+  /// Whether this session changed the orientation lock, so it can be handed
+  /// back to the device when the player closes.
+  bool _orientationTouched = false;
+
+  /// How far the control layer has been pulled down; 64 points close it.
   double _videoDrag = 0;
 
   /// Share of the body height taken by the info panel; draggable.
@@ -496,10 +523,13 @@ class _BrowserPageState extends State<BrowserPage>
     if (event.isEnter) {
       setState(() {
         _videoOpen = true;
+        _videoControls = true;
         _videoPaused = false;
         _videoPosition = 0;
         _videoDuration = 0;
         _videoDrag = 0;
+        _videoSeek = null;
+        _videoSeekPreview = null;
       });
       if (_consoleOpen) _pushToConsole('视频窗口打开 ${window.host}');
       return;
@@ -509,27 +539,69 @@ class _BrowserPageState extends State<BrowserPage>
       if (_consoleOpen) _pushToConsole('视频窗口关闭');
       return;
     }
-    if (event.isState && _videoOpen) {
+    if (!_videoOpen) return;
+    // A tap on the picture is the show/hide switch for the control layer.
+    if (event.isTap) {
+      setState(() => _videoControls = !_videoControls);
+      return;
+    }
+    if (event.isSeeking) {
+      setState(() {
+        _videoSeekPreview = event.position;
+        _videoPaused = event.paused;
+        if (event.duration > 0) _videoDuration = event.duration;
+      });
+      return;
+    }
+    if (event.isState) {
       setState(() {
         _videoPaused = event.paused;
         _videoPosition = event.position;
         _videoDuration = event.duration;
+        _videoSeekPreview = null;
       });
     }
   }
 
-  /// Drops the bar without asking the page anything. Exiting the theater is
+  /// Drops the player without asking the page anything. Exiting the theater is
   /// always the page script's own step, triggered by [_closeVideoWindow] or by
   /// the document going away.
   void _hideVideoWindow() {
-    if (!_videoOpen && _videoDrag == 0) return;
+    final wasLandscape = _videoLandscape;
+    final wasTouched = _orientationTouched;
+    if (!_videoOpen && !wasLandscape && _videoDrag == 0) return;
     setState(() {
       _videoOpen = false;
+      _videoControls = true;
       _videoPaused = true;
       _videoPosition = 0;
       _videoDuration = 0;
       _videoDrag = 0;
+      _videoSeek = null;
+      _videoSeekPreview = null;
+      _videoLandscape = false;
     });
+    if (wasLandscape) {
+      unawaited(SystemChrome.setPreferredOrientations(
+        const <DeviceOrientation>[DeviceOrientation.portraitUp],
+      ));
+    }
+    if (wasLandscape || wasTouched) {
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(
+          SystemUiMode.manual,
+          overlays: SystemUiOverlay.values,
+        ),
+      );
+      // The browser is a portrait app by default; let the device decide again
+      // once the turn back has finished.
+      Timer(const Duration(milliseconds: 500), () {
+        unawaited(SystemChrome.setPreferredOrientations(
+          const <DeviceOrientation>[],
+        ));
+      });
+      _orientationTouched = false;
+    }
   }
 
   /// Asks the page to close the theater, which also pauses its video.
@@ -539,11 +611,43 @@ class _BrowserPageState extends State<BrowserPage>
   }
 
   /// Drives the injected `window.__soVideo` API. The page owns playback; this
-  /// only sends it commands the bar's buttons stand for.
+  /// only sends it commands the control layer's buttons stand for.
   void _videoCommand(String call) {
     final webView = _browser.webView;
     if (webView == null) return;
     unawaited(webView.evaluate('window.__soVideo && window.__soVideo.$call'));
+  }
+
+  /// Turns the player into a landscape full-screen surface, or back.
+  ///
+  /// The browser chrome is hidden while the player fills the screen; the page
+  /// itself never moves, so the video keeps playing through the turn.
+  void _toggleVideoLandscape() {
+    if (_videoLandscape) {
+      setState(() => _videoLandscape = false);
+      unawaited(SystemChrome.setPreferredOrientations(
+        const <DeviceOrientation>[DeviceOrientation.portraitUp],
+      ));
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(
+          SystemUiMode.manual,
+          overlays: SystemUiOverlay.values,
+        ),
+      );
+      _orientationTouched = true;
+      return;
+    }
+    setState(() => _videoLandscape = true);
+    unawaited(SystemChrome.setPreferredOrientations(
+      const <DeviceOrientation>[
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ],
+    ));
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+    );
+    _orientationTouched = true;
   }
 
   /// `m:ss`, or `h:mm:ss` past the hour. A zero or missing length is `0:00`.
@@ -684,15 +788,37 @@ class _BrowserPageState extends State<BrowserPage>
     window.refreshLabel();
     final url = browser.url;
     final hasPage = url != null && url.isNotEmpty && url != 'about:blank';
+    final wasTouched = _orientationTouched;
     setState(() {
       _started = hasPage;
       _videoOpen = false;
+      _videoControls = true;
       _videoPaused = true;
       _videoPosition = 0;
       _videoDuration = 0;
       _videoDrag = 0;
+      _videoSeek = null;
+      _videoSeekPreview = null;
+      _videoLandscape = false;
       if (!_urlFocus.hasFocus) _urlController.text = hasPage ? url : '';
     });
+    if (wasTouched) {
+      unawaited(SystemChrome.setPreferredOrientations(
+        const <DeviceOrientation>[DeviceOrientation.portraitUp],
+      ));
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(
+          SystemUiMode.manual,
+          overlays: SystemUiOverlay.values,
+        ),
+      );
+      Timer(const Duration(milliseconds: 500), () {
+        unawaited(SystemChrome.setPreferredOrientations(
+          const <DeviceOrientation>[],
+        ));
+      });
+      _orientationTouched = false;
+    }
   }
 
   Future<void> _openTaskView() async {
@@ -1871,6 +1997,18 @@ class _BrowserPageState extends State<BrowserPage>
 
   @override
   void dispose() {
+    // A landscape player must not leave the next screen sideways.
+    if (_orientationTouched || _videoLandscape) {
+      unawaited(SystemChrome.setPreferredOrientations(
+        const <DeviceOrientation>[],
+      ));
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(
+          SystemUiMode.manual,
+          overlays: SystemUiOverlay.values,
+        ),
+      );
+    }
     _consoleRefreshTimer?.cancel();
     _resourceTimer?.cancel();
     _jsInput.dispose();
@@ -1892,13 +2030,20 @@ class _BrowserPageState extends State<BrowserPage>
 
   @override
   Widget build(BuildContext context) {
+    // Landscape playback takes the whole screen: the chrome is offstage, not
+    // removed, so the WebView underneath keeps its document and its picture.
+    final immersive = _videoLandscape;
     return Scaffold(
-      backgroundColor: AppColors.surface,
+      backgroundColor: immersive ? Colors.black : AppColors.surface,
       body: SafeArea(
+        top: !immersive,
+        bottom: !immersive,
+        left: !immersive,
+        right: !immersive,
         child: Column(
           children: <Widget>[
-            _buildToolbar(),
-            _buildContextBar(),
+            Offstage(offstage: immersive, child: _buildToolbar()),
+            Offstage(offstage: immersive, child: _buildContextBar()),
             Expanded(child: _buildSplitBody()),
           ],
         ),
@@ -2289,11 +2434,12 @@ class _BrowserPageState extends State<BrowserPage>
     const handleHeight = 15.0;
     return LayoutBuilder(
       builder: (context, constraints) {
+        final showPanel = _panelVisible && !_videoLandscape;
         final available = math.max(
           0.0,
-          constraints.maxHeight - (_panelVisible ? handleHeight : 0),
+          constraints.maxHeight - (showPanel ? handleHeight : 0),
         );
-        final panelHeight = _panelVisible
+        final panelHeight = showPanel
             ? (available * _panelFraction)
                 .clamp(0.0, available * 0.85)
                 .toDouble()
@@ -2302,7 +2448,7 @@ class _BrowserPageState extends State<BrowserPage>
         return Column(
           children: <Widget>[
             SizedBox(height: webHeight, child: _buildWebArea()),
-            if (_panelVisible) ...<Widget>[
+            if (showPanel) ...<Widget>[
               _buildDragHandle(available),
               SizedBox(height: panelHeight, child: _buildPanel()),
             ],
@@ -2323,15 +2469,12 @@ class _BrowserPageState extends State<BrowserPage>
           fit: StackFit.expand,
           children: <Widget>[
             BrowserView(controller: _browser),
-            if (!_started && !_hasDocument)
+            if (!_started && !_hasDocument && !_videoOpen)
               _StartPage(onOpen: _openShortcut),
-            // The page's video fills the area behind this bar; the bar itself
-            // keeps clear of the console when that is open.
-            if (_videoOpen)
-              _buildVideoBar(
-                bottom: _consoleOpen ? height * _consoleSize / 100 : 0,
-              ),
-            if (_consoleOpen) ...<Widget>[
+            // Two layers over the page: the picture on the bottom (drawn by
+            // WebKit inside the platform view) and this control layer above it.
+            if (_videoOpen) _buildVideoOverlay(),
+            if (_consoleOpen && !_videoLandscape) ...<Widget>[
               Positioned(
                 left: 0,
                 right: 0,
@@ -2356,102 +2499,197 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
-  /// The control bar of the video window.
+  /// The control layer of the video window.
   ///
-  /// It sits on the lower edge of the page, not over the middle of the video:
-  /// the page's own controls stay reachable behind it. Dragging it down closes
-  /// the window — the same gesture as swiping a sheet away.
-  Widget _buildVideoBar({required double bottom}) {
-    final length = _videoDuration > 0 ? _videoClock(_videoDuration) : '--:--';
-    return Positioned(
-      left: 12,
-      right: 12,
-      bottom: bottom + 12,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onVerticalDragStart: (_) {
-          if (_videoDrag != 0) setState(() => _videoDrag = 0);
-        },
-        onVerticalDragUpdate: (details) {
-          final next = math.max(0.0, _videoDrag + details.delta.dy);
-          setState(() => _videoDrag = next);
-        },
-        onVerticalDragEnd: (_) {
-          final close = _videoDrag > 56;
-          setState(() => _videoDrag = 0);
-          if (close) _closeVideoWindow();
-        },
-        child: Transform.translate(
-          offset: Offset(0, _videoDrag),
-          child: Opacity(
-            opacity: (1 - _videoDrag / 200).clamp(0.4, 1.0).toDouble(),
-            child: Container(
-              padding: const EdgeInsets.fromLTRB(14, 7, 6, 5),
-              decoration: BoxDecoration(
-                color: const Color(0xF015161A),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: Colors.white.withAlpha(30)),
-                boxShadow: const <BoxShadow>[
-                  BoxShadow(
-                    color: Color(0x55000000),
-                    blurRadius: 18,
-                    offset: Offset(0, 6),
-                  ),
-                ],
+  /// Two layers, like any player: the picture underneath is the page's own
+  /// <video> stretched by the injected script, and this is the chrome over it.
+  /// The middle is deliberately empty, so a tap lands on the picture and the
+  /// page can hide or show this layer; when the layer is hidden the whole
+  /// screen belongs to the video again.
+  Widget _buildVideoOverlay() {
+    final bubble = _videoSeekPreview;
+    if (!_videoControls && bubble == null) return const SizedBox.shrink();
+    return Positioned.fill(
+      child: Stack(
+        children: <Widget>[
+          if (_videoControls)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: _buildVideoTopBar(),
+            ),
+          if (_videoControls)
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: _buildVideoPanel(),
+            ),
+          if (bubble != null)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Center(child: _buildVideoSeekBubble(bubble)),
               ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Close lives at the top right, out of the way of the picture's centre.
+  Widget _buildVideoTopBar() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(10, 2, 10, 22),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: <Color>[Color(0xCC000000), Color(0x00000000)],
+        ),
+      ),
+      child: SafeArea(
+        bottom: false,
+        child: Align(
+          alignment: Alignment.centerRight,
+          child: _videoControl(
+            Icons.close_rounded,
+            '关闭视频窗口',
+            _closeVideoWindow,
+            background: const Color(0x66000000),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Progress on top (elapsed left, remaining right), transport under it, and
+  /// the landscape switch in the bottom-left corner. Pulling the panel down
+  /// closes the window.
+  Widget _buildVideoPanel() {
+    final duration = _videoDuration;
+    final shown = _videoSeek ?? _videoSeekPreview ?? _videoPosition;
+    final sliderMax = duration > 0 ? duration : 1.0;
+    final sliderValue = shown.clamp(0.0, sliderMax).toDouble();
+    final remaining = duration > 0 ? math.max(0.0, duration - shown) : 0.0;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onVerticalDragUpdate: (details) {
+        setState(
+          () => _videoDrag = math.max(0.0, _videoDrag + details.delta.dy),
+        );
+      },
+      onVerticalDragEnd: (_) {
+        final close = _videoDrag > 64;
+        setState(() => _videoDrag = 0);
+        if (close) _closeVideoWindow();
+      },
+      child: Transform.translate(
+        offset: Offset(0, _videoDrag),
+        child: Opacity(
+          opacity: (1 - _videoDrag / 240).clamp(0.45, 1.0).toDouble(),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(12, 46, 12, 2),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: <Color>[
+                  Color(0x00000000),
+                  Color(0xB3000000),
+                  Color(0xF2000000),
+                ],
+                stops: <double>[0.0, 0.42, 1.0],
+              ),
+            ),
+            child: SafeArea(
+              top: false,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: <Widget>[
-                  Container(
-                    width: 34,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.white.withAlpha(76),
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                  const SizedBox(height: 4),
                   Row(
                     children: <Widget>[
-                      Text(
-                        _videoClock(_videoPosition),
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w600,
+                      Text(_videoClock(shown), style: _videoTimeStyle(true)),
+                      Expanded(
+                        child: SliderTheme(
+                          data: SliderThemeData(
+                            trackHeight: 2.5,
+                            activeTrackColor: AppColors.signal,
+                            inactiveTrackColor: Colors.white.withAlpha(64),
+                            thumbColor: Colors.white,
+                            overlayColor: const Color(0x33FFFFFF),
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 6,
+                            ),
+                            overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 14,
+                            ),
+                          ),
+                          child: Slider(
+                            value: sliderValue,
+                            max: sliderMax,
+                            onChanged: duration > 0
+                                ? (value) =>
+                                    setState(() => _videoSeek = value)
+                                : null,
+                            onChangeEnd: duration > 0
+                                ? (value) {
+                                    _videoCommand(
+                                      'seekTo(${value.toStringAsFixed(2)})',
+                                    );
+                                    setState(() {
+                                      _videoPosition = value;
+                                      _videoSeek = null;
+                                      _videoSeekPreview = null;
+                                    });
+                                  }
+                                : null,
+                          ),
                         ),
                       ),
                       Text(
-                        ' / $length',
-                        style: const TextStyle(
-                          color: AppColors.darkMuted,
-                          fontSize: 12.5,
+                        duration > 0 ? '-${_videoClock(remaining)}' : '--:--',
+                        style: _videoTimeStyle(false),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    children: <Widget>[
+                      _videoControl(
+                        _videoLandscape
+                            ? Icons.fullscreen_exit_rounded
+                            : Icons.fullscreen_rounded,
+                        _videoLandscape ? '退出横屏' : '横屏播放',
+                        _toggleVideoLandscape,
+                      ),
+                      Expanded(
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: <Widget>[
+                            _videoControl(
+                              Icons.replay_10_rounded,
+                              '后退 10 秒',
+                              () => _videoCommand('seekBy(-10)'),
+                            ),
+                            _videoControl(
+                              _videoPaused
+                                  ? Icons.play_arrow_rounded
+                                  : Icons.pause_rounded,
+                              _videoPaused ? '播放' : '暂停',
+                              () => _videoCommand('toggle()'),
+                              primary: true,
+                            ),
+                            _videoControl(
+                              Icons.forward_10_rounded,
+                              '前进 10 秒',
+                              () => _videoCommand('seekBy(10)'),
+                            ),
+                          ],
                         ),
                       ),
-                      const Spacer(),
-                      _videoControl(
-                        Icons.replay_10_rounded,
-                        '后退 10 秒',
-                        () => _videoCommand('seekBy(-10)'),
-                      ),
-                      _videoControl(
-                        _videoPaused
-                            ? Icons.play_arrow_rounded
-                            : Icons.pause_rounded,
-                        _videoPaused ? '播放' : '暂停',
-                        () => _videoCommand('toggle()'),
-                        primary: true,
-                      ),
-                      _videoControl(
-                        Icons.forward_10_rounded,
-                        '前进 10 秒',
-                        () => _videoCommand('seekBy(10)'),
-                      ),
-                      _videoControl(
-                        Icons.close_rounded,
-                        '关闭视频窗口',
-                        _closeVideoWindow,
-                      ),
+                      // Balances the landscape button so the transport group
+                      // stays optically centred in both orientations.
+                      const SizedBox(width: 40),
                     ],
                   ),
                 ],
@@ -2463,11 +2701,40 @@ class _BrowserPageState extends State<BrowserPage>
     );
   }
 
+  /// Where a horizontal swipe would land, shown until the finger lifts.
+  Widget _buildVideoSeekBubble(double position) {
+    final total = _videoDuration > 0
+        ? ' / ${_videoClock(_videoDuration)}'
+        : '';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+      decoration: BoxDecoration(
+        color: const Color(0xD9000000),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Text(
+        '${_videoClock(position)}$total',
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 18,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  TextStyle _videoTimeStyle(bool strong) => TextStyle(
+        color: strong ? Colors.white : AppColors.darkMuted,
+        fontSize: 11.5,
+        fontWeight: strong ? FontWeight.w600 : FontWeight.w400,
+      );
+
   Widget _videoControl(
     IconData icon,
     String label,
     VoidCallback onTap, {
     bool primary = false,
+    Color? background,
   }) {
     return Semantics(
       button: true,
@@ -2475,17 +2742,17 @@ class _BrowserPageState extends State<BrowserPage>
       child: Padding(
         padding: const EdgeInsets.only(left: 2),
         child: Material(
-          color: primary ? AppColors.signal : Colors.transparent,
+          color: primary ? AppColors.signal : (background ?? Colors.transparent),
           shape: const CircleBorder(),
           child: InkWell(
             customBorder: const CircleBorder(),
             onTap: onTap,
             child: SizedBox(
-              width: primary ? 40 : 36,
-              height: primary ? 40 : 36,
+              width: primary ? 44 : 38,
+              height: primary ? 44 : 38,
               child: Icon(
                 icon,
-                size: primary ? 24 : 21,
+                size: primary ? 26 : 22,
                 color: primary ? AppColors.signalInk : Colors.white,
               ),
             ),

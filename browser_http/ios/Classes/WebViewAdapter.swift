@@ -1512,8 +1512,11 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
     ///
     /// The video keeps playing inside the page — stretched over the viewport,
     /// at the top of the stacking order — so every stream WebKit can play
-    /// (progressive MP4, HLS, MSE) keeps working. The host draws its bar over
-    /// it and drives it through `window.__soVideo`.
+    /// (progressive MP4, HLS, MSE) keeps working. The host draws the control
+    /// layer over it and drives it through `window.__soVideo`; this script
+    /// reports what the picture is doing and owns the touch gestures: tap to
+    /// show or hide the controls, horizontal drag to seek, pinch to zoom,
+    /// pull-down to leave.
     ///
     /// A video inside a cross-origin iframe cannot stretch past the frame, so
     /// the frame reports upwards and the *top* document stretches the iframe
@@ -1527,13 +1530,19 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       var video = null;        // the element this frame has taken over
       var theater = null;      // the element stretched over the viewport
       var savedStyle = null;   // its inline style before we changed it
+      var savedControls = null;// its native controls flag, restored on exit
       var child = null;        // top frame: the frame whose video is showing
-      var startY = 0, startX = 0, swiping = false;
       var lifted = [];         // ancestors neutralised while the window is up
 
-      // Room kept free under the picture for this app's control bar. The page
-      // cannot draw there, and the bar never covers the player's own controls.
-      var BAR = 78;
+      // One finger: a tap, a horizontal seek or a pull-down. Two fingers zoom.
+      var startX = 0, startY = 0, startTime = 0, lastDy = 0;
+      var mode = '';           // '' | 'seek' | 'exit' | 'none' | 'pinch'
+      var zoom = 1;
+      var pinchStart = 0, pinchBase = 1;
+      var seekTarget = 0;
+      var moved = false;
+      var suppressUntil = 0;   // a swipe must not end as a tap
+      var lastPreview = 0;
 
       function report(message) {
         try {
@@ -1551,11 +1560,48 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         });
       }
 
+      // The host shows where a horizontal drag is heading before it commits.
+      function preview(position, duration) {
+        var now = Date.now();
+        if (now - lastPreview < 80) { return; }
+        lastPreview = now;
+        report({
+          kind: 'seeking',
+          paused: !!(video && video.paused),
+          position: position,
+          duration: duration
+        });
+      }
+
       function play(el) {
         try {
           var started = el.play();
           if (started && started.catch) { started.catch(function () {}); }
         } catch (e) {}
+      }
+
+      function distance(touches) {
+        var dx = touches[0].clientX - touches[1].clientX;
+        var dy = touches[0].clientY - touches[1].clientY;
+        return Math.sqrt(dx * dx + dy * dy);
+      }
+
+      // Zoom and the pull-down preview share one transform on the picture.
+      function applyTransform(dy) {
+        if (!theater) { return; }
+        var value = 'scale(' + zoom + ')';
+        if (dy) { value = 'translate(0px, ' + dy + 'px) ' + value; }
+        theater.style.setProperty('transform', value, 'important');
+      }
+
+      function snapBack() {
+        if (!theater) { return; }
+        theater.style.setProperty('transition',
+                                 'transform 0.18s ease-out', 'important');
+        applyTransform(0);
+        setTimeout(function () {
+          if (theater) { theater.style.removeProperty('transition'); }
+        }, 240);
       }
 
       // A fixed element is still laid out inside its nearest ancestor with a
@@ -1597,16 +1643,14 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         if (!el || savedStyle !== null) { return; }
         savedStyle = el.getAttribute('style') || '';
         liftContainers(el.parentNode);
-        // The top document leaves the bottom strip to the control bar; a frame
-        // stretched inside it already ends above that strip.
-        var height = isTop ? 'calc(100vh - ' + BAR + 'px)' : '100vh';
         // Fixed positioning leaves the page's layout and any clipping wrapper
-        // behind; touch-action:none keeps a downward swipe available to the
-        // close gesture instead of scrolling the page under the video.
+        // behind; touch-action:none keeps our gestures instead of scrolling the
+        // page under the video. 100vh: the host draws its control layer over
+        // the picture, the way a normal player does.
         el.setAttribute('style', savedStyle + ';'
           + 'position:fixed!important;top:0!important;left:0!important;'
           + 'right:0!important;bottom:auto!important;'
-          + 'width:100vw!important;height:' + height + '!important;'
+          + 'width:100vw!important;height:100vh!important;'
           + 'min-width:0!important;min-height:0!important;'
           + 'max-width:none!important;max-height:none!important;'
           + 'margin:0!important;padding:0!important;'
@@ -1631,7 +1675,7 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       }
 
       // Watch one element. Position updates arrive four times a second, the
-      // pace a progress row needs; the rest pin the bar to real playback.
+      // pace a progress bar needs; the rest pin the bar to real playback.
       function watch(el) {
         if (el.__soVideoWatched) { return; }
         el.__soVideoWatched = true;
@@ -1650,6 +1694,12 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         video = el;
         watch(el);
         stretch(el);
+        // WebKit's own controls would sit under the host's control layer and
+        // answer the same taps twice.
+        try {
+          savedControls = el.controls;
+          el.controls = false;
+        } catch (e) {}
         report({kind: 'enter', paused: !!el.paused,
                 position: el.currentTime || 0,
                 duration: isFinite(el.duration) ? el.duration : 0});
@@ -1660,6 +1710,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
       // reporting to the top document, which owns the iframe's style.
       function leave(reportExit) {
         stop();
+        if (theater && savedControls !== null) {
+          try { theater.controls = savedControls; } catch (e) {}
+        }
+        savedControls = null;
+        zoom = 1;
+        mode = '';
+        moved = false;
         release();
         if (reportExit !== false) { report({kind: 'exit'}); }
       }
@@ -1678,12 +1735,16 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         leave(true);
       }
 
-      function seek(el, by) {
-        var target = (el.currentTime || 0) + by;
+      function seekTo(el, to) {
         var end = isFinite(el.duration) ? el.duration : 0;
+        var target = Math.max(0, to);
         if (end > 0) { target = Math.min(target, Math.max(0, end - 0.25)); }
-        el.currentTime = Math.max(0, target);
+        try { el.currentTime = target; } catch (e) {}
         state();
+      }
+
+      function seek(el, by) {
+        seekTo(el, (el.currentTime || 0) + by);
       }
 
       function toggle(el) {
@@ -1711,11 +1772,16 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         return null;
       }
 
-      // The only way into the player window: a tap on the video surface. A
-      // scroll produces no click, and a page that starts playing on its own
-      // never gets here.
+      // A tap on the playing picture is the host's show/hide switch. A tap on
+      // the page before the window exists is the only way in.
       document.addEventListener('click', function (e) {
-        if (theater && document.contains(theater)) { return; }
+        if (theater && document.contains(theater)) {
+          if (Date.now() < suppressUntil) { return; }
+          if (e.cancelable) { e.preventDefault(); }
+          e.stopPropagation();
+          report({kind: 'tap'});
+          return;
+        }
         if (theater) { leave(false); }
         var el = videoOf(e.target, e);
         if (!el) { return; }
@@ -1731,6 +1797,10 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         video = el;
         watch(el);
         stretch(el);
+        try {
+          savedControls = el.controls;
+          el.controls = false;
+        } catch (err) {}
         play(el);
         try { parent.postMessage({__soVideo: 'enter'}, '*'); } catch (err) {}
       }, true);
@@ -1763,34 +1833,101 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         }
         if (!isTop && video) {
           if (data.__soVideo === 'seekBy') { seek(video, data.by || 0); }
+          else if (data.__soVideo === 'seekTo') { seekTo(video, data.to || 0); }
           else if (data.__soVideo === 'toggle') { toggle(video); }
         }
       }, false);
 
-      // Swipe down on the playing video closes the window. 16 px are enough to
-      // claim the gesture and keep the page's own seek/brightness drag from
-      // fighting it; 96 px commit the close.
       document.addEventListener('touchstart', function (e) {
-        if (!theater || e.touches.length !== 1) { swiping = false; return; }
-        swiping = true;
-        startY = e.touches[0].clientY;
+        if (!theater) { return; }
+        if (e.touches.length >= 2) {
+          mode = 'pinch';
+          pinchStart = distance(e.touches);
+          pinchBase = zoom;
+          moved = true;
+          return;
+        }
+        if (e.touches.length !== 1) { return; }
+        mode = '';
+        moved = false;
+        lastDy = 0;
         startX = e.touches[0].clientX;
+        startY = e.touches[0].clientY;
+        startTime = video ? (video.currentTime || 0) : 0;
       }, {passive: true, capture: true});
+
       document.addEventListener('touchmove', function (e) {
-        if (!swiping || !theater || e.touches.length !== 1) { return; }
-        var t = e.touches[0];
-        var dy = t.clientY - startY;
-        var dx = Math.abs(t.clientX - startX);
-        if (dy > 16 && dx < 90 && e.cancelable) { e.preventDefault(); }
-        if (dy > 96 && dx < 90) {
-          swiping = false;
-          close();
+        if (!theater) { return; }
+        if (e.touches.length >= 2) {
+          if (e.cancelable) { e.preventDefault(); }
+          moved = true;
+          if (mode !== 'pinch') {
+            mode = 'pinch';
+            pinchStart = distance(e.touches);
+            pinchBase = zoom;
+          }
+          if (pinchStart > 0) {
+            zoom = Math.min(3,
+                Math.max(1, pinchBase * distance(e.touches) / pinchStart));
+            applyTransform(0);
+          }
+          return;
+        }
+        if (mode === 'pinch' || e.touches.length !== 1) { return; }
+        var touch = e.touches[0];
+        var dx = touch.clientX - startX;
+        var dy = touch.clientY - startY;
+        if (!moved && Math.abs(dx) < 10 && Math.abs(dy) < 10) { return; }
+        moved = true;
+        if (mode === '') {
+          if (Math.abs(dx) > Math.abs(dy)) { mode = 'seek'; }
+          else if (dy > 0) { mode = 'exit'; }
+          else { mode = 'none'; }
+        }
+        if (mode === 'seek') {
+          if (e.cancelable) { e.preventDefault(); }
+          var end = video && isFinite(video.duration) ? video.duration : 0;
+          if (end > 0) {
+            // A full screen width is two minutes; the bar shows the target
+            // before the finger lifts.
+            seekTarget = Math.max(0, Math.min(end,
+                startTime + (dx / Math.max(1, window.innerWidth)) * 120));
+            preview(seekTarget, end);
+          }
+        } else if (mode === 'exit') {
+          if (e.cancelable) { e.preventDefault(); }
+          lastDy = dy;
+          applyTransform(Math.max(0, dy));
         }
       }, {passive: false, capture: true});
-      document.addEventListener('touchend', function () { swiping = false; },
-                                {passive: true, capture: true});
-      document.addEventListener('touchcancel', function () { swiping = false; },
-                                {passive: true, capture: true});
+
+      document.addEventListener('touchend', function (e) {
+        if (!theater) { return; }
+        if (mode === 'pinch') {
+          if (e.touches.length === 0) {
+            mode = '';
+            moved = false;
+            suppressUntil = Date.now() + 350;
+          }
+          return;
+        }
+        if (e.touches.length > 0) { return; }
+        if (mode === 'seek' && video) {
+          seekTo(video, seekTarget);
+        } else if (mode === 'exit') {
+          if (lastDy > 96) { close(); }
+          else { snapBack(); }
+        }
+        if (moved) { suppressUntil = Date.now() + 350; }
+        mode = '';
+        moved = false;
+      }, {passive: true, capture: true});
+
+      document.addEventListener('touchcancel', function () {
+        if (mode === 'pinch' || mode === 'exit') { snapBack(); }
+        mode = '';
+        moved = false;
+      }, {passive: true, capture: true});
 
       // The system player must stay out of reach even if a page asks for it
       // directly: it is the thing that reappears over the page on its own.
@@ -1818,6 +1955,14 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             return;
           }
           if (video) { seek(video, seconds); }
+        },
+        seekTo: function (seconds) {
+          if (child) {
+            try { child.postMessage({__soVideo: 'seekTo', to: seconds}, '*'); }
+            catch (e) {}
+            return;
+          }
+          if (video) { seekTo(video, seconds); }
         },
         toggle: function () {
           if (child) {
