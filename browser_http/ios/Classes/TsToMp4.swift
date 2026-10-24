@@ -310,6 +310,11 @@ enum TsToMp4 {
         var lastDecode: Int64 = 0
         let ticksPerAudioFrame = layout.audioRate > 0
             ? 1024.0 * Double(timescale) / Double(layout.audioRate) : 0
+        // The audio frame the writer is told about, and the pause long enough
+        // to be a stream stopping rather than a frame boundary: a quarter of a
+        // second, where one AAC frame is 23 ms.
+        var audioHeld: (frame: PESFrame, start: Int64, duration: Int64)?
+        let audioGapFloor = max(2 * Int64(ticksPerAudioFrame.rounded()), 22_500)
 
         do {
             state.skippedBytes = try walk(source, stride: layout.stride) { read in
@@ -388,11 +393,29 @@ enum TsToMp4 {
                                             - Int64(measured.rounded()))
                         let sample = PESFrame(bytes: frame.bytes,
                                               pts: start, decode: nil)
-                        if state.writeAudio(sample, start: start,
-                                           duration: duration,
-                                           description: audioFormat) {
-                            state.lastStart = start
+                        // One frame held back, the way the video track holds an
+                        // access unit. A stream that stopped recording for
+                        // seconds has that hole *in front of* the frame now in
+                        // hand, and the only sample that can carry it is the one
+                        // that was playing when the recording stopped: hand the
+                        // frame straight through and the writer packs the audio
+                        // end to end whatever start times it is given, so every
+                        // second of the pause the video track keeps turns into
+                        // the sound running ahead of the picture.
+                        if var older = audioHeld {
+                            let expected = older.start + older.duration
+                            let hole = start - expected
+                            if hole > audioGapFloor {
+                                older.duration += hole
+                            }
+                            if state.writeAudio(older.frame, start: older.start,
+                                                duration: older.duration,
+                                                description: audioFormat) {
+                                state.lastStart = older.start
+                            }
                         }
+                        audioHeld = (frame: sample, start: start,
+                                     duration: duration)
                     }
                 }
                 return state.aborted
@@ -409,6 +432,15 @@ enum TsToMp4 {
                                decode: last.decode,
                                description: description) {
                 state.lastPresent = last.present + state.lastDuration
+            }
+        }
+        // The last audio frame is held back for the same reason the video unit
+        // is: only the frame after it shows whether a pause came in front of it.
+        if let last = audioHeld, let audioFormat = layout.audioDescription {
+            if state.writeAudio(last.frame, start: last.start,
+                                duration: last.duration,
+                                description: audioFormat) {
+                state.lastStart = last.start
             }
         }
         // Samples the writer had no room for are written before the walk is
