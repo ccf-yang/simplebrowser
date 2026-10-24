@@ -1442,6 +1442,26 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
         }
     }
 
+    /// Makes sure a re-issued tap really starts. A load can be dropped while
+    /// the navigation that asked for it is being cancelled; if the page has
+    /// not started moving half a second later, the same request is handed to
+    /// the WebView again. It never fights a load that is already running, and
+    /// it gives up as soon as the page has moved anywhere.
+    private func confirmLoad(_ request: URLRequest, from source: URL?,
+                             attempt: Int = 0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self, attempt < 2 else { return }
+            if self.webView.isLoading { return }
+            let current = self.webView.url?.absoluteString ?? ""
+            if let target = request.url?.absoluteString, current == target {
+                return
+            }
+            if let source, current != source.absoluteString { return }
+            self.loadInApp(request)
+            self.confirmLoad(request, from: source, attempt: attempt + 1)
+        }
+    }
+
     /// Loads a URL the way Safari's address bar does: from code, never as the
     /// continuation of a user gesture, so Universal Links stay in-app.
     ///
@@ -1584,6 +1604,17 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
            isGesture || opensFromScript || settledScriptJump || crossOriginFrameTap,
            targetsMainFrame || opensWindow || crossOriginFrameTap,
            navigationAction.request.httpBody == nil {
+            // The one-shot marker for a re-issued load can be consumed by a
+            // competing callback. That load carries no gesture, so it can
+            // never hand the URL to another app: let it through instead of
+            // cancelling it over and over and leaving the tap dead.
+            if wasReissuedRecently(url), trigger == .other, !webView.isLoading {
+                reportNavigation(kind: "start", url: url, method: method,
+                                 mainFrame: targetsMainFrame, type: type,
+                                 message: "in-app load continued")
+                decisionHandler(.allow)
+                return
+            }
             // The identical request is already in flight (a page that fires both
             // a tap and a `window.open`, or a double tap). Cancel it: allowing
             // would hand the Universal Link over, and a second load would put a
@@ -1602,10 +1633,13 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
             reportNavigation(kind: "in-app", url: url, method: method,
                              mainFrame: targetsMainFrame, type: type,
                              message: "reloaded in-app (no external app)")
+            // Start it now. A `target="_blank"` action is cancelled here
+            // before WebKit ever reaches `createWebViewWith`, and a load
+            // queued for the next run-loop turn was sometimes dropped as
+            // part of that cancellation: the tap then did nothing at all.
             let reissued = reissueRequest(navigationAction)
-            DispatchQueue.main.async { [weak self] in
-                self?.loadInApp(reissued)
-            }
+            loadInApp(reissued)
+            confirmLoad(reissued, from: webView.url)
             return
         }
 
@@ -1697,7 +1731,22 @@ final class WebViewHolder: NSObject, WKNavigationDelegate, WKUIDelegate,
                                      message: "external app jump blocked (new window)")
                 }
             } else if !wasReissuedRecently(url) {
-                loadInApp(navigationAction.request)
+                // The tap already re-issued this URL from `decidePolicyFor`
+                // when that callback ran first; this path is for the
+                // WebKit versions that only offer a new window. The load
+                // must not start inside the callback that is cancelling
+                // this window, or WebKit drops it and the tap does nothing.
+                let request = navigationAction.request
+                let source = webView.url
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if let target = request.url?.absoluteString,
+                       self.programmaticURLs.contains(target) {
+                        return
+                    }
+                    self.loadInApp(request)
+                    self.confirmLoad(request, from: source)
+                }
             }
         }
         return nil
