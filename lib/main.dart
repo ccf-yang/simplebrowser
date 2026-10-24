@@ -588,6 +588,9 @@ class _BrowserPageState extends State<BrowserPage>
   /// blocking list. A new window that blocks less than the one it came from
   /// would be a hole, not a feature.
   Future<BrowseWindow?> _newWindow({Uri? uri}) async {
+    // Moving to another window is the same as switching: the player on this
+    // one stops, or its sound would keep running from a page nobody sees.
+    if (!_windows.isEmpty && _videoOpen) _closeVideoWindow();
     // Photograph the page being pushed aside first, while its WebView is still
     // the one on screen.
     if (!_windows.isEmpty) await _windows.capture(_windows.current);
